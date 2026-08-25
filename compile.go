@@ -507,6 +507,21 @@ func Compile(expressions []Expression) (*Scanner, error) {
 	}
 	blockScanPlan := buildBlockScanPlan(regexPrograms, compiled, unanchoredGroups, unanchoredNeeded, triggers, anchoredGroups, anchoredNeeded, eventNeeded, advancedEvents)
 	automaton := builder.freeze()
+	directLiterals := false
+	for state := range automaton.outputStart {
+		if automaton.outputEnd[state]-automaton.outputStart[state] > 1 {
+			directLiterals = len(regexPrograms) == 0 && len(unicodeProperties) == 0 && len(unicodeApproximate) == 0 && len(combinations) == 0 && !advancedEvents && len(triggers) == len(compiled)
+			break
+		}
+	}
+	if directLiterals {
+		for _, expression := range compiled {
+			if expression.flags&(CompileSingleMatch|CompileQuiet) != 0 || expression.constraint.hasMinOffset || expression.constraint.hasMaxOffset || expression.constraint.hasMinLength {
+				directLiterals = false
+				break
+			}
+		}
+	}
 	unicodePlan := blockScanPlan.unicode.scanPlan
 	// 单根字特化仅对选择性强的固定前导锚点有效。浮动锚点和单字节前缀的候选工作量较多，
 	// 通用扫描器更适合。
@@ -547,6 +562,7 @@ func Compile(expressions []Expression) (*Scanner, error) {
 		editNFAs:              editNFAs,
 		maxEditLength:         maxEditLength,
 		advancedEvents:        advancedEvents,
+		directLiterals:        directLiterals,
 		requiresUTF8:          requiresUTF8,
 		singleByteOnly:        singleByteOnly,
 		singleByteFast:        singleByteFast,

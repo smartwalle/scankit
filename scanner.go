@@ -164,6 +164,7 @@ type Scanner struct {
 	editNFAs              []editNFA
 	maxEditLength         int
 	advancedEvents        bool
+	directLiterals        bool
 	requiresUTF8          bool
 	singleByteOnly        bool
 	singleByteFast        bool
@@ -923,6 +924,9 @@ func (scanner *Scanner) scanBlock(data []byte, ctx *context, matches *[]Match) e
 			ctx.unicodeApprox[index].runes = ctx.unicodeApprox[index].runes[:0]
 		}
 	}()
+	if scanner.directLiterals {
+		return scanner.scanBlockDirectLiterals(data, matches)
+	}
 	if len(scanner.unicodeProperties) != 0 || len(scanner.unicodeApproximate) != 0 {
 		return scanner.scanBlockUnicodeProperties(data, ctx, matches)
 	}
@@ -1041,6 +1045,29 @@ func (scanner *Scanner) scanBlock(data []byte, ctx *context, matches *[]Match) e
 		end := uint64(offset + 1)
 		if len(ctx.readyEvents) != 0 || ctx.pendingCount != 0 && ctx.pendingFirstEnd <= end {
 			collectScanEvents(scanner, ctx, offset+1, matches)
+		}
+	}
+	return nil
+}
+
+// scanBlockDirectLiterals 仅处理没有任何结果过滤语义的普通字面量规则。AC 输出已按表达式
+// 索引稳定排序，因此可直接写入结果，避免为每个命中构造、排序和消解中间事件。
+func (scanner *Scanner) scanBlockDirectLiterals(data []byte, matches *[]Match) error {
+	state := uint32(0)
+	for offset, value := range data {
+		if scanner.automaton.sparse {
+			state = scanner.automaton.nextSparse(state, value)
+		} else {
+			state = scanner.automaton.transitions[state<<8|uint32(value)]
+		}
+		for outputIndex := scanner.automaton.outputStart[state]; outputIndex < scanner.automaton.outputEnd[state]; outputIndex++ {
+			trigger := scanner.triggers[scanner.automaton.outputs[outputIndex]]
+			expression := scanner.expressions[trigger.expressionIndex]
+			*matches = append(*matches, Match{
+				Id:   expression.id,
+				From: uint64(offset + 1 - int(expression.length)),
+				To:   uint64(offset + 1),
+			})
 		}
 	}
 	return nil
@@ -1694,6 +1721,20 @@ func hammingMatches(data []byte, pattern string, maximum uint32) bool {
 
 func collectScanEvents(scanner *Scanner, ctx *context, end int, matches *[]Match) {
 	prepareScanEvents(ctx, end)
+	if len(scanner.combinations) == 0 && len(ctx.readyEvents) == 1 {
+		event := ctx.readyEvents[0]
+		expression := scanner.expressions[event.expressionIndex]
+		if expression.constraint.accepts(event.match) && (expression.flags&CompileSingleMatch == 0 || !ctx.singleMatched[event.expressionIndex]) {
+			if expression.flags&CompileSingleMatch != 0 {
+				ctx.singleMatched[event.expressionIndex] = true
+			}
+			if expression.flags&CompileQuiet == 0 {
+				*matches = append(*matches, event.match)
+			}
+		}
+		ctx.readyEvents = ctx.readyEvents[:0]
+		return
+	}
 	sortScanEvents(ctx.readyEvents)
 	scanner.keepOneEventPerExpressionEnd(&ctx.readyEvents)
 	if len(scanner.combinations) != 0 {

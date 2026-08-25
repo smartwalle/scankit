@@ -86,6 +86,78 @@ func TestCompileUsesFixedAnchorForLargeFixedWidthAlternation(t *testing.T) {
 	}
 }
 
+func TestDirectLiteralScanPreservesEventOrder(t *testing.T) {
+	expressions := []Expression{
+		{Id: 1, Pattern: `matched`},
+		{Id: 2, Pattern: `matched`},
+		{Id: 3, Pattern: `match`},
+		{Id: 4, Pattern: `hed`},
+	}
+	direct, err := Compile(expressions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !direct.directLiterals {
+		t.Fatal("plain literal expressions did not select direct scan")
+	}
+	fallbackExpressions := append([]Expression(nil), expressions...)
+	for index := range fallbackExpressions {
+		fallbackExpressions[index].Pattern = `(?:)` + fallbackExpressions[index].Pattern
+	}
+	fallback, err := Compile(fallbackExpressions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte(`matched unmatched`)
+	got, err := direct.ScanInto(data, []Match{{Id: 99, From: 1, To: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := fallback.Scan(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = append([]Match{{Id: 99, From: 1, To: 1}}, want...)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("direct ScanInto() = %#v, want %#v", got, want)
+	}
+}
+
+func FuzzDirectLiteralScanMatchesRegexFallback(f *testing.F) {
+	for _, seed := range [][]byte{[]byte(`matched unmatched`), []byte{}, {0xff, 'm', 'a', 't', 'c', 'h'}} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 512 {
+			t.Skip()
+		}
+		expressions := []Expression{{Id: 1, Pattern: `matched`}, {Id: 2, Pattern: `match`}, {Id: 3, Pattern: `hed`}}
+		direct, err := Compile(expressions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fallbackExpressions := append([]Expression(nil), expressions...)
+		for index := range fallbackExpressions {
+			fallbackExpressions[index].Pattern = `(?:)` + fallbackExpressions[index].Pattern
+		}
+		fallback, err := Compile(fallbackExpressions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := direct.Scan(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := fallback.Scan(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("direct Scan(%q) = %#v, want %#v", data, got, want)
+		}
+	})
+}
+
 func TestFixedAnchorPreservesAdvancedEventSemantics(t *testing.T) {
 	expressions := []Expression{
 		{Id: 1, Pattern: `(?:ab|cd|ef|gh){4}`, Flags: CompileQuiet},

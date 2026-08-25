@@ -35,8 +35,6 @@ func (s *nfaUnanchoredDFASchedulerContext) reset() {
 }
 
 func (s *nfaUnanchoredDFASchedulerContext) advance(value byte, absoluteOffset uint64) []nfaThread {
-	// buildNFAVerifierDFA 会先插入 program.start 的闭包，因此零是从当前字节开始的候选 DFA 状态。
-	s.active = append(s.active, nfaDFAThread{start: absoluteOffset})
 	next := s.next[:0]
 	matches := s.matches[:0]
 	for _, thread := range s.active {
@@ -47,6 +45,15 @@ func (s *nfaUnanchoredDFASchedulerContext) advance(value byte, absoluteOffset ui
 		next = append(next, nfaDFAThread{state: state, start: thread.start})
 		if s.dfa.matches[state] {
 			matches = append(matches, nfaThread{start: thread.start})
+		}
+	}
+	// buildNFAVerifierDFA 将起始闭包固定为状态零。新起点无需先写入 active 再被同一轮
+	// 读取；直接推进可减少每个输入字节一次切片写入，并保持旧起点优先的稳定输出顺序。
+	state := s.dfa.transitions[uint32(value)]
+	if state != nfaDFANoState {
+		next = append(next, nfaDFAThread{state: state, start: absoluteOffset})
+		if s.dfa.matches[state] {
+			matches = append(matches, nfaThread{start: absoluteOffset})
 		}
 	}
 	s.active, s.next = next, s.active[:0]
