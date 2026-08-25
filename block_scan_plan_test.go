@@ -123,6 +123,30 @@ func TestDirectLiteralScanPreservesEventOrder(t *testing.T) {
 	}
 }
 
+func TestDirectSingleEventRequiresUnfilteredExpressions(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		expressions []Expression
+		want        bool
+	}{
+		{name: "plain expressions", expressions: []Expression{{Id: 1, Pattern: `a`}, {Id: 2, Pattern: `b`}}, want: true},
+		{name: "single match", expressions: []Expression{{Id: 1, Pattern: `a`, Flags: CompileSingleMatch}, {Id: 2, Pattern: `b`}}, want: false},
+		{name: "quiet", expressions: []Expression{{Id: 1, Pattern: `a`, Flags: CompileQuiet}, {Id: 2, Pattern: `b`}}, want: false},
+		{name: "constraint", expressions: []Expression{{Id: 1, Pattern: `a`, Ext: &ExpressionExt{Flags: ExtMinOffset, MinOffset: 1}}, {Id: 2, Pattern: `b`}}, want: false},
+		{name: "combination", expressions: []Expression{{Id: 1, Pattern: `a`}, {Id: 2, Pattern: `b`}, {Id: 3, Pattern: `1|2`, Flags: CompileCombination}}, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scanner, err := Compile(test.expressions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scanner.directSingleEvent != test.want {
+				t.Fatalf("directSingleEvent = %t, want %t", scanner.directSingleEvent, test.want)
+			}
+		})
+	}
+}
+
 func FuzzDirectLiteralScanMatchesRegexFallback(f *testing.F) {
 	for _, seed := range [][]byte{[]byte(`matched unmatched`), []byte{}, {0xff, 'm', 'a', 't', 'c', 'h'}} {
 		f.Add(seed)

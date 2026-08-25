@@ -165,6 +165,7 @@ type Scanner struct {
 	maxEditLength         int
 	advancedEvents        bool
 	directLiterals        bool
+	directSingleEvent     bool
 	requiresUTF8          bool
 	singleByteOnly        bool
 	singleByteFast        bool
@@ -1721,17 +1722,9 @@ func hammingMatches(data []byte, pattern string, maximum uint32) bool {
 
 func collectScanEvents(scanner *Scanner, ctx *context, end int, matches *[]Match) {
 	prepareScanEvents(ctx, end)
-	if len(scanner.combinations) == 0 && len(ctx.readyEvents) == 1 {
+	if scanner.directSingleEvent && len(ctx.readyEvents) == 1 {
 		event := ctx.readyEvents[0]
-		expression := scanner.expressions[event.expressionIndex]
-		if expression.constraint.accepts(event.match) && (expression.flags&CompileSingleMatch == 0 || !ctx.singleMatched[event.expressionIndex]) {
-			if expression.flags&CompileSingleMatch != 0 {
-				ctx.singleMatched[event.expressionIndex] = true
-			}
-			if expression.flags&CompileQuiet == 0 {
-				*matches = append(*matches, event.match)
-			}
-		}
+		*matches = append(*matches, event.match)
 		ctx.readyEvents = ctx.readyEvents[:0]
 		return
 	}

@@ -125,3 +125,59 @@ func TestLeadingAnchorSuffixClassPrefilter(t *testing.T) {
 		t.Fatalf("suffix prefilter class = %#v, want [3-9]", plan.suffixClass)
 	}
 }
+
+func TestLeadingAnchorSuffixClassRepeatMatchesFullVerifier(t *testing.T) {
+	optimized, err := Compile([]Expression{{Id: 1, Pattern: `account=[AB]{4}[0-9]{4}`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(optimized.regexPrograms) != 1 || !optimized.regexPrograms[0].hasSuffixClass {
+		t.Fatal("positive suffix repeat did not select a class prefilter")
+	}
+	reference, err := Compile([]Expression{{Id: 1, Pattern: `(?:)account=[AB]{4}[0-9]{4}`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte(`account=ABAB1234 account=CBAA1234 account=BABA9876`)
+	got, err := optimized.Scan(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := reference.Scan(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("suffix-prefilter matches = %#v, full verifier matches = %#v", got, want)
+	}
+}
+
+func FuzzLeadingAnchorSuffixClassRepeatMatchesFullVerifier(f *testing.F) {
+	optimized, err := Compile([]Expression{{Id: 1, Pattern: `account=[AB]{4}[0-9]{4}`}})
+	if err != nil {
+		f.Fatal(err)
+	}
+	reference, err := Compile([]Expression{{Id: 1, Pattern: `(?:)account=[AB]{4}[0-9]{4}`}})
+	if err != nil {
+		f.Fatal(err)
+	}
+	for _, seed := range [][]byte{[]byte(`account=ABAB1234`), []byte(`account=CBAA1234`), []byte{}, {0xff, 'a', 'c', 'c'}} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 4_096 {
+			t.Skip()
+		}
+		got, err := optimized.Scan(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := reference.Scan(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("suffix-prefilter matches = %#v, full verifier matches = %#v for %q", got, want, data)
+		}
+	})
+}

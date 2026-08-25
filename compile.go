@@ -522,6 +522,15 @@ func Compile(expressions []Expression) (*Scanner, error) {
 			}
 		}
 	}
+	directSingleEvent := len(combinations) == 0
+	if directSingleEvent {
+		for _, expression := range compiled {
+			if expression.flags&(CompileSingleMatch|CompileQuiet) != 0 || expression.constraint.hasMinOffset || expression.constraint.hasMaxOffset || expression.constraint.hasMinLength {
+				directSingleEvent = false
+				break
+			}
+		}
+	}
 	unicodePlan := blockScanPlan.unicode.scanPlan
 	// 单根字特化仅对选择性强的固定前导锚点有效。浮动锚点和单字节前缀的候选工作量较多，
 	// 通用扫描器更适合。
@@ -563,6 +572,7 @@ func Compile(expressions []Expression) (*Scanner, error) {
 		maxEditLength:         maxEditLength,
 		advancedEvents:        advancedEvents,
 		directLiterals:        directLiterals,
+		directSingleEvent:     directSingleEvent,
 		requiresUTF8:          requiresUTF8,
 		singleByteOnly:        singleByteOnly,
 		singleByteFast:        singleByteFast,

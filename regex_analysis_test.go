@@ -161,3 +161,22 @@ func TestLeadingBoundedPrefixClassRecognizesEmailShape(t *testing.T) {
 		t.Fatalf("leadingBoundedPrefixClass() = %#v, %v", prefix, ok)
 	}
 }
+
+func TestLeadingAnchorSuffixClassRecognizesPositiveClassRepeat(t *testing.T) {
+	root, err := parseRegex(`account=[AB]{4}[0-9]{4}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	analysis, err := analyzeRegex(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor, ok := selectRegexAnchor(analysis)
+	if !ok {
+		t.Fatal("selectRegexAnchor() did not select the literal prefix")
+	}
+	suffix, ok := leadingAnchorSuffixClass(root, anchor)
+	if !ok || !suffix.contains('A') || !suffix.contains('B') || suffix.contains('C') {
+		t.Fatalf("leadingAnchorSuffixClass() = %#v, %t; want [AB]", suffix, ok)
+	}
+}

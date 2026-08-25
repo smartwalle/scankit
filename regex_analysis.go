@@ -1,6 +1,9 @@
 package scankit
 
-import "sort"
+import (
+	"math/bits"
+	"sort"
+)
 
 // maxRegexFiniteWidth 是当前 Thompson 编译器在必然超出状态预算前可表示的最大有限宽度。
 // 它也限制编译期宽度运算，避免嵌套有限重复在 NFA 资源保护拒绝前使 int 溢出。
@@ -173,8 +176,8 @@ func leadingBoundedPrefixClass(root *regexNode, anchor regexAnchor) (byteClass, 
 	return prefix.children[0].class, true
 }
 
-// leadingAnchorSuffixClass 识别紧跟必需字节类的固定字面量前缀。AC 找到前缀字面量后，
-// 非成员字节不可能开始匹配，因此可作为不改变起始位置选择的安全二级预过滤。
+// leadingAnchorSuffixClass 识别紧跟必需字节类或其正重复的固定字面量前缀。AC 找到前缀
+// 字面量后，非成员字节不可能开始匹配，因此可作为不改变起始位置选择的安全二级预过滤。
 func leadingAnchorSuffixClass(root *regexNode, anchor regexAnchor) (byteClass, bool) {
 	if root == nil || root.kind != regexConcat || anchor.minOffset != 0 || anchor.maxOffset != 0 || len(anchor.literal) == 0 {
 		return byteClass{}, false
@@ -191,9 +194,22 @@ func leadingAnchorSuffixClass(root *regexNode, anchor regexAnchor) (byteClass, b
 		if child.kind == regexClass {
 			return child.class, true
 		}
+		if child.kind == regexRepeat && child.min > 0 && len(child.children) == 1 {
+			class, ok := extractSingleByteClass(child.children[0])
+			if ok && isSelectiveAnchorSuffixClass(class) {
+				return class, true
+			}
+		}
 		return byteClass{}, false
 	}
 	return byteClass{}, false
+}
+
+// isSelectiveAnchorSuffixClass 仅保留足以抵消一次额外字节检查的小类。宽类（如 \d）在
+// 锚点命中后通常不能排除足够候选，交给 verifier 反而更快。
+func isSelectiveAnchorSuffixClass(class byteClass) bool {
+	const maxSelectiveAnchorSuffixBytes = 8
+	return bits.OnesCount64(class[0])+bits.OnesCount64(class[1])+bits.OnesCount64(class[2])+bits.OnesCount64(class[3]) <= maxSelectiveAnchorSuffixBytes
 }
 
 func normalizeRegexAnchors(anchors []regexAnchor) []regexAnchor {
