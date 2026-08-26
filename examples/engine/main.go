@@ -25,7 +25,7 @@ func main() {
 
 	var msg = []byte("ts=2026-08-19 level=info user=42 phone=13800138000 12345678@qq.com email=alice.smith42@example.cn invalid=12345678901 path=/api/profile")
 
-	engine.MaskWith(msg, func(match scankit.Match, value []byte) {
+	engine.Mask(msg, func(match scankit.Match, value []byte) {
 		switch match.Id {
 		case 1:
 			for i := 3; i < 7; i++ {

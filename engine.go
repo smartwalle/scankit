@@ -33,26 +33,15 @@ func (engine *Engine) Replace(data []byte, fn ReplaceFunc) ([]byte, error) {
 	return Replace(data, matches, fn), nil
 }
 
-// Mask 使用当前 Scanner 查找 data 中的匹配片段，并用 mask 原地覆盖这些片段。
-func (engine *Engine) Mask(data []byte, mask byte) ([]byte, error) {
+// Mask 使用 fn 原地修改 data 中的命中片段，并返回 data。
+func (engine *Engine) Mask(data []byte, fn MaskFunc) ([]byte, error) {
 	matches, err := engine.scanIntoReusableMatches(data)
 	if err != nil {
 		engine.recycleMatches(matches)
 		return data, err
 	}
 	defer engine.recycleMatches(matches)
-	return Mask(data, matches, mask), nil
-}
-
-// MaskWith 使用 fn 原地修改 data 中的命中片段，并返回 data。
-func (engine *Engine) MaskWith(data []byte, fn MaskFunc) ([]byte, error) {
-	matches, err := engine.scanIntoReusableMatches(data)
-	if err != nil {
-		engine.recycleMatches(matches)
-		return data, err
-	}
-	defer engine.recycleMatches(matches)
-	return MaskWith(data, matches, fn), nil
+	return Mask(data, matches, fn), nil
 }
 
 func (engine *Engine) scanIntoReusableMatches(data []byte) ([]Match, error) {

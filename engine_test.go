@@ -21,7 +21,7 @@ func TestNewCompilesExpressions(t *testing.T) {
 	}
 }
 
-func TestEngineReplaceMaskAndMaskWith(t *testing.T) {
+func TestEngineReplaceAndMask(t *testing.T) {
 	engine, err := New([]Expression{{Id: 1, Pattern: "token"}})
 	if err != nil {
 		t.Fatal(err)
@@ -37,18 +37,9 @@ func TestEngineReplaceMaskAndMaskWith(t *testing.T) {
 		t.Fatalf("Replace() = %q, want %q", replaced, "***")
 	}
 
-	data := []byte("token")
-	masked, err := engine.Mask(data, '*')
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(masked) != "*****" || !bytes.Equal(masked, data) {
-		t.Fatalf("Mask() = %q, want %q", masked, "*****")
-	}
-
-	data = []byte("token token")
+	data := []byte("token token")
 	var seen []Match
-	masked, err = engine.MaskWith(data, func(match Match, value []byte) {
+	masked, err := engine.Mask(data, func(match Match, value []byte) {
 		seen = append(seen, match)
 		copy(value, "#####")
 	})
@@ -56,22 +47,22 @@ func TestEngineReplaceMaskAndMaskWith(t *testing.T) {
 		t.Fatal(err)
 	}
 	if string(masked) != "##### #####" || !bytes.Equal(masked, data) {
-		t.Fatalf("MaskWith() = %q, want %q", masked, "##### #####")
+		t.Fatalf("Mask() = %q, want %q", masked, "##### #####")
 	}
 	wantMatches := []Match{{Id: 1, From: 0, To: 5}, {Id: 1, From: 6, To: 11}}
 	if !equalMatches(seen, wantMatches) {
-		t.Fatalf("MaskWith() matches = %#v, want %#v", seen, wantMatches)
+		t.Fatalf("Mask() matches = %#v, want %#v", seen, wantMatches)
 	}
 }
 
-func TestEngineMaskWithResolvesOverlappingMatches(t *testing.T) {
+func TestEngineMaskResolvesOverlappingMatches(t *testing.T) {
 	engine, err := New([]Expression{{Id: 1, Pattern: "token"}, {Id: 2, Pattern: "ok"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	data := []byte("token")
 	var seen []Match
-	masked, err := engine.MaskWith(data, func(match Match, value []byte) {
+	masked, err := engine.Mask(data, func(match Match, value []byte) {
 		seen = append(seen, match)
 		for index := range value {
 			value[index] = '#'
@@ -81,19 +72,19 @@ func TestEngineMaskWithResolvesOverlappingMatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	if string(masked) != "#####" || !bytes.Equal(masked, data) {
-		t.Fatalf("MaskWith() = %q, want %q", masked, "#####")
+		t.Fatalf("Mask() = %q, want %q", masked, "#####")
 	}
 	if want := []Match{{Id: 1, From: 0, To: 5}}; !equalMatches(seen, want) {
-		t.Fatalf("MaskWith() matches = %#v, want %#v", seen, want)
+		t.Fatalf("Mask() matches = %#v, want %#v", seen, want)
 	}
 }
 
-func TestMaskWith(t *testing.T) {
+func TestMask(t *testing.T) {
 	t.Run("modifies resolved matches", func(t *testing.T) {
 		data := []byte("token")
 		matches := []Match{{Id: 2, From: 1, To: 3}, {Id: 1, From: 0, To: 5}}
 		var seen []Match
-		masked := MaskWith(data, matches, func(match Match, value []byte) {
+		masked := Mask(data, matches, func(match Match, value []byte) {
 			seen = append(seen, match)
 			for index := range value {
 				value[index] = '#'
@@ -109,21 +100,21 @@ func TestMaskWith(t *testing.T) {
 
 }
 
-func TestEngineMaskWithReturnsInputWhenScanFails(t *testing.T) {
+func TestEngineMaskReturnsInputWhenScanFails(t *testing.T) {
 	engine, err := New([]Expression{{Id: 1, Pattern: `x`, Flags: CompileUTF8}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	data := []byte{0xff}
 	called := false
-	masked, maskErr := engine.MaskWith(data, func(_ Match, _ []byte) {
+	masked, maskErr := engine.Mask(data, func(_ Match, _ []byte) {
 		called = true
 	})
 	if maskErr == nil {
-		t.Fatal("MaskWith() error = nil, want invalid UTF-8 error")
+		t.Fatal("Mask() error = nil, want invalid UTF-8 error")
 	}
 	if !bytes.Equal(masked, data) || called {
-		t.Fatalf("MaskWith() = %v, called = %t, want unchanged input without callback", masked, called)
+		t.Fatalf("Mask() = %v, called = %t, want unchanged input without callback", masked, called)
 	}
 }
 
@@ -149,20 +140,14 @@ func TestEngineReplaceAndMaskConcurrently(t *testing.T) {
 					return
 				}
 
-				masked, err := engine.Mask([]byte("token"), '*')
-				if err != nil || string(masked) != "*****" {
-					t.Errorf("Mask() = %q, %v", masked, err)
-					return
-				}
-
 				data := []byte("token")
-				masked, err = engine.MaskWith(data, func(_ Match, value []byte) {
+				masked, err := engine.Mask(data, func(_ Match, value []byte) {
 					for index := range value {
 						value[index] = '#'
 					}
 				})
 				if err != nil || string(masked) != "#####" || !bytes.Equal(masked, data) {
-					t.Errorf("MaskWith() = %q, %v", masked, err)
+					t.Errorf("Mask() = %q, %v", masked, err)
 					return
 				}
 			}
@@ -171,7 +156,7 @@ func TestEngineReplaceAndMaskConcurrently(t *testing.T) {
 	group.Wait()
 }
 
-func FuzzEngineMaskWithMutatesOnlyResolvedMatches(f *testing.F) {
+func FuzzEngineMaskMutatesOnlyResolvedMatches(f *testing.F) {
 	engine, err := New([]Expression{{Id: 1, Pattern: "token"}, {Id: 2, Pattern: "ok"}, {Id: 3, Pattern: `[0-9]{4}`}})
 	if err != nil {
 		f.Fatal(err)
@@ -195,7 +180,7 @@ func FuzzEngineMaskWithMutatesOnlyResolvedMatches(f *testing.F) {
 				want[index] = '#'
 			}
 		}
-		if _, err := engine.MaskWith(data, func(_ Match, value []byte) {
+		if _, err := engine.Mask(data, func(_ Match, value []byte) {
 			for index := range value {
 				value[index] = '#'
 			}
@@ -203,12 +188,12 @@ func FuzzEngineMaskWithMutatesOnlyResolvedMatches(f *testing.F) {
 			t.Fatal(err)
 		}
 		if !bytes.Equal(data, want) {
-			t.Fatalf("MaskWith() data = %q, want %q", data, want)
+			t.Fatalf("Mask() data = %q, want %q", data, want)
 		}
 	})
 }
 
-func FuzzMaskWithMutatesOnlyResolvedMatches(f *testing.F) {
+func FuzzMaskMutatesOnlyResolvedMatches(f *testing.F) {
 	f.Add([]byte("token"))
 	f.Add([]byte("token 2026"))
 	f.Add([]byte{})
@@ -232,7 +217,7 @@ func FuzzMaskWithMutatesOnlyResolvedMatches(f *testing.F) {
 				want[index] = '#'
 			}
 		}
-		MaskWith(data, matches, func(_ Match, value []byte) {
+		Mask(data, matches, func(_ Match, value []byte) {
 			for index := range value {
 				value[index] = '#'
 			}

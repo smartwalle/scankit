@@ -62,30 +62,13 @@ func BenchmarkPIIRedaction(b *testing.B) {
 					b.Run("EngineMask", func(b *testing.B) {
 						data := make([]byte, len(fixture.data))
 						copy(data, fixture.data)
-						if _, err := fixture.engine.Mask(data, '*'); err != nil {
+						if _, err := fixture.engine.Mask(data, maskPIIValue); err != nil {
 							b.Fatal(err)
 						}
 						startPIIBenchmarkTimer(b, fixture)
 						for range b.N {
 							copy(data, fixture.data)
-							result, err := fixture.engine.Mask(data, '*')
-							if err != nil {
-								b.Fatal(err)
-							}
-							piiBenchmarkBytesSink = result
-						}
-					})
-
-					b.Run("EngineMaskWith", func(b *testing.B) {
-						data := make([]byte, len(fixture.data))
-						copy(data, fixture.data)
-						if _, err := fixture.engine.MaskWith(data, maskPIIValue); err != nil {
-							b.Fatal(err)
-						}
-						startPIIBenchmarkTimer(b, fixture)
-						for range b.N {
-							copy(data, fixture.data)
-							result, err := fixture.engine.MaskWith(data, maskPIIValue)
+							result, err := fixture.engine.Mask(data, maskPIIValue)
 							if err != nil {
 								b.Fatal(err)
 							}
@@ -213,19 +196,11 @@ func newPIIBenchmarkFixture(b testing.TB, scenario piiBenchmarkScenario, density
 		b.Fatal(err)
 	}
 	maskedInput := append([]byte(nil), data...)
-	masked, err := engine.Mask(maskedInput, '*')
-	if err != nil {
-		b.Fatal(err)
-	}
-	if !bytes.Equal(masked, fixture.masked) {
-		b.Fatal("Engine Mask does not match Engine Replace")
-	}
-	maskedInput = append(maskedInput[:0], data...)
-	if _, err := engine.MaskWith(maskedInput, maskPIIValue); err != nil {
+	if _, err := engine.Mask(maskedInput, maskPIIValue); err != nil {
 		b.Fatal(err)
 	}
 	if !bytes.Equal(maskedInput, fixture.masked) {
-		b.Fatal("Engine MaskWith does not match Engine Replace")
+		b.Fatal("Engine Mask does not match Engine Replace")
 	}
 	if replaced := goRegexp.ReplaceAllFunc(data, fixture.maskRegexpMatch); !bytes.Equal(replaced, fixture.masked) {
 		b.Fatal("Go regexp replacement does not match Engine Replace")

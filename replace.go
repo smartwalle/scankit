@@ -33,27 +33,11 @@ func Replace(data []byte, matches []Match, fn ReplaceFunc) []byte {
 	return buf.Bytes()
 }
 
-// Mask 用 mask 原地覆盖 data 中的匹配片段。重叠片段按与 Replace 相同的规则处理。
-//
-// Mask 会原地重排 matches 并返回 data；调用方需要保留原始数据时必须传入副本。
-func Mask(data []byte, matches []Match, mask byte) []byte {
-	if len(matches) == 0 {
-		return data
-	}
-	matches = resolveOverlappingMatches(matches)
-	for _, m := range matches {
-		for i := int(m.From); i < int(m.To); i++ {
-			data[i] = mask
-		}
-	}
-	return data
-}
-
-// MaskWith 使用 fn 原地修改 data 中的匹配片段。重叠片段按与 Replace 相同的规则处理。
+// Mask 使用 fn 原地修改 data 中的匹配片段。重叠片段按与 Replace 相同的规则处理。
 //
 // value 与 data 共享底层数组，长度固定。
-// MaskWith 会原地重排 matches，并返回 data；调用方需要保留原始数据时必须传入副本。
-func MaskWith(data []byte, matches []Match, fn MaskFunc) []byte {
+// Mask 会原地重排 matches，并返回 data；调用方需要保留原始数据时必须传入副本。
+func Mask(data []byte, matches []Match, fn MaskFunc) []byte {
 	if len(matches) == 0 {
 		return data
 	}
