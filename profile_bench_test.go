@@ -6,6 +6,7 @@ import (
 )
 
 var profileBenchmarkMatchesSink []Match
+var profileBenchmarkBoolSink bool
 
 // BenchmarkProfileScanPaths 为 AC、锚点验证、无锚定 DFA 和事件收集提供可重复的定位入口。
 // 它们不构成发布门槛，也不代表任何业务工作负载。
@@ -192,9 +193,126 @@ func BenchmarkProfileFixedByteRegex(b *testing.B) {
 	}
 }
 
+// BenchmarkProfileFixedAnchor 将超过定宽展开上限时的 class-anchor 通道单独暴露出来。
+// NoCandidate、CandidateRejected 与 HighMatch 分别定位触发类未命中、必要条件拒绝和
+// 完整 verifier 接受的成本；规则仅描述通用定宽字节结构。
+func BenchmarkProfileFixedAnchor(b *testing.B) {
+	const pattern = `(?:a[0-9]|b[0-9]|c[0-9]|d[0-9]){4}`
+	for _, test := range []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "NoCandidate",
+			data: bytes.Repeat([]byte(`zzzzzzzzz `), 256),
+		},
+		{
+			name: "CandidateRejected",
+			data: bytes.Repeat([]byte(`aXbXcXdX `), 256),
+		},
+		{
+			name: "HighMatch",
+			data: bytes.Repeat([]byte(`a0b1c2d3 `), 256),
+		},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			scanner, err := Compile([]Expression{{Id: 1, Pattern: pattern}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if profileFixedByteRegexAnchorLaneCount(scanner) == 0 {
+				b.Fatal("expected fixed-anchor scan plan")
+			}
+			want, err := scanner.Scan(test.data)
+			if err != nil {
+				b.Fatal(err)
+			}
+			benchmarkProfileScanInto(b, scanner, test.data, want)
+		})
+	}
+}
+
+// BenchmarkProfileFixedAnchorChecks 对比单个与多个必要条件的过滤成本。它直接测量
+// 已编译 anchor 的检查函数，以免 AC、NFA/DFA 与事件投递掩盖这一小段热路径。
+func BenchmarkProfileFixedAnchorChecks(b *testing.B) {
+	root, err := parseRegex(`(?:a[0-9]|b[0-9]|c[0-9]|d[0-9]){4}`)
+	if err != nil {
+		b.Fatal(err)
+	}
+	anchor, ok := extractFixedByteRegexAnchor(root)
+	if !ok || anchor.checks == nil || anchor.checks.count < 2 {
+		b.Fatal("expected multiple fixed-anchor checks")
+	}
+	oneCheck := *anchor.checks
+	oneCheck.count = 1
+	for _, test := range []struct {
+		name   string
+		data   []byte
+		checks *fixedByteRegexAnchorChecks
+	}{
+		{name: "FirstCheckReject/OneCheck", data: []byte(`aXbXcXdX`), checks: &oneCheck},
+		{name: "FirstCheckReject/MultipleChecks", data: []byte(`aXbXcXdX`), checks: anchor.checks},
+		{name: "AllPass/OneCheck", data: []byte(`a0b1c2d3`), checks: &oneCheck},
+		{name: "AllPass/MultipleChecks", data: []byte(`a0b1c2d3`), checks: anchor.checks},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			if !fixedByteRegexAnchorChecksMatch([]byte(`a0b1c2d3`), 0, test.checks) {
+				b.Fatal("valid fixed anchor did not pass checks")
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				profileBenchmarkBoolSink = fixedByteRegexAnchorChecksMatch(test.data, 0, test.checks)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "FirstCheckReject", data: []byte(`aXbXcXdX`)},
+		{name: "AllPass", data: []byte(`a0b1c2d3`)},
+	} {
+		b.Run(test.name+"/PointerAccess", func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				profileBenchmarkBoolSink = fixedByteRegexAnchorChecksMatch(test.data, 0, anchor.checks)
+			}
+		})
+		b.Run(test.name+"/ValueCopyReference", func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				profileBenchmarkBoolSink = profileFixedByteRegexAnchorChecksMatchCopy(test.data, 0, anchor.checks)
+			}
+		})
+	}
+}
+
+// profileFixedByteRegexAnchorChecksMatchCopy 是仅用于微基准的旧值复制参考实现，不能被
+// 扫描热路径调用。
+func profileFixedByteRegexAnchorChecksMatchCopy(data []byte, start int, checks *fixedByteRegexAnchorChecks) bool {
+	for index := 0; index < int(checks.count); index++ {
+		check := checks.values[index]
+		if !check.class.contains(data[start+check.offset]) {
+			return false
+		}
+	}
+	return true
+}
+
 func profileFixedByteRegexLaneCount(scanner *Scanner) int {
 	count := 0
 	for _, lanes := range scanner.blockScanPlan.unanchored.fixed {
+		count += len(lanes)
+	}
+	return count
+}
+
+func profileFixedByteRegexAnchorLaneCount(scanner *Scanner) int {
+	count := 0
+	for _, lanes := range scanner.blockScanPlan.unanchored.fixedAnchor {
 		count += len(lanes)
 	}
 	return count

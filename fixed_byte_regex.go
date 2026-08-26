@@ -322,7 +322,9 @@ func fixedByteRegexAnchorCheckFurther(left, right fixedByteRegexAnchorCheck, anc
 
 func fixedByteRegexAnchorChecksMatch(data []byte, start int, checks *fixedByteRegexAnchorChecks) bool {
 	for index := 0; index < int(checks.count); index++ {
-		check := checks.values[index]
+		// byteClass 含四个 uint64。保留数组元素的地址，避免每个候选都复制整个字符类；
+		// checks 在已编译 Scanner 中不可变，因此这里没有并发可见性问题。
+		check := &checks.values[index]
 		if !check.class.contains(data[start+check.offset]) {
 			return false
 		}
