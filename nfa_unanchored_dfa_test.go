@@ -48,18 +48,18 @@ func TestDatabaseUsesDFASchedulerForNonSimpleUnanchoredRegex(t *testing.T) {
 	}{
 		{
 			name:        "byte scan",
-			expressions: []Expression{{Id: 1, Pattern: `\d\w{1,2}`}},
-			data:        []byte("a1bc2D"),
-			want:        []Match{{Id: 1, From: 1, To: 3}, {Id: 1, From: 1, To: 4}, {Id: 1, From: 4, To: 6}},
+			expressions: []Expression{{Id: 1, Pattern: `[A-C]+\d`}},
+			data:        []byte("aA1BB2C3"),
+			want:        []Match{{Id: 1, From: 1, To: 3}, {Id: 1, From: 3, To: 6}, {Id: 1, From: 6, To: 8}},
 		},
 		{
 			name: "UCP mixed scan",
 			expressions: []Expression{
 				{Id: 1, Pattern: `\p{Han}+`, Flags: CompileUTF8 | CompileUnicodeProperties},
-				{Id: 2, Pattern: `\d\w{1,2}`},
+				{Id: 2, Pattern: `[A-C]+\d`},
 			},
-			data: []byte("张1bc"),
-			want: []Match{{Id: 1, From: 0, To: 3}, {Id: 2, From: 3, To: 5}, {Id: 2, From: 3, To: 6}},
+			data: []byte("张A1"),
+			want: []Match{{Id: 1, From: 0, To: 3}, {Id: 2, From: 3, To: 5}},
 		},
 	}
 	for _, tt := range tests {
@@ -94,6 +94,8 @@ func TestFixedByteRegexMatchesNFA(t *testing.T) {
 		{name: "fixed digit width", pattern: `\d{2}`, data: []byte("a1234")},
 		{name: "class alternation", pattern: `(?:[1-2]A|[1-2]B)\d`, data: []byte("x1A2 2B3 1A4")},
 		{name: "overlapping alternatives", pattern: `(?:[1-2]A|[1-2]A)\d`, data: []byte("1A2")},
+		{name: "boundary alternatives and optional fixed prefix", pattern: `(?:\b|^)(?:\+86|86)?1[3-9][0-9]{9}(?:\b|$)`, data: []byte("+8613800138000 13800138000 8613800138000 x13800138000 8613800138000x a8613800138000")},
+		{name: "not word boundaries and optional fixed prefix", pattern: `\B(?:a)?b\B`, data: []byte("cabbc abb b")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root, err := parseRegex(test.pattern)
@@ -139,7 +141,7 @@ func FuzzFixedByteRegexMatchesNFA(f *testing.F) {
 	for _, seed := range [][]byte{[]byte("1234"), []byte("1A2 2B3"), []byte(""), {0xff, '1', 'A', '2'}} {
 		f.Add(seed)
 	}
-	patterns := []string{`\d{2}`, `(?:[1-2]A|[1-2]B)\d`, `(?:[1-2]A|[1-2]A)\d`}
+	patterns := []string{`\d{2}`, `(?:[1-2]A|[1-2]B)\d`, `(?:[1-2]A|[1-2]A)\d`, `(?:\b|^)(?:\+86|86)?1[3-9][0-9]{9}(?:\b|$)`, `\B(?:a)?b\B`}
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > 512 {
 			t.Skip()

@@ -97,6 +97,37 @@ func TestExtractFixedByteRegexAnchorRejectsNonFixedWidthStructure(t *testing.T) 
 	}
 }
 
+func TestExtractFixedByteRegexSupportsBoundariesAndBoundedWidth(t *testing.T) {
+	root, err := parseRegex(`(?:\b|^)(?:\+86|86)?1[3-9][0-9]{9}(?:\b|$)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixed, ok := extractFixedByteRegex(root)
+	if !ok {
+		t.Fatal("extractFixedByteRegex() did not select fixed executor")
+	}
+	if fixed.leadingWordBoundary != fixedByteRegexWordBoundary|fixedByteRegexStart || fixed.trailingWordBoundary != fixedByteRegexWordBoundary|fixedByteRegexEnd {
+		t.Fatalf("boundaries = (%d, %d), want word-or-start and word-or-end", fixed.leadingWordBoundary, fixed.trailingWordBoundary)
+	}
+	widths := map[int]bool{}
+	for _, sequence := range fixed.sequences {
+		widths[len(sequence.classes)] = true
+	}
+	if len(fixed.sequences) != 3 || !widths[11] || !widths[13] || !widths[14] {
+		t.Fatalf("sequence widths = %#v, want 11, 13 and 14", widths)
+	}
+	if len(fixed.sequenceTrigger['1']) != 3 || len(fixed.sequenceTrigger['+']) != 0 || len(fixed.sequenceTrigger['8']) != 0 {
+		t.Fatalf("shared trigger counts = 1:%d +:%d 8:%d, want 3/0/0", len(fixed.sequenceTrigger['1']), len(fixed.sequenceTrigger['+']), len(fixed.sequenceTrigger['8']))
+	}
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: `(?:\b|^)(?:\+86|86)?1[3-9][0-9]{9}(?:\b|$)`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !scanner.fixedOnlyBlock {
+		t.Fatalf("compiled scanner did not select fixed-only block path: fixed=%t fixedAnchor=%t always=%d triggers=%d advanced=%t", scanner.regexPrograms[0].fixed != nil, scanner.regexPrograms[0].fixedAnchor != nil, len(scanner.blockScanPlan.unanchored.always), len(scanner.triggers), scanner.advancedEvents)
+	}
+}
+
 func BenchmarkFixedByteRegexLargeAlternation(b *testing.B) {
 	const pattern = `(?:ab|cd|ef|gh){4}`
 	data := bytes.Repeat([]byte("xxabcdefghyy"), 256)

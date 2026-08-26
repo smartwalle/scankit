@@ -12,9 +12,23 @@ const (
 // fixedByteRegex 是纯字节定宽正则的有界展开。它从每个分支中选择性最强的字节直接分派，
 // 避免为每个可能起点维护活跃 DFA 线程。
 type fixedByteRegex struct {
-	sequences       []fixedByteRegexSequence
-	sequenceTrigger [byteClassCardinality][]uint16
+	sequences            []fixedByteRegexSequence
+	sequenceTrigger      [byteClassCardinality][]uint16
+	leadingWordBoundary  fixedByteRegexBoundary
+	trailingWordBoundary fixedByteRegexBoundary
 }
+
+// fixedByteRegexBoundary 表示定长字节执行器可在首尾独立验证的单词边界断言。
+// 中间断言仍交给完整 NFA，避免改变其匹配语义。
+type fixedByteRegexBoundary uint8
+
+const (
+	fixedByteRegexNoBoundary   fixedByteRegexBoundary = 0
+	fixedByteRegexWordBoundary fixedByteRegexBoundary = 1 << (iota - 1)
+	fixedByteRegexNotWordBoundary
+	fixedByteRegexStart
+	fixedByteRegexEnd
+)
 
 type fixedByteRegexSequence struct {
 	classes       []byteClass
@@ -52,16 +66,36 @@ type fixedByteRegexMatch struct {
 }
 
 func extractFixedByteRegex(root *regexNode) (*fixedByteRegex, bool) {
+	root, leadingBoundary, trailingBoundary, ok := splitFixedByteRegexBoundaries(root)
+	if !ok {
+		return nil, false
+	}
 	sequences, ok := expandFixedByteRegex(root)
 	if !ok || len(sequences) == 0 || len(sequences) > maxFixedByteRegexSequences {
 		return nil, false
 	}
-	program := &fixedByteRegex{sequences: make([]fixedByteRegexSequence, len(sequences))}
+	program := &fixedByteRegex{
+		sequences:            make([]fixedByteRegexSequence, len(sequences)),
+		leadingWordBoundary:  leadingBoundary,
+		trailingWordBoundary: trailingBoundary,
+	}
+	triggerOffsets := make([]int, len(sequences))
+	var individualTrigger byteClass
 	for index, classes := range sequences {
 		if len(classes) == 0 || len(classes) > maxFixedByteRegexLength {
 			return nil, false
 		}
-		triggerOffset := mostSelectiveByteClass(classes)
+		triggerOffsets[index] = mostSelectiveByteClass(classes)
+		individualTrigger.merge(classes[triggerOffsets[index]])
+	}
+	// 变宽分支可能拥有相同的后缀。若共同字符类比各分支独立触发字符的并集更小，统一
+	// 由该类触发可减少日志中无关前缀字符造成的 verifier 调用；等宽分支后续会转为
+	// fixedAnchor，本选择不会改变其执行路径。
+	if offsets, trigger, ok := commonFixedByteRegexTrigger(sequences); ok && byteClassSize(trigger) < byteClassSize(individualTrigger) {
+		triggerOffsets = offsets
+	}
+	for index, classes := range sequences {
+		triggerOffset := triggerOffsets[index]
 		program.sequences[index] = fixedByteRegexSequence{classes: classes, triggerOffset: triggerOffset}
 		trigger := classes[triggerOffset]
 		for value := range program.sequenceTrigger {
@@ -71,6 +105,135 @@ func extractFixedByteRegex(root *regexNode) (*fixedByteRegex, bool) {
 		}
 	}
 	return program, true
+}
+
+// commonFixedByteRegexTrigger 查找每个分支均包含的同一位置类。它只给出候选；调用方
+// 还会比较字符类大小，确保不会用宽泛共同后缀替换更具选择性的分支触发器。
+func commonFixedByteRegexTrigger(sequences [][]byteClass) ([]int, byteClass, bool) {
+	if len(sequences) < 2 {
+		return nil, byteClass{}, false
+	}
+	var best byteClass
+	var bestOffsets []int
+	found := false
+	for firstOffset, candidate := range sequences[0] {
+		offsets := make([]int, len(sequences))
+		offsets[0] = firstOffset
+		complete := true
+		for sequenceIndex := 1; sequenceIndex < len(sequences); sequenceIndex++ {
+			offset := fixedByteRegexClassIndex(sequences[sequenceIndex], candidate)
+			if offset < 0 {
+				complete = false
+				break
+			}
+			offsets[sequenceIndex] = offset
+		}
+		if !complete || (found && byteClassSize(best) <= byteClassSize(candidate)) {
+			continue
+		}
+		best, bestOffsets, found = candidate, offsets, true
+	}
+	return bestOffsets, best, found
+}
+
+func fixedByteRegexClassIndex(classes []byteClass, target byteClass) int {
+	for index, class := range classes {
+		if class == target {
+			return index
+		}
+	}
+	return -1
+}
+
+func fixedByteRegexHasSingleWidth(fixed *fixedByteRegex) bool {
+	if fixed == nil || len(fixed.sequences) == 0 {
+		return false
+	}
+	width := len(fixed.sequences[0].classes)
+	for _, sequence := range fixed.sequences[1:] {
+		if len(sequence.classes) != width {
+			return false
+		}
+	}
+	return true
+}
+
+// splitFixedByteRegexBoundaries 仅从连接表达式两端剥离 \b 或 \B。两端之外的断言无法
+// 由固定位置类安全表示，必须继续使用完整 NFA/DFA 执行器。
+func splitFixedByteRegexBoundaries(root *regexNode) (*regexNode, fixedByteRegexBoundary, fixedByteRegexBoundary, bool) {
+	if root == nil {
+		return nil, fixedByteRegexNoBoundary, fixedByteRegexNoBoundary, false
+	}
+	if root.kind != regexConcat {
+		return root, fixedByteRegexNoBoundary, fixedByteRegexNoBoundary, true
+	}
+	start, end := 0, len(root.children)
+	for start < end && root.children[start].kind == regexEmpty {
+		start++
+	}
+	for end > start && root.children[end-1].kind == regexEmpty {
+		end--
+	}
+	leading := fixedByteRegexNoBoundary
+	if start < end {
+		if boundary, ok := fixedByteRegexBoundaryForNode(root.children[start]); ok {
+			leading = boundary
+			start++
+		}
+	}
+	trailing := fixedByteRegexNoBoundary
+	if start < end {
+		if boundary, ok := fixedByteRegexBoundaryForNode(root.children[end-1]); ok {
+			trailing = boundary
+			end--
+		}
+	}
+	if start >= end {
+		return nil, fixedByteRegexNoBoundary, fixedByteRegexNoBoundary, false
+	}
+	if end-start == 1 {
+		return root.children[start], leading, trailing, true
+	}
+	return &regexNode{kind: regexConcat, children: root.children[start:end]}, leading, trailing, true
+}
+
+func fixedByteRegexBoundaryForNode(node *regexNode) (fixedByteRegexBoundary, bool) {
+	if node == nil {
+		return fixedByteRegexNoBoundary, false
+	}
+	switch node.kind {
+	case regexWordBoundary:
+		return fixedByteRegexWordBoundary, true
+	case regexNotWordBoundary:
+		return fixedByteRegexNotWordBoundary, true
+	case regexAbsoluteStart:
+		return fixedByteRegexStart, true
+	case regexAbsoluteEnd:
+		return fixedByteRegexEnd, true
+	case regexAnchorStart:
+		if node.flags&CompileMultiline == 0 {
+			return fixedByteRegexStart, true
+		}
+	case regexAnchorEnd:
+		if node.flags&CompileMultiline == 0 {
+			return fixedByteRegexEnd, true
+		}
+	case regexAlternate:
+		if len(node.children) == 0 {
+			return fixedByteRegexNoBoundary, false
+		}
+		var boundary fixedByteRegexBoundary
+		for _, child := range node.children {
+			part, ok := fixedByteRegexBoundaryForNode(child)
+			if !ok {
+				return fixedByteRegexNoBoundary, false
+			}
+			boundary |= part
+		}
+		return boundary, boundary != fixedByteRegexNoBoundary
+	default:
+	}
+	return fixedByteRegexNoBoundary, false
 }
 
 // extractBoundedByteClassRepeat 将重复的单字节分支下沉为等价字节类。它刻意仅限一个
@@ -150,16 +313,26 @@ func expandFixedByteRegex(node *regexNode) ([][]byteClass, bool) {
 		}
 		return sequences, true
 	case regexRepeat:
-		if node.min != node.max || node.min < 1 || node.min > maxFixedByteRegexLength {
+		if len(node.children) != 1 || node.min < 0 || node.max == unboundedRepeat || node.max < node.min || node.max > maxFixedByteRegexLength {
 			return nil, false
 		}
 		sequences, ok := expandFixedByteRegex(node.children[0])
 		if !ok {
 			return nil, false
 		}
-		result := [][]byteClass{{}}
-		for range node.min {
-			result, ok = combineFixedByteRegexSequences(result, sequences)
+		result := make([][]byteClass, 0, maxFixedByteRegexSequences)
+		current := [][]byteClass{{}}
+		for count := 0; count <= node.max; count++ {
+			if count >= node.min {
+				if len(result)+len(current) > maxFixedByteRegexSequences {
+					return nil, false
+				}
+				result = append(result, current...)
+			}
+			if count == node.max {
+				break
+			}
+			current, ok = combineFixedByteRegexSequences(current, sequences)
 			if !ok {
 				return nil, false
 			}
@@ -432,6 +605,10 @@ func (run *fixedByteRegexRun) advance(program *fixedByteRegex, data []byte, offs
 		if !matched {
 			continue
 		}
+		if !fixedByteRegexBoundaryMatches(program.leadingWordBoundary, data, start) ||
+			!fixedByteRegexBoundaryMatches(program.trailingWordBoundary, data, end) {
+			continue
+		}
 		duplicate := false
 		for _, prior := range matches {
 			if prior.start == start && prior.end == end {
@@ -445,4 +622,12 @@ func (run *fixedByteRegexRun) advance(program *fixedByteRegex, data []byte, offs
 	}
 	run.matches = matches
 	return matches
+}
+
+func fixedByteRegexBoundaryMatches(boundary fixedByteRegexBoundary, data []byte, offset int) bool {
+	return boundary == fixedByteRegexNoBoundary ||
+		boundary&fixedByteRegexWordBoundary != 0 && nfaMatchesWordBoundary(data, offset) ||
+		boundary&fixedByteRegexNotWordBoundary != 0 && !nfaMatchesWordBoundary(data, offset) ||
+		boundary&fixedByteRegexStart != 0 && offset == 0 ||
+		boundary&fixedByteRegexEnd != 0 && offset == len(data)
 }

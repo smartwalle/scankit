@@ -9,11 +9,13 @@ import (
 // 这些规则描述日志扫描测试使用的五类敏感信息。
 // 它们只匹配原始值；生产调用方可按日志格式增加字段名或边界约束。
 const (
-	logChinesePhonePattern = `1[3-9][0-9]{9}`
-	logEmailPattern        = "[A-Za-z0-9.!#$%&'*+/?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\\b"
-	logChineseIDPattern    = `[1-9][0-9]{5}(18|19|20)[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]`
-	logBankCardPattern     = `62[0-9]{14,17}`
-	logCreditCardPattern   = `4[0-9]{15}|5[1-5][0-9]{14}|3[47][0-9]{13}`
+	logChinesePhonePattern1 = `1[3-9][0-9]{9}`
+	logChinesePhonePattern2 = `(?:\b|^)(?:\+86|86)?1[3-9]\d{9}(?:\b|$)`
+	logChinesePhonePattern3 = `\b(?:86)?1[3-9][0-9]{9}\b`
+	logEmailPattern         = "[A-Za-z0-9.!#$%&'*+/?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\\b"
+	logChineseIDPattern     = `[1-9][0-9]{5}(18|19|20)[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]`
+	logBankCardPattern      = `62[0-9]{14,17}`
+	logCreditCardPattern    = `4[0-9]{15}|5[1-5][0-9]{14}|3[47][0-9]{13}`
 )
 
 func TestLogPIIFixtures(t *testing.T) {
@@ -24,7 +26,9 @@ func TestLogPIIFixtures(t *testing.T) {
 		record      string
 		want        int
 	}{
-		{"ChinesePhone", []scankit.Expression{{Id: 1, Pattern: logChinesePhonePattern}}, logPIIRecord("mobile", "13800138000"), 1},
+		{"ChinesePhonePattern1", []scankit.Expression{{Id: 1, Pattern: logChinesePhonePattern1}}, logPIIRecord("mobile", "13800138000"), 1},
+		{"ChinesePhonePattern2", []scankit.Expression{{Id: 1, Pattern: logChinesePhonePattern2}}, logPIIRecord("mobile", "13800138000"), 1},
+		{"ChinesePhonePattern3", []scankit.Expression{{Id: 1, Pattern: logChinesePhonePattern3}}, logPIIRecord("mobile", "13800138000"), 1},
 		{"Email", []scankit.Expression{{Id: 1, Pattern: logEmailPattern}}, logPIIRecord("email", "alice.zhang@example.com"), 1},
 		{"ChineseID", []scankit.Expression{{Id: 1, Pattern: logChineseIDPattern}}, logPIIRecord("identity_no", "11010520000101002X"), 1},
 		{"BankCard", []scankit.Expression{{Id: 1, Pattern: logBankCardPattern}}, logPIIRecord("bank_card", "6222021234567890"), 1},
@@ -65,6 +69,30 @@ func TestLogEmailPatternWithWordBoundariesMatchesEachAddress(t *testing.T) {
 		if got := string(data[match.From:match.To]); got != "12345678@qq.com" && got != "alice.smith42@example.cn" {
 			t.Fatalf("unexpected email match %q", got)
 		}
+	}
+}
+
+func TestLogChinesePhonePatternMatchesBoundedNumbers(t *testing.T) {
+	scanner, err := scankit.Compile([]scankit.Expression{{Id: 1, Pattern: logChinesePhonePattern2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("+8613800138000 mobile=13800138000 mobile=8613800138000 invalid=x13800138000 invalid=8613800138000x invalid=a8613800138000")
+	matches, err := scanner.Scan(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 3 {
+		t.Fatalf("match count = %d, want 3; matches=%#v", len(matches), matches)
+	}
+	if got := string(data[matches[0].From:matches[0].To]); got != "+8613800138000" {
+		t.Fatalf("first phone = %q, want +8613800138000", got)
+	}
+	if got := string(data[matches[1].From:matches[1].To]); got != "13800138000" {
+		t.Fatalf("second phone = %q, want 13800138000", got)
+	}
+	if got := string(data[matches[2].From:matches[2].To]); got != "8613800138000" {
+		t.Fatalf("third phone = %q, want 8613800138000", got)
 	}
 }
 
@@ -117,7 +145,7 @@ func logPIIMixedRecord() string {
 
 func logPIIMixedExpressions() []scankit.Expression {
 	return []scankit.Expression{
-		{Id: 1, Pattern: logChinesePhonePattern},
+		{Id: 1, Pattern: logChinesePhonePattern2},
 		{Id: 2, Pattern: logEmailPattern},
 		{Id: 3, Pattern: logChineseIDPattern},
 		{Id: 4, Pattern: logBankCardPattern},

@@ -86,12 +86,19 @@ func TestCompileSelectsOnlySafeInternalLiteralAnchors(t *testing.T) {
 }
 
 func TestLeadingWordBoundaryFallsBackFromFloatingAnchor(t *testing.T) {
-	scanner, err := Compile([]Expression{{Id: 1, Pattern: `\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b`}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(scanner.unanchoredGroups) != 1 || len(scanner.blockScanPlan.triggers) != 0 {
-		t.Fatalf("leading word-boundary scanner selected anchored plan: unanchored=%d triggers=%d", len(scanner.unanchoredGroups), len(scanner.blockScanPlan.triggers))
+	for _, pattern := range []string{
+		`\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b`,
+		`(?:\b|^)(?:\+86|86)?1[3-9][0-9]{9}(?:\b|$)`,
+	} {
+		t.Run(pattern, func(t *testing.T) {
+			scanner, err := Compile([]Expression{{Id: 1, Pattern: pattern}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(scanner.unanchoredGroups) != 1 || len(scanner.blockScanPlan.triggers) != 0 {
+				t.Fatalf("leading word-boundary scanner selected anchored plan: unanchored=%d triggers=%d", len(scanner.unanchoredGroups), len(scanner.blockScanPlan.triggers))
+			}
+		})
 	}
 }
 
@@ -202,10 +209,17 @@ func FuzzInternalLiteralAnchorMatchesNFABaseline(f *testing.F) {
 }
 
 func FuzzLeadingWordBoundaryFloatingAnchorMatchesNFABaseline(f *testing.F) {
-	const pattern = `\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b`
-	scanner, err := Compile([]Expression{{Id: 1, Pattern: pattern}})
-	if err != nil {
-		f.Fatal(err)
+	patterns := []string{
+		`\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b`,
+		`(?:\b|^)(?:\+86|86)?1[3-9][0-9]{9}(?:\b|$)`,
+	}
+	scanners := make([]*Scanner, len(patterns))
+	for index, pattern := range patterns {
+		scanner, err := Compile([]Expression{{Id: 1, Pattern: pattern}})
+		if err != nil {
+			f.Fatal(err)
+		}
+		scanners[index] = scanner
 	}
 	for _, seed := range [][]byte{
 		[]byte(`email=alice.smith42@example.cn other=12345678@qq.com`),
@@ -221,13 +235,15 @@ func FuzzLeadingWordBoundaryFloatingAnchorMatchesNFABaseline(f *testing.F) {
 		if len(data) > 1_024 {
 			t.Skip()
 		}
-		got, err := scanner.ScanInto(data, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := internalAnchorNFABaseline(t, pattern, data)
-		if !equalMatches(got, want) {
-			t.Fatalf("ScanInto(%q) = %#v, NFA baseline = %#v", data, got, want)
+		for index, pattern := range patterns {
+			got, err := scanners[index].ScanInto(data, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := internalAnchorNFABaseline(t, pattern, data)
+			if !equalMatches(got, want) {
+				t.Fatalf("ScanInto(%q, %q) = %#v, NFA baseline = %#v", pattern, data, got, want)
+			}
 		}
 	})
 }

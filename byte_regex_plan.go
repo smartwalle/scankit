@@ -114,12 +114,21 @@ func hasLeadingRegexWordBoundary(root *regexNode) bool {
 }
 
 func isRegexWordBoundary(node *regexNode) bool {
+	if node == nil {
+		return false
+	}
 	switch node.kind {
 	case regexWordBoundary, regexNotWordBoundary:
 		return true
+	case regexAlternate:
+		for _, child := range node.children {
+			if isRegexWordBoundary(child) {
+				return true
+			}
+		}
 	default:
-		return false
 	}
+	return false
 }
 
 // extractInternalLiteralAnchor 识别“可选固定字面量前导 + 无界单字节类重复 + 必经

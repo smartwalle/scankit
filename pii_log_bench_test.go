@@ -113,8 +113,16 @@ func piiBenchmarkDensities() []piiBenchmarkDensity {
 func piiBenchmarkScenarios() []piiBenchmarkScenario {
 	return []piiBenchmarkScenario{
 		{
-			name:        "Phone",
-			expressions: []scankit.Expression{{Id: 1, Pattern: logChinesePhonePattern}},
+			name:        "Phone1",
+			expressions: []scankit.Expression{{Id: 1, Pattern: logChinesePhonePattern1}},
+		},
+		{
+			name:        "Phone2",
+			expressions: []scankit.Expression{{Id: 1, Pattern: logChinesePhonePattern2}},
+		},
+		{
+			name:        "Phone3",
+			expressions: []scankit.Expression{{Id: 1, Pattern: logChinesePhonePattern3}},
 		},
 		{
 			name:        "Email",
@@ -214,9 +222,9 @@ func newPIIBenchmarkLog(scenario piiBenchmarkScenario, density piiBenchmarkDensi
 	for index := range piiBenchmarkRecordCount {
 		payload := piiBenchmarkNeutralPayload(index)
 		if density.hasMatchAtRow(index) {
-			payload = strings.Join(piiBenchmarkFields(scenario.name, index, true), " ")
+			payload = strings.Join(piiBenchmarkFields(piiBenchmarkScenarioType(scenario.name), index, true), " ")
 		} else if index%4 == 0 {
-			payload = strings.Join(piiBenchmarkFields(scenario.name, index, false), " ")
+			payload = strings.Join(piiBenchmarkFields(piiBenchmarkScenarioType(scenario.name), index, false), " ")
 		}
 		switch index % 4 {
 		case 0:
@@ -230,6 +238,35 @@ func newPIIBenchmarkLog(scenario piiBenchmarkScenario, density piiBenchmarkDensi
 		}
 	}
 	return []byte(builder.String())
+}
+
+func piiBenchmarkScenarioType(name string) string {
+	switch name {
+	case "Phone", "Phone1", "Phone2", "Phone3":
+		return "Phone"
+	default:
+		return name
+	}
+}
+
+func TestPIIBenchmarkScenarioType(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		want string
+	}{
+		{name: "Phone", want: "Phone"},
+		{name: "Phone1", want: "Phone"},
+		{name: "Phone2", want: "Phone"},
+		{name: "Phone3", want: "Phone"},
+		{name: "Email", want: "Email"},
+		{name: "AllPIITypes", want: "AllPIITypes"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := piiBenchmarkScenarioType(test.name); got != test.want {
+				t.Fatalf("piiBenchmarkScenarioType(%q) = %q, want %q", test.name, got, test.want)
+			}
+		})
+	}
 }
 
 func piiBenchmarkNeutralPayload(index int) string {

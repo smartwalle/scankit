@@ -154,6 +154,17 @@ func TestHammingNFAProductRejectsUnboundedResourceOrLanguageShapes(t *testing.T)
 	}
 }
 
+func TestHammingDistanceRejectsVariableWidthFixedExecutor(t *testing.T) {
+	_, err := scankit.Compile([]scankit.Expression{{
+		Id:      1,
+		Pattern: `\d{2,3}`,
+		Ext:     &scankit.ExpressionExt{Flags: scankit.ExtHammingDistance, HammingDistance: 1},
+	}})
+	if !errors.Is(err, scankit.ErrUnsupportedExtension) {
+		t.Fatalf("Compile() error = %v, want ErrUnsupportedExtension", err)
+	}
+}
+
 func TestEditDistanceMatchesBoundedVariableWidthByteClassRepeat(t *testing.T) {
 	t.Parallel()
 	lowered, err := scankit.Compile([]scankit.Expression{{

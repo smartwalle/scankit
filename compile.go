@@ -213,7 +213,7 @@ func Compile(expressions []Expression) (*Scanner, error) {
 				}
 				applyRegexFlags(root, 0)
 				fixed, ok := extractFixedByteRegex(root)
-				if ok {
+				if ok && fixedByteRegexHasSingleWidth(fixed) {
 					hammingRegexes = append(hammingRegexes, hammingFixedRegex{expressionIndex: uint32(index), sequences: fixed.sequences, distance: expression.Ext.HammingDistance})
 					continue
 				}

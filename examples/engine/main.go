@@ -12,7 +12,7 @@ func main() {
 	var engine, err = scankit.New([]scankit.Expression{
 		{
 			Id:      1,
-			Pattern: "1[3-9][0-9]{9}",
+			Pattern: `(?:\b|^)(?:\+86|86)?1[3-9]\d{9}(?:\b|$)`,
 		},
 		{
 			Id:      2,
