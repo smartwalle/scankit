@@ -56,6 +56,137 @@ func BenchmarkProfileScanPaths(b *testing.B) {
 	}
 }
 
+// BenchmarkProfileTriggerDispatch 将 AC 输出后的 trigger 分派从自动机遍历中拆开。它覆盖
+// 单个字面量事件、锚定候选被后缀条件拒绝、锚定完整命中，以及同一结束位置的多个消费者；
+// 仅用于 profile 和前后对比，不代表业务规则或发布指标。
+func BenchmarkProfileTriggerDispatch(b *testing.B) {
+	for _, test := range []struct {
+		name        string
+		expressions []Expression
+		data        []byte
+	}{
+		{
+			name:        "Literal/HighMatch",
+			expressions: []Expression{{Id: 1, Pattern: `marker=value`}},
+			data:        bytes.Repeat([]byte(`marker=value `), 256),
+		},
+		{
+			name:        "Anchored/CandidateRejected",
+			expressions: []Expression{{Id: 1, Pattern: `marker=[A-Z]{4}[0-9]{4}`}},
+			data:        bytes.Repeat([]byte(`marker=ABCDxxxx `), 256),
+		},
+		{
+			name:        "Anchored/HighMatch",
+			expressions: []Expression{{Id: 1, Pattern: `marker=[A-Z]{4}[0-9]{4}`}},
+			data:        bytes.Repeat([]byte(`marker=ABCD1234 `), 256),
+		},
+		{
+			name: "MultipleConsumers/HighMatch",
+			expressions: []Expression{
+				{Id: 1, Pattern: `marker=value`},
+				{Id: 2, Pattern: `marker=value`},
+				{Id: 3, Pattern: `marker=value`},
+				{Id: 4, Pattern: `marker=value`},
+			},
+			data: bytes.Repeat([]byte(`marker=value `), 256),
+		},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			scanner, err := Compile(test.expressions)
+			if err != nil {
+				b.Fatal(err)
+			}
+			want, err := scanner.Scan(test.data)
+			if err != nil {
+				b.Fatal(err)
+			}
+			benchmarkProfileScanInto(b, scanner, test.data, want)
+		})
+	}
+}
+
+// BenchmarkProfileLiteralDelivery 比较纯单字面量的根字节机器字扫描与 direct-literal
+// 投递。后者跳过内部事件层，前者可跳过不含根字节的完整机器字；该基准用于决定两条
+// 通用调度路径的适用范围，不代表业务场景。
+func BenchmarkProfileLiteralDelivery(b *testing.B) {
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: `marker=value`}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	if scanner.directLiterals || !scanner.automaton.rootByteFast {
+		b.Fatal("expected root-byte literal delivery path")
+	}
+	direct := *scanner
+	direct.directLiterals = true
+	data := bytes.Repeat([]byte(`marker=value `), 256)
+	want, err := scanner.Scan(data)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		scanner *Scanner
+	}{
+		{name: "RootByteWord", scanner: scanner},
+		{name: "DirectLiteral", scanner: &direct},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			benchmarkProfileScanInto(b, test.scanner, data, want)
+		})
+	}
+}
+
+// BenchmarkProfileMixedUnanchoredChannels 分别启用 fixed executor、fixed class-anchor
+// 与 always NFA/DFA 通道，并测量它们组合后的边际扫描成本。规则只描述通用字节正则
+// 结构；它是编译期通道分流的定位依据，不作为业务或发布基准。
+func BenchmarkProfileMixedUnanchoredChannels(b *testing.B) {
+	data := bytes.Repeat([]byte(`record=ab12 candidate=aXbXcXdX value=4111111111111111 `), 128)
+	for _, test := range []struct {
+		name        string
+		expressions []Expression
+	}{
+		{
+			name:        "Fixed",
+			expressions: []Expression{{Id: 1, Pattern: `4[0-9]{15}|5[1-5][0-9]{14}|3[47][0-9]{13}`}},
+		},
+		{
+			name:        "FixedAnchor",
+			expressions: []Expression{{Id: 1, Pattern: `(?:a[0-9]|b[0-9]|c[0-9]|d[0-9]){4}`}},
+		},
+		{
+			name:        "AlwaysDFA",
+			expressions: []Expression{{Id: 1, Pattern: `(?:ab|ac)[0-9]{1,2}`}},
+		},
+		{
+			name: "FixedAndAnchor",
+			expressions: []Expression{
+				{Id: 1, Pattern: `4[0-9]{15}|5[1-5][0-9]{14}|3[47][0-9]{13}`},
+				{Id: 2, Pattern: `(?:a[0-9]|b[0-9]|c[0-9]|d[0-9]){4}`},
+			},
+		},
+		{
+			name: "AllChannels",
+			expressions: []Expression{
+				{Id: 1, Pattern: `4[0-9]{15}|5[1-5][0-9]{14}|3[47][0-9]{13}`},
+				{Id: 2, Pattern: `(?:a[0-9]|b[0-9]|c[0-9]|d[0-9]){4}`},
+				{Id: 3, Pattern: `(?:ab|ac)[0-9]{1,2}`},
+			},
+		},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			scanner, err := Compile(test.expressions)
+			if err != nil {
+				b.Fatal(err)
+			}
+			want, err := scanner.Scan(data)
+			if err != nil {
+				b.Fatal(err)
+			}
+			benchmarkProfileScanInto(b, scanner, data, want)
+		})
+	}
+}
+
 // BenchmarkProfileSingleByteAnchorWord 将单字节锚点的机器字扫描从业务规则中拆出。
 // 它覆盖一个或两个根锚点、无命中、稀疏命中、高密度命中，以及验证器产生未来事件的情形；
 // 仅用于 profile 和前后对比，不表示日志脱敏的发布指标。

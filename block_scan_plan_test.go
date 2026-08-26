@@ -86,6 +86,106 @@ func TestCompileUsesFixedAnchorForLargeFixedWidthAlternation(t *testing.T) {
 	}
 }
 
+func TestFixedOnlyBlockScanPreservesGenericSemantics(t *testing.T) {
+	tests := []struct {
+		name        string
+		expressions []Expression
+		data        []byte
+	}{
+		{
+			name:        "fixed executor",
+			expressions: []Expression{{Id: 1, Pattern: `4[0-9]{15}|5[1-5][0-9]{14}|3[47][0-9]{13}`}},
+			data:        []byte(`x4111111111111111 y5111111111111111 z371234567890123`),
+		},
+		{
+			name:        "class anchor",
+			expressions: []Expression{{Id: 1, Pattern: `(?:a[0-9]|b[0-9]|c[0-9]|d[0-9]){4}`}},
+			data:        []byte(`a0b1c2d3 aXbXcXdX d0c1b2a3`),
+		},
+		{
+			name: "filtered events",
+			expressions: []Expression{
+				{Id: 1, Pattern: `(?:a[0-9]|b[0-9]|c[0-9]|d[0-9]){4}`, Flags: CompileSingleMatch},
+				{Id: 2, Pattern: `4[0-9]{15}|5[1-5][0-9]{14}|3[47][0-9]{13}`, Ext: &ExpressionExt{Flags: ExtMinLength, MinLength: 16}},
+			},
+			data: []byte(`a0b1c2d3 4111111111111111 a1b2c3d4 371234567890123`),
+		},
+		{
+			name: "combination",
+			expressions: []Expression{
+				{Id: 1, Pattern: `(?:a[0-9]|b[0-9]|c[0-9]|d[0-9]){4}`},
+				{Id: 2, Pattern: `4[0-9]{15}|5[1-5][0-9]{14}|3[47][0-9]{13}`},
+				{Id: 3, Pattern: `1&2`, Flags: CompileCombination},
+			},
+			data: []byte(`a0b1c2d3 4111111111111111`),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			scanner, err := Compile(test.expressions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !scanner.fixedOnlyBlock {
+				t.Fatal("compiled scanner did not select fixed-only Block path")
+			}
+			reference := *scanner
+			reference.fixedOnlyBlock = false
+			got, err := scanner.Scan(test.data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := reference.Scan(test.data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("fixed-only Scan() = %#v, generic Scan() = %#v", got, want)
+			}
+		})
+	}
+}
+
+func FuzzFixedOnlyBlockScanPreservesGenericSemantics(f *testing.F) {
+	for _, seed := range [][]byte{
+		[]byte(`a0b1c2d3 4111111111111111 d0c1b2a3 371234567890123`),
+		[]byte{},
+		{0xff, '4', '1', '1', '1', 'a', '0', 'b', '1', 'c', '2', 'd', '3'},
+	} {
+		f.Add(seed)
+	}
+	expressions := []Expression{
+		{Id: 1, Pattern: `(?:a[0-9]|b[0-9]|c[0-9]|d[0-9]){4}`, Flags: CompileSingleMatch},
+		{Id: 2, Pattern: `4[0-9]{15}|5[1-5][0-9]{14}|3[47][0-9]{13}`, Ext: &ExpressionExt{Flags: ExtMinLength, MinLength: 16}},
+		{Id: 3, Pattern: `1&2`, Flags: CompileCombination},
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 512 {
+			t.Skip()
+		}
+		scanner, err := Compile(expressions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !scanner.fixedOnlyBlock {
+			t.Fatal("compiled scanner did not select fixed-only Block path")
+		}
+		reference := *scanner
+		reference.fixedOnlyBlock = false
+		got, err := scanner.ScanInto(data, make([]Match, 0, 8))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := reference.ScanInto(data, make([]Match, 0, 8))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("fixed-only ScanInto(%q) = %#v, generic ScanInto() = %#v", data, got, want)
+		}
+	})
+}
+
 func TestDirectLiteralScanPreservesEventOrder(t *testing.T) {
 	expressions := []Expression{
 		{Id: 1, Pattern: `matched`},

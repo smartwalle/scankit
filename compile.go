@@ -536,6 +536,7 @@ func Compile(expressions []Expression) (*Scanner, error) {
 			}
 		}
 	}
+	fixedOnlyBlock := !advancedEvents && len(triggers) == 0 && len(blockScanPlan.unanchored.always) == 0 && blockScanPlan.unanchored.hasLanes()
 	unicodePlan := blockScanPlan.unicode.scanPlan
 	// 单根字特化仅对选择性强的固定前导锚点有效。浮动锚点和单字节前缀的候选工作量较多，
 	// 通用扫描器更适合。
@@ -578,6 +579,7 @@ func Compile(expressions []Expression) (*Scanner, error) {
 		advancedEvents:        advancedEvents,
 		directLiterals:        directLiterals,
 		directSingleEvent:     directSingleEvent,
+		fixedOnlyBlock:        fixedOnlyBlock,
 		requiresUTF8:          requiresUTF8,
 		singleByteOnly:        singleByteOnly,
 		singleByteFast:        singleByteFast,

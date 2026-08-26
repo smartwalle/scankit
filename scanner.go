@@ -166,6 +166,7 @@ type Scanner struct {
 	advancedEvents        bool
 	directLiterals        bool
 	directSingleEvent     bool
+	fixedOnlyBlock        bool
 	requiresUTF8          bool
 	singleByteOnly        bool
 	singleByteFast        bool
@@ -993,6 +994,9 @@ func (scanner *Scanner) scanBlock(data []byte, ctx *context, matches *[]Match) e
 		}
 		return scanner.scanBlockAnchoredOnly(data, ctx, matches)
 	}
+	if scanner.fixedOnlyBlock {
+		return scanner.scanBlockFixedOnly(data, ctx, matches)
+	}
 	state := uint32(0)
 	if scanner.advancedEvents && len(scanner.emptyRegex) != 0 {
 		scanner.appendEmptyRegexEvents(&ctx.readyEvents, 0, data)
@@ -1086,6 +1090,56 @@ func (scanner *Scanner) scanBlock(data []byte, ctx *context, matches *[]Match) e
 			scanner.appendBlockHammingEvents(&ctx.readyEvents, ctx, data, offset+1)
 			scanner.appendBlockEditEvents(&ctx.readyEvents, ctx, data, offset+1)
 			scanner.appendEmptyRegexEvents(&ctx.readyEvents, uint64(offset+1), data)
+		}
+		end := uint64(offset + 1)
+		if len(ctx.readyEvents) != 0 || ctx.pendingCount != 0 && ctx.pendingFirstEnd <= end {
+			collectScanEvents(scanner, ctx, offset+1, matches)
+		}
+	}
+	return nil
+}
+
+// scanBlockFixedOnly 处理没有字面量 trigger、没有 always NFA/DFA、也没有扩展事件的
+// 固定宽度通道。此时通用 Block 循环的 AC 状态转移与 always lane 均不可能产生事件，
+// 因而可以省去这些每字节读取；命中仍经过原有 pending 与事件收集层。
+func (scanner *Scanner) scanBlockFixedOnly(data []byte, ctx *context, matches *[]Match) error {
+	plan := scanner.blockScanPlan.unanchored
+	for offset := 0; offset < len(data); offset++ {
+		value := data[offset]
+		for _, lane := range plan.fixed[value] {
+			for _, found := range ctx.regexFixed[lane.contextIndex].advance(lane.fixed, data, offset) {
+				for _, expressionIndex := range lane.consumers {
+					expression := scanner.expressions[expressionIndex]
+					event := scanEvent{match: Match{Id: expression.id, From: uint64(found.start), To: uint64(found.end)}, expressionIndex: expressionIndex}
+					if found.end == offset+1 {
+						ctx.readyEvents = append(ctx.readyEvents, event)
+					} else {
+						ctx.pushPendingEvent(event)
+					}
+				}
+			}
+		}
+		for _, lane := range plan.fixedAnchor[value] {
+			anchor := lane.anchor
+			start := offset - anchor.offset
+			if start < 0 || start+anchor.width > len(data) {
+				continue
+			}
+			if anchor.checks != nil && !fixedByteRegexAnchorChecksMatch(data, start, anchor.checks) {
+				continue
+			}
+			verifier := ctx.regexVerifiers[lane.contextIndex]
+			for _, end := range verifier.matchFromLimit(lane.program, data, start, anchor.width) {
+				for _, expressionIndex := range lane.consumers {
+					expression := scanner.expressions[expressionIndex]
+					event := scanEvent{match: Match{Id: expression.id, From: uint64(start), To: uint64(end)}, expressionIndex: expressionIndex}
+					if end == offset+1 {
+						ctx.readyEvents = append(ctx.readyEvents, event)
+					} else {
+						ctx.pushPendingEvent(event)
+					}
+				}
+			}
 		}
 		end := uint64(offset + 1)
 		if len(ctx.readyEvents) != 0 || ctx.pendingCount != 0 && ctx.pendingFirstEnd <= end {
