@@ -167,6 +167,9 @@ type Scanner struct {
 	directLiterals        bool
 	directSingleEvent     bool
 	fixedOnlyBlock        bool
+	fixedOnlyWordScan     bool
+	fixedOnlyTriggerCount uint8
+	fixedOnlyTriggers     [8]byte
 	requiresUTF8          bool
 	singleByteOnly        bool
 	singleByteFast        bool
@@ -651,6 +654,23 @@ func hasSingleRootFixedAnchoredTrigger(automaton literalAutomaton, plan blockSca
 		lane.anchored.anchorLength >= 2
 }
 
+// fixedOnlyBlockTriggers 汇总 fixed executor 与 fixed class-anchor 通道的触发字节。
+// 只有触发集合不超过八个字节时才启用机器字预过滤；更宽的集合保留标量路径，避免额外
+// 分派和不具选择性的预过滤伤害通用规则。
+func fixedOnlyBlockTriggers(plan blockScanPlan) (values [8]byte, count uint8, ok bool) {
+	for value := range plan.unanchored.fixed {
+		if len(plan.unanchored.fixed[value]) == 0 && len(plan.unanchored.fixedAnchor[value]) == 0 {
+			continue
+		}
+		if count == uint8(len(values)) {
+			return values, 0, false
+		}
+		values[count] = byte(value)
+		count++
+	}
+	return values, count, count != 0
+}
+
 func isBlockTriggerAnchored(kind blockTriggerLaneKind) bool {
 	return kind == blockTriggerAnchored || kind == blockTriggerAnchoredAtStart
 }
@@ -1026,6 +1046,9 @@ func (scanner *Scanner) scanBlock(data []byte, ctx *context, matches *[]Match) e
 		return scanner.scanBlockAnchoredOnly(data, ctx, matches)
 	}
 	if scanner.fixedOnlyBlock {
+		if scanner.fixedOnlyWordScan {
+			return scanner.scanBlockFixedOnlyWord(data, ctx, matches)
+		}
 		return scanner.scanBlockFixedOnly(data, ctx, matches)
 	}
 	state := uint32(0)
@@ -1176,6 +1199,64 @@ func (scanner *Scanner) scanBlockFixedOnly(data []byte, ctx *context, matches *[
 		if len(ctx.readyEvents) != 0 || ctx.pendingCount != 0 && ctx.pendingFirstEnd <= end {
 			collectScanEvents(scanner, ctx, offset+1, matches)
 		}
+	}
+	return nil
+}
+
+// scanBlockFixedOnlyWord 在 fixed-only 的触发字节集合不超过八个时，以机器字跳过不含
+// 候选的连续八字节。遇到候选或待处理事件结束位置后立即恢复逐字节处理，保持事件顺序。
+func (scanner *Scanner) scanBlockFixedOnlyWord(data []byte, ctx *context, matches *[]Match) error {
+	plan := scanner.blockScanPlan.unanchored
+	offset := 0
+	for offset < len(data) {
+		wordEnd := offset + 8
+		if wordEnd <= len(data) &&
+			rootByteTriggerMask(data, offset, scanner.fixedOnlyTriggers, scanner.fixedOnlyTriggerCount) == 0 &&
+			(ctx.pendingCount == 0 || ctx.pendingFirstEnd > uint64(wordEnd)) {
+			offset = wordEnd
+			continue
+		}
+		value := data[offset]
+		for _, lane := range plan.fixed[value] {
+			for _, found := range ctx.regexFixed[lane.contextIndex].advance(lane.fixed, data, offset) {
+				for _, expressionIndex := range lane.consumers {
+					expression := scanner.expressions[expressionIndex]
+					event := scanEvent{match: Match{Id: expression.id, From: uint64(found.start), To: uint64(found.end)}, expressionIndex: expressionIndex}
+					if found.end == offset+1 {
+						ctx.readyEvents = append(ctx.readyEvents, event)
+					} else {
+						ctx.pushPendingEvent(event)
+					}
+				}
+			}
+		}
+		for _, lane := range plan.fixedAnchor[value] {
+			anchor := lane.anchor
+			start := offset - anchor.offset
+			if start < 0 || start+anchor.width > len(data) {
+				continue
+			}
+			if anchor.checks != nil && !fixedByteRegexAnchorChecksMatch(data, start, anchor.checks) {
+				continue
+			}
+			verifier := ctx.regexVerifiers[lane.contextIndex]
+			for _, end := range verifier.matchFromLimit(lane.program, data, start, anchor.width) {
+				for _, expressionIndex := range lane.consumers {
+					expression := scanner.expressions[expressionIndex]
+					event := scanEvent{match: Match{Id: expression.id, From: uint64(start), To: uint64(end)}, expressionIndex: expressionIndex}
+					if end == offset+1 {
+						ctx.readyEvents = append(ctx.readyEvents, event)
+					} else {
+						ctx.pushPendingEvent(event)
+					}
+				}
+			}
+		}
+		end := uint64(offset + 1)
+		if len(ctx.readyEvents) != 0 || ctx.pendingCount != 0 && ctx.pendingFirstEnd <= end {
+			collectScanEvents(scanner, ctx, offset+1, matches)
+		}
+		offset++
 	}
 	return nil
 }

@@ -129,8 +129,11 @@ func TestFixedOnlyBlockScanPreservesGenericSemantics(t *testing.T) {
 			if !scanner.fixedOnlyBlock {
 				t.Fatal("compiled scanner did not select fixed-only Block path")
 			}
+			if singleByteWordScanAvailable && (!scanner.fixedOnlyWordScan || scanner.fixedOnlyTriggerCount == 0) {
+				t.Fatalf("compiled scanner did not select fixed-only word path: enabled=%t triggers=%d", scanner.fixedOnlyWordScan, scanner.fixedOnlyTriggerCount)
+			}
 			reference := *scanner
-			reference.fixedOnlyBlock = false
+			reference.fixedOnlyWordScan = false
 			got, err := scanner.Scan(test.data)
 			if err != nil {
 				t.Fatal(err)
@@ -170,8 +173,11 @@ func FuzzFixedOnlyBlockScanPreservesGenericSemantics(f *testing.F) {
 		if !scanner.fixedOnlyBlock {
 			t.Fatal("compiled scanner did not select fixed-only Block path")
 		}
+		if singleByteWordScanAvailable && (!scanner.fixedOnlyWordScan || scanner.fixedOnlyTriggerCount == 0) {
+			t.Fatalf("compiled scanner did not select fixed-only word path: enabled=%t triggers=%d", scanner.fixedOnlyWordScan, scanner.fixedOnlyTriggerCount)
+		}
 		reference := *scanner
-		reference.fixedOnlyBlock = false
+		reference.fixedOnlyWordScan = false
 		got, err := scanner.ScanInto(data, make([]Match, 0, 8))
 		if err != nil {
 			t.Fatal(err)
