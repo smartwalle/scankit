@@ -85,6 +85,16 @@ func TestCompileSelectsOnlySafeInternalLiteralAnchors(t *testing.T) {
 	}
 }
 
+func TestLeadingWordBoundaryFallsBackFromFloatingAnchor(t *testing.T) {
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: `\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scanner.unanchoredGroups) != 1 || len(scanner.blockScanPlan.triggers) != 0 {
+		t.Fatalf("leading word-boundary scanner selected anchored plan: unanchored=%d triggers=%d", len(scanner.unanchoredGroups), len(scanner.blockScanPlan.triggers))
+	}
+}
+
 func TestInternalLiteralAnchorPreservesEventSemantics(t *testing.T) {
 	t.Parallel()
 
@@ -187,6 +197,37 @@ func FuzzInternalLiteralAnchorMatchesNFABaseline(f *testing.F) {
 			if !equalMatches(got, want) {
 				t.Fatalf("Scan(%q, %q) = %#v, want %#v", pattern, data, got, want)
 			}
+		}
+	})
+}
+
+func FuzzLeadingWordBoundaryFloatingAnchorMatchesNFABaseline(f *testing.F) {
+	const pattern = `\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b`
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: pattern}})
+	if err != nil {
+		f.Fatal(err)
+	}
+	for _, seed := range [][]byte{
+		[]byte(`email=alice.smith42@example.cn other=12345678@qq.com`),
+		[]byte(`prefix_alice.smith42@example.cn invalid=user@example..invalid`),
+		[]byte(`email=a@example.com email=b@example.net`),
+		[]byte(`00000000000000000000@0000000.0.0`),
+		{},
+		{0xff, 'a', '@', 'b', '.', 'c', 'n'},
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 1_024 {
+			t.Skip()
+		}
+		got, err := scanner.ScanInto(data, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := internalAnchorNFABaseline(t, pattern, data)
+		if !equalMatches(got, want) {
+			t.Fatalf("ScanInto(%q) = %#v, NFA baseline = %#v", data, got, want)
 		}
 	})
 }

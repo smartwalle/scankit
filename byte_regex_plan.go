@@ -37,6 +37,11 @@ func compileByteRegexPlan(root *regexNode, flags CompileFlag) (byteRegexCompileP
 	anchor, hasBoundedAnchor := selectRegexAnchor(analysis)
 	internalAnchor, internalPrefixClass, internalLeading, hasInternalAnchor := extractInternalLiteralAnchor(root)
 	hasInternalAnchor = hasInternalAnchor && flags&CompileCaseless == 0
+	// 前置单词边界会使浮动字面量锚点的候选起点与触发位置不再能由现有 verifier 安全关联。
+	// 保持通用 NFA 调度器可避免某个较早候选吞掉后续触发器，从而漏报独立匹配。
+	if hasLeadingRegexWordBoundary(root) && anchor.minOffset != anchor.maxOffset {
+		hasBoundedAnchor = false
+	}
 	prefixClass, hasPrefixClass := leadingBoundedPrefixClass(root, anchor)
 	if !hasPrefixClass {
 		for _, candidate := range analysis.anchors {
@@ -88,6 +93,33 @@ func compileByteRegexPlan(root *regexNode, flags CompileFlag) (byteRegexCompileP
 		}
 	}
 	return plan, nil
+}
+
+// hasLeadingRegexWordBoundary 识别连接表达式开头的 \b 或 \B。^ 和 \A 会将起点固定，
+// 因此仍可安全使用字面量锚点；单词边界允许多个候选起点，必须保持通用 NFA 调度。
+func hasLeadingRegexWordBoundary(root *regexNode) bool {
+	if root == nil {
+		return false
+	}
+	if root.kind != regexConcat {
+		return isRegexWordBoundary(root)
+	}
+	for _, child := range root.children {
+		if child.kind == regexEmpty {
+			continue
+		}
+		return isRegexWordBoundary(child)
+	}
+	return false
+}
+
+func isRegexWordBoundary(node *regexNode) bool {
+	switch node.kind {
+	case regexWordBoundary, regexNotWordBoundary:
+		return true
+	default:
+		return false
+	}
 }
 
 // extractInternalLiteralAnchor 识别“可选固定字面量前导 + 无界单字节类重复 + 必经

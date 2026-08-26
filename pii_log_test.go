@@ -47,6 +47,27 @@ func TestLogPIIFixtures(t *testing.T) {
 	}
 }
 
+func TestLogEmailPatternWithWordBoundariesMatchesEachAddress(t *testing.T) {
+	pattern := `\b` + logEmailPattern
+	scanner, err := scankit.Compile([]scankit.Expression{{Id: 1, Pattern: pattern}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte(`phone=13800138000 12345678@qq.com email=alice.smith42@example.cn invalid=12345678901`)
+	matches, err := scanner.Scan(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 2 {
+		t.Fatalf("match count = %d, want 2; matches=%#v", len(matches), matches)
+	}
+	for _, match := range matches {
+		if got := string(data[match.From:match.To]); got != "12345678@qq.com" && got != "alice.smith42@example.cn" {
+			t.Fatalf("unexpected email match %q", got)
+		}
+	}
+}
+
 func FuzzLogPIIRulesScanInto(f *testing.F) {
 	database, err := scankit.Compile(logPIIMixedExpressions())
 	if err != nil {
