@@ -14,6 +14,7 @@ const (
 type fixedByteRegex struct {
 	sequences            []fixedByteRegexSequence
 	sequenceTrigger      [byteClassCardinality][]uint16
+	sharedSuffix         [byteClassCardinality]uint8
 	leadingWordBoundary  fixedByteRegexBoundary
 	trailingWordBoundary fixedByteRegexBoundary
 }
@@ -102,6 +103,36 @@ func extractFixedByteRegex(root *regexNode) (*fixedByteRegex, bool) {
 			if trigger.contains(byte(value)) {
 				program.sequenceTrigger[value] = append(program.sequenceTrigger[value], uint16(index))
 			}
+		}
+	}
+	for value, sequenceIndexes := range program.sequenceTrigger {
+		if len(sequenceIndexes) < 2 {
+			continue
+		}
+		first := program.sequences[sequenceIndexes[0]]
+		shared := 0
+		for {
+			position := first.triggerOffset + shared + 1
+			if position >= len(first.classes) {
+				break
+			}
+			class := first.classes[position]
+			matchesAll := true
+			for _, sequenceIndex := range sequenceIndexes[1:] {
+				sequence := program.sequences[sequenceIndex]
+				otherPosition := sequence.triggerOffset + shared + 1
+				if otherPosition >= len(sequence.classes) || sequence.classes[otherPosition] != class {
+					matchesAll = false
+					break
+				}
+			}
+			if !matchesAll {
+				break
+			}
+			shared++
+		}
+		if shared != 0 {
+			program.sharedSuffix[value] = uint8(shared)
 		}
 	}
 	return program, true
@@ -578,7 +609,23 @@ func fixedByteRegexPositionClasses(node *regexNode) ([]byteClass, bool) {
 // 投递结果，或经由常规待处理事件队列投递。
 func (run *fixedByteRegexRun) advance(program *fixedByteRegex, data []byte, offset int) []fixedByteRegexMatch {
 	matches := run.matches[:0]
-	for _, sequenceIndex := range program.sequenceTrigger[data[offset]] {
+	value := data[offset]
+	sequenceIndexes := program.sequenceTrigger[value]
+	sharedSuffix := int(program.sharedSuffix[value])
+	if sharedSuffix != 0 {
+		if offset+sharedSuffix >= len(data) {
+			run.matches = matches
+			return matches
+		}
+		first := program.sequences[sequenceIndexes[0]]
+		for index := 0; index < sharedSuffix; index++ {
+			if !first.classes[first.triggerOffset+index+1].contains(data[offset+index+1]) {
+				run.matches = matches
+				return matches
+			}
+		}
+	}
+	for _, sequenceIndex := range sequenceIndexes {
 		sequence := program.sequences[sequenceIndex]
 		start := offset - sequence.triggerOffset
 		end := start + len(sequence.classes)
@@ -595,7 +642,7 @@ func (run *fixedByteRegexRun) advance(program *fixedByteRegex, data []byte, offs
 			}
 		}
 		if matched {
-			for index := sequence.triggerOffset + 1; index < len(sequence.classes); index++ {
+			for index := sequence.triggerOffset + sharedSuffix + 1; index < len(sequence.classes); index++ {
 				if !sequence.classes[index].contains(data[start+index]) {
 					matched = false
 					break

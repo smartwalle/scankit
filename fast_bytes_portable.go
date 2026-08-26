@@ -38,3 +38,25 @@ func rootByteSingleTriggerMask(data []byte, offset int, value byte) uint64 {
 	}
 	return mask
 }
+
+func byteWordRangeAndValuesMask(data []byte, offset int, minimum, maximum byte, values [2]byte, count uint8) uint64 {
+	var mask uint64
+	for lane := 0; lane < 8; lane++ {
+		value := data[offset+lane]
+		if value >= minimum && value <= maximum || count != 0 && value == values[0] || count == 2 && value == values[1] {
+			mask |= uint64(0x80) << (lane * 8)
+		}
+	}
+	return mask
+}
+
+func byteWordRangeAndSingleMask(data []byte, offset int, minimum, maximum, value byte) uint64 {
+	var mask uint64
+	for lane := 0; lane < 8; lane++ {
+		current := data[offset+lane]
+		if current >= minimum && current <= maximum || current == value {
+			mask |= uint64(0x80) << (lane * 8)
+		}
+	}
+	return mask
+}

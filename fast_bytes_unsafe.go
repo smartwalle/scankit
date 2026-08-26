@@ -58,7 +58,33 @@ func rootByteSingleTriggerMask(data []byte, offset int, value byte) uint64 {
 	return byteWordMatchMask(word, value)
 }
 
+func byteWordRangeAndValuesMask(data []byte, offset int, minimum, maximum byte, values [2]byte, count uint8) uint64 {
+	word := *(*uint64)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(data)), offset))
+	mask := byteWordRangeMask(word, minimum, maximum)
+	if count != 0 {
+		mask |= byteWordMatchMask(word, values[0])
+	}
+	if count == 2 {
+		mask |= byteWordMatchMask(word, values[1])
+	}
+	return mask
+}
+
+func byteWordRangeAndSingleMask(data []byte, offset int, minimum, maximum, value byte) uint64 {
+	word := *(*uint64)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(data)), offset))
+	return byteWordRangeMask(word, minimum, maximum) | byteWordMatchMask(word, value)
+}
+
 func byteWordMatchMask(word uint64, value byte) uint64 {
 	xor := word ^ uint64(value)*byteWordOnes
 	return (xor - byteWordOnes) &^ xor & byteWordHigh
+}
+
+// byteWordRangeMask 精确标记 [minimum, maximum] 内的 ASCII byte lanes。计算先清除原
+// 高位，使每个 lane 的加减均不会跨 lane 借位或进位；原高位字节在最终交集里被排除。
+func byteWordRangeMask(word uint64, minimum, maximum byte) uint64 {
+	low := word &^ byteWordHigh
+	greaterOrEqual := (low + uint64(0x80-minimum)*byteWordOnes) & byteWordHigh
+	lessOrEqual := (uint64(0x80+maximum)*byteWordOnes - low) & byteWordHigh
+	return greaterOrEqual & lessOrEqual &^ word
 }

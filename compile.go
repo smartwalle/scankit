@@ -510,8 +510,9 @@ func Compile(expressions []Expression) (*Scanner, error) {
 			}
 		}
 	}
-	blockScanPlan := buildBlockScanPlan(regexPrograms, compiled, unanchoredGroups, unanchoredNeeded, triggers, anchoredGroups, anchoredNeeded, eventNeeded, advancedEvents)
+	blockPlan := buildBlockScanPlan(regexPrograms, compiled, unanchoredGroups, unanchoredNeeded, triggers, anchoredGroups, anchoredNeeded, eventNeeded, advancedEvents)
 	automaton := builder.freeze()
+	blockPlan.mixed = buildMixedTriggerPlan(automaton, blockPlan, advancedEvents, len(unicodeProperties) != 0 || len(unicodeApproximate) != 0)
 	directLiterals := false
 	for state := range automaton.outputStart {
 		if automaton.outputEnd[state]-automaton.outputStart[state] > 1 {
@@ -536,13 +537,13 @@ func Compile(expressions []Expression) (*Scanner, error) {
 			}
 		}
 	}
-	fixedOnlyBlock := !advancedEvents && len(triggers) == 0 && len(blockScanPlan.unanchored.always) == 0 && blockScanPlan.unanchored.hasLanes()
-	fixedOnlyTriggers, fixedOnlyTriggerCount, fixedOnlyWordScan := fixedOnlyBlockTriggers(blockScanPlan)
+	fixedOnlyBlock := !advancedEvents && len(triggers) == 0 && len(blockPlan.unanchored.always) == 0 && blockPlan.unanchored.hasLanes()
+	fixedOnlyTriggers, fixedOnlyTriggerCount, fixedOnlyWordScan := fixedOnlyBlockTriggers(blockPlan)
 	fixedOnlyWordScan = fixedOnlyWordScan && singleByteWordScanAvailable
-	unicodePlan := blockScanPlan.unicode.scanPlan
+	unicodePlan := blockPlan.unicode.scanPlan
 	// 单根字特化仅对选择性强的固定前导锚点有效。浮动锚点和单字节前缀的候选工作量较多，
 	// 通用扫描器更适合。
-	singleRootFixedAnchor := hasSingleRootFixedAnchoredTrigger(automaton, blockScanPlan)
+	singleRootFixedAnchor := hasSingleRootFixedAnchoredTrigger(automaton, blockPlan)
 	// 大型等价锚定表达式组（例如多个租户共用一条规则体）会让每个触发器生成多个未来事件。
 	// 仅这些分组启用 FIFO 快路径；普通数据库保留紧凑的堆路径，避免增加每事件分支。
 	orderedPendingEvents := false
@@ -567,7 +568,7 @@ func Compile(expressions []Expression) (*Scanner, error) {
 		unanchoredRegex:       unanchoredRegex,
 		unanchoredGroups:      unanchoredGroups,
 		unanchoredNeeded:      unanchoredNeeded,
-		blockScanPlan:         blockScanPlan,
+		blockScanPlan:         blockPlan,
 		eventNeeded:           eventNeeded,
 		emptyRegex:            emptyRegex,
 		hammingLiterals:       hammingLiterals,

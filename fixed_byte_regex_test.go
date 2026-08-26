@@ -119,6 +119,9 @@ func TestExtractFixedByteRegexSupportsBoundariesAndBoundedWidth(t *testing.T) {
 	if len(fixed.sequenceTrigger['1']) != 3 || len(fixed.sequenceTrigger['+']) != 0 || len(fixed.sequenceTrigger['8']) != 0 {
 		t.Fatalf("shared trigger counts = 1:%d +:%d 8:%d, want 3/0/0", len(fixed.sequenceTrigger['1']), len(fixed.sequenceTrigger['+']), len(fixed.sequenceTrigger['8']))
 	}
+	if fixed.sharedSuffix['1'] != 10 {
+		t.Fatalf("shared trigger suffix length = %d, want 10", fixed.sharedSuffix['1'])
+	}
 	scanner, err := Compile([]Expression{{Id: 1, Pattern: `(?:\b|^)(?:\+86|86)?1[3-9][0-9]{9}(?:\b|$)`}})
 	if err != nil {
 		t.Fatal(err)
