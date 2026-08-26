@@ -186,6 +186,82 @@ func withoutRootByteAnchoredPrefixDFA(scanner *Scanner) *Scanner {
 	return &reference
 }
 
+func TestAnchoredAtStartScanPreservesGenericSemantics(t *testing.T) {
+	optimized, err := Compile([]Expression{
+		{Id: 1, Pattern: `marker=[A-Z]{4}[0-9]{4}`},
+		{Id: 2, Pattern: `marker=[A-Z]{4}[0-9]{4}`, Flags: CompileSingleMatch},
+		{Id: 3, Pattern: `marker=[A-Z]{4}[0-9]{4}`, Flags: CompileQuiet},
+		{Id: 4, Pattern: `1&2`, Flags: CompileCombination},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(optimized.blockScanPlan.triggers) != 1 || optimized.blockScanPlan.triggers[0].kind != blockTriggerAnchoredAtStart {
+		t.Fatal("fixture did not select the anchored-at-start trigger path")
+	}
+	reference := withoutAnchoredAtStart(optimized)
+	data := []byte(`marker=ABCD1234 marker=ABCDxxxx marker=WXYZ9876 marker=ABCD1234`)
+	got, err := optimized.Scan(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := reference.Scan(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("anchored-at-start matches = %#v, generic matches = %#v", got, want)
+	}
+}
+
+func FuzzAnchoredAtStartScanPreservesGenericSemantics(f *testing.F) {
+	optimized, err := Compile([]Expression{
+		{Id: 1, Pattern: `marker=[A-Z]{4}[0-9]{4}`},
+		{Id: 2, Pattern: `marker=[A-Z]{4}[0-9]{4}`, Flags: CompileSingleMatch},
+		{Id: 3, Pattern: `marker=[A-Z]{4}[0-9]{4}`, Flags: CompileQuiet},
+		{Id: 4, Pattern: `1&2`, Flags: CompileCombination},
+	})
+	if err != nil {
+		f.Fatal(err)
+	}
+	reference := withoutAnchoredAtStart(optimized)
+	for _, seed := range [][]byte{
+		[]byte(`marker=ABCD1234 marker=ABCDxxxx`),
+		[]byte(`marker=WXYZ9876 marker=ABCD1234`),
+		[]byte{},
+		{0xff, 'm', 'a', 'r', 'k', 'e', 'r', '='},
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 4_096 {
+			t.Skip()
+		}
+		got, err := optimized.ScanInto(data, make([]Match, 0, 8))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := reference.ScanInto(data, make([]Match, 0, 8))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("anchored-at-start ScanInto(%q) = %#v, generic ScanInto() = %#v", data, got, want)
+		}
+	})
+}
+
+func withoutAnchoredAtStart(scanner *Scanner) *Scanner {
+	reference := *scanner
+	reference.blockScanPlan.triggers = append([]blockTriggerLane(nil), scanner.blockScanPlan.triggers...)
+	for index := range reference.blockScanPlan.triggers {
+		if reference.blockScanPlan.triggers[index].kind == blockTriggerAnchoredAtStart {
+			reference.blockScanPlan.triggers[index].kind = blockTriggerAnchored
+		}
+	}
+	return &reference
+}
+
 func TestLeadingAnchorSuffixClassPrefilter(t *testing.T) {
 	root, err := parseRegex(`1[3-9][0-9]{9}`)
 	if err != nil {

@@ -462,6 +462,7 @@ const (
 	blockTriggerInactive blockTriggerLaneKind = iota
 	blockTriggerLiteral
 	blockTriggerAnchored
+	blockTriggerAnchoredAtStart
 	blockTriggerInternalAnchored
 )
 
@@ -608,6 +609,8 @@ func buildBlockScanPlan(programs []compiledRegexProgram, expressions []compiledE
 			kind := blockTriggerAnchored
 			if regex.internalAnchor {
 				kind = blockTriggerInternalAnchored
+			} else if regex.anchorMinOffset == 0 && regex.anchorMaxOffset == 0 {
+				kind = blockTriggerAnchoredAtStart
 			}
 			plan.triggers[triggerIndex] = blockTriggerLane{
 				kind: kind,
@@ -642,10 +645,14 @@ func hasSingleRootFixedAnchoredTrigger(automaton literalAutomaton, plan blockSca
 		return false
 	}
 	lane := plan.triggers[0]
-	return lane.kind == blockTriggerAnchored &&
+	return isBlockTriggerAnchored(lane.kind) &&
 		lane.anchored.anchorMinOffset == 0 &&
 		lane.anchored.anchorMaxOffset == 0 &&
 		lane.anchored.anchorLength >= 2
+}
+
+func isBlockTriggerAnchored(kind blockTriggerLaneKind) bool {
+	return kind == blockTriggerAnchored || kind == blockTriggerAnchoredAtStart
 }
 
 // anchoredGroupKey 与无锚点 NFA 共享使用相同的语言键。编译器对同一模式的锚点选择
@@ -743,6 +750,8 @@ func (scanner *Scanner) appendBlockTriggerEvents(data []byte, offset int, trigge
 		})
 	case blockTriggerAnchored:
 		scanner.appendBlockAnchoredEvents(data, offset, &lane.anchored, ctx)
+	case blockTriggerAnchoredAtStart:
+		scanner.appendBlockAnchoredAtStartEvents(data, offset, &lane.anchored, ctx)
 	case blockTriggerInternalAnchored:
 		scanner.appendBlockInternalAnchoredEvents(data, offset, &lane.anchored, ctx)
 	default:
@@ -792,6 +801,28 @@ func (scanner *Scanner) appendBlockAnchoredEvents(data []byte, offset int, ancho
 		}
 		if anchored.leftmost && len(verifier.ends) != 0 {
 			break
+		}
+	}
+}
+
+// appendBlockAnchoredAtStartEvents 处理锚点位于表达式起点的普通字面量触发规则。编译期已
+// 证明此时不存在可变前缀，因此无需枚举候选起点或恢复前缀 DFA 状态。
+func (scanner *Scanner) appendBlockAnchoredAtStartEvents(data []byte, offset int, anchored *blockAnchoredLane, ctx *context) {
+	anchorStart := offset + 1 - int(anchored.anchorLength)
+	if !matchesAnchoredSuffix(data, anchorStart, anchored.anchorLength, anchored.suffixClass, anchored.hasSuffixClass) ||
+		anchored.suffixChecks != nil && !matchesAdditionalAnchoredSuffix(data, anchorStart+int(anchored.anchorLength)+1, anchored.suffixChecks) {
+		return
+	}
+	verifier := ctx.regexVerifiers[anchored.contextIndex]
+	for _, end := range verifier.matchFromLimit(anchored.program, data, anchorStart, regexMatchLimit(anchored.maxLength, len(data)-anchorStart)) {
+		for _, expressionIndex := range anchored.consumers {
+			expression := scanner.expressions[expressionIndex]
+			event := scanEvent{match: Match{Id: expression.id, From: uint64(anchorStart), To: uint64(end)}, expressionIndex: expressionIndex}
+			if end == offset+1 {
+				ctx.readyEvents = append(ctx.readyEvents, event)
+				continue
+			}
+			ctx.pushPendingEvent(event)
 		}
 	}
 }

@@ -380,7 +380,7 @@ func TestCompileResolvesACOutputsToBlockTriggerLanes(t *testing.T) {
 			}
 			foundLiteral = true
 		case scanRegex:
-			if lane.kind != blockTriggerAnchored {
+			if !isBlockTriggerAnchored(lane.kind) {
 				t.Fatalf("anchored trigger %d was not resolved: %#v", triggerIndex, lane)
 			}
 			if lane.anchored.contextIndex != database.anchoredGroups[trigger.regexGroupIndex][0] {
@@ -418,7 +418,7 @@ func TestCompileAllocatesVerifierForEveryAnchoredTriggerLane(t *testing.T) {
 	ctx := scanner.newContext()
 	found := false
 	for triggerIndex, lane := range scanner.blockScanPlan.triggers {
-		if lane.kind != blockTriggerAnchored {
+		if !isBlockTriggerAnchored(lane.kind) {
 			continue
 		}
 		found = true
