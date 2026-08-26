@@ -505,6 +505,7 @@ func TestCompileRejectsInvalidMilestoneInputs(t *testing.T) {
 	}{
 		{name: "no expressions", want: scankit.ErrEmptyExpressions},
 		{name: "duplicate id", expressions: []scankit.Expression{{Id: 1, Pattern: "abc"}, {Id: 1, Pattern: "def"}}, want: scankit.ErrDuplicateExpression},
+		{name: "unknown compile flag", expressions: []scankit.Expression{{Id: 1, Pattern: "abc", Flags: scankit.CompileFlag(1 << 30)}}, want: scankit.ErrUnsupportedFlag},
 		{name: "empty pattern", expressions: []scankit.Expression{{Id: 1, Pattern: ""}}, want: scankit.ErrInvalidExpression},
 		{name: "UCP compile flag", expressions: []scankit.Expression{{Id: 1, Pattern: "abc", Flags: scankit.CompileUnicodeProperties}}, want: scankit.ErrUnsupportedFlag},
 		{name: "empty matching expression", expressions: []scankit.Expression{{Id: 1, Pattern: "a*"}}, want: scankit.ErrUnsupportedExpression},
@@ -518,6 +519,31 @@ func TestCompileRejectsInvalidMilestoneInputs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func FuzzCompileRejectsUnknownFlags(f *testing.F) {
+	f.Add(uint32(1 << 30))
+	f.Add(^uint32(0))
+	f.Fuzz(func(t *testing.T, flags uint32) {
+		unknown := scankit.CompileFlag(flags) &^ (scankit.CompileCaseless |
+			scankit.CompileDotAll |
+			scankit.CompileMultiline |
+			scankit.CompileSingleMatch |
+			scankit.CompileAllowEmpty |
+			scankit.CompileUTF8 |
+			scankit.CompileUnicodeProperties |
+			scankit.CompilePrefilter |
+			scankit.CompileLeftmostStart |
+			scankit.CompileCombination |
+			scankit.CompileQuiet)
+		if unknown == 0 {
+			t.Skip()
+		}
+		_, err := scankit.Compile([]scankit.Expression{{Id: 1, Pattern: "abc", Flags: unknown}})
+		if !errors.Is(err, scankit.ErrUnsupportedFlag) {
+			t.Fatalf("Compile() error = %v, want ErrUnsupportedFlag for flags %#x", err, unknown)
+		}
+	})
 }
 
 func TestScanRunsUnanchoredRegexInOneInputPass(t *testing.T) {
