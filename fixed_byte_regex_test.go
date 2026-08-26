@@ -57,6 +57,26 @@ func TestExtractFixedByteRegexAnchorWithoutExpansion(t *testing.T) {
 	}
 }
 
+func TestExtractFixedByteRegexAnchorSelectsAdditionalNecessaryChecks(t *testing.T) {
+	root, err := parseRegex(`[1-9][0-9]{5}(18|19|20)[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor, ok := extractFixedByteRegexAnchor(root)
+	if !ok || anchor.checks == nil || anchor.checks.count == 0 {
+		t.Fatalf("anchor = %#v, want additional necessary checks", anchor)
+	}
+	if anchor.checks.count > maxFixedByteRegexChecks {
+		t.Fatalf("additional check count = %d, limit = %d", anchor.checks.count, maxFixedByteRegexChecks)
+	}
+	for index := 0; index < int(anchor.checks.count); index++ {
+		check := anchor.checks.values[index]
+		if check.offset == anchor.offset || byteClassSize(check.class) > maxFixedByteRegexCheckSize {
+			t.Fatalf("check %d = %#v is not a selective non-trigger position", index, check)
+		}
+	}
+}
+
 func TestExtractFixedByteRegexAnchorRejectsNonFixedWidthStructure(t *testing.T) {
 	for _, pattern := range []string{
 		`(?:ab|cde){4}`,

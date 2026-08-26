@@ -55,6 +55,188 @@ func BenchmarkProfileScanPaths(b *testing.B) {
 	}
 }
 
+// BenchmarkProfileSingleByteAnchorWord 将单字节锚点的机器字扫描从业务规则中拆出。
+// 它覆盖一个或两个根锚点、无命中、稀疏命中、高密度命中，以及验证器产生未来事件的情形；
+// 仅用于 profile 和前后对比，不表示日志脱敏的发布指标。
+func BenchmarkProfileSingleByteAnchorWord(b *testing.B) {
+	for _, test := range []struct {
+		name        string
+		expressions []Expression
+		data        []byte
+	}{
+		{
+			name:        "OneRoot/NoMatch",
+			expressions: []Expression{{Id: 1, Pattern: `a[0-9]{4}`}},
+			data:        bytes.Repeat([]byte(`message=payment-completed `), 256),
+		},
+		{
+			name:        "OneRoot/SparseMatch",
+			expressions: []Expression{{Id: 1, Pattern: `a[0-9]{4}`}},
+			data:        append(bytes.Repeat([]byte(`message=payment-completed `), 255), []byte(`a1234 `)...),
+		},
+		{
+			name:        "OneRoot/HighMatchPending",
+			expressions: []Expression{{Id: 1, Pattern: `a[0-9]{4}`}},
+			data:        bytes.Repeat([]byte(`a1234 `), 512),
+		},
+		{
+			name: "TwoRoots/NoMatch",
+			expressions: []Expression{
+				{Id: 1, Pattern: `a[0-9]{4}`},
+				{Id: 2, Pattern: `b[0-9]{4}`},
+			},
+			data: bytes.Repeat([]byte(`message=payment-completed `), 256),
+		},
+		{
+			name: "TwoRoots/HighMatchPending",
+			expressions: []Expression{
+				{Id: 1, Pattern: `a[0-9]{4}`},
+				{Id: 2, Pattern: `b[0-9]{4}`},
+			},
+			data: bytes.Repeat([]byte(`a1234 b5678 `), 256),
+		},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			scanner, err := Compile(test.expressions)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if !scanner.singleByteFast {
+				b.Fatal("expected single-byte anchor fast path")
+			}
+			want, err := scanner.Scan(test.data)
+			if err != nil {
+				b.Fatal(err)
+			}
+			benchmarkProfileScanInto(b, scanner, test.data, want)
+		})
+	}
+}
+
+// BenchmarkProfileRootByteAnchoredWord 隔离多字节字面量锚点的根字节跳过与 verifier
+// 成本。它覆盖无根字节、高密度触发但验证失败，以及高密度有效匹配三种调度形态。
+func BenchmarkProfileRootByteAnchoredWord(b *testing.B) {
+	for _, test := range []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "NoRootByte",
+			data: bytes.Repeat([]byte(`message=payment-completed `), 256),
+		},
+		{
+			name: "CandidateRejected",
+			data: bytes.Repeat([]byte(`Xacct=ABCDxxxx `), 256),
+		},
+		{
+			name: "HighMatch",
+			data: bytes.Repeat([]byte(`Xacct=ABCD1234 `), 256),
+		},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			scanner, err := Compile([]Expression{{Id: 1, Pattern: `[A-Z]{1,8}acct=[A-Z]{4}[0-9]{4}`}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if !scanner.automaton.rootByteFast || scanner.singleByteOnly {
+				b.Fatal("expected multi-byte root-anchor fast path")
+			}
+			want, err := scanner.Scan(test.data)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Run("PrefixDFA", func(b *testing.B) {
+				benchmarkProfileScanInto(b, scanner, test.data, want)
+			})
+			b.Run("FullVerifier", func(b *testing.B) {
+				benchmarkProfileScanInto(b, withoutRootByteAnchoredPrefixDFA(scanner), test.data, want)
+			})
+		})
+	}
+}
+
+// BenchmarkProfileFixedByteRegex 隔离固定宽度正则的候选分派与逐类验证成本。CreditCard
+// 规则没有公共字面量锚点，正是该通道的典型输入。
+func BenchmarkProfileFixedByteRegex(b *testing.B) {
+	for _, test := range []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "NoCandidate",
+			data: bytes.Repeat([]byte(`card=xxxxxxxxxxxxxxxx `), 256),
+		},
+		{
+			name: "CandidateRejected",
+			data: bytes.Repeat([]byte(`card=4xxxxxxxxxxxxxxx `), 256),
+		},
+		{
+			name: "HighMatch",
+			data: bytes.Repeat([]byte(`card=4111111111111111 `), 256),
+		},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			scanner, err := Compile([]Expression{{Id: 1, Pattern: `4[0-9]{15}|5[1-5][0-9]{14}|3[47][0-9]{13}`}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if profileFixedByteRegexLaneCount(scanner) == 0 {
+				b.Fatal("expected fixed-width scan plan")
+			}
+			want, err := scanner.Scan(test.data)
+			if err != nil {
+				b.Fatal(err)
+			}
+			benchmarkProfileScanInto(b, scanner, test.data, want)
+		})
+	}
+}
+
+func profileFixedByteRegexLaneCount(scanner *Scanner) int {
+	count := 0
+	for _, lanes := range scanner.blockScanPlan.unanchored.fixed {
+		count += len(lanes)
+	}
+	return count
+}
+
+// BenchmarkProfileMixedPII 聚合五类 PII 规则，供 profile 区分 AC、锚定验证、固定宽度
+// 分派和事件投递的成本。它不替代外部包中的端到端脱敏基准。
+func BenchmarkProfileMixedPII(b *testing.B) {
+	expressions := []Expression{
+		{Id: 1, Pattern: `1[3-9][0-9]{9}`},
+		{Id: 2, Pattern: `[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b`},
+		{Id: 3, Pattern: `[1-9][0-9]{5}(18|19|20)[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]`},
+		{Id: 4, Pattern: `62[0-9]{14,17}`},
+		{Id: 5, Pattern: `4[0-9]{15}|5[1-5][0-9]{14}|3[47][0-9]{13}`},
+	}
+	for _, test := range []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "NoMatch",
+			data: bytes.Repeat([]byte(`服务=支付网关 level=INFO event=payment-completed audit=日志脱敏\n`), 128),
+		},
+		{
+			name: "HighMatch",
+			data: bytes.Repeat([]byte(`mobile=13800138000 email=alice@example.com identity=11010520000101002X bank=6222021234567890 card=4111111111111111\n`), 128),
+		},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			scanner, err := Compile(expressions)
+			if err != nil {
+				b.Fatal(err)
+			}
+			want, err := scanner.Scan(test.data)
+			if err != nil {
+				b.Fatal(err)
+			}
+			benchmarkProfileScanInto(b, scanner, test.data, want)
+		})
+	}
+}
+
 func benchmarkProfileScanInto(b *testing.B, scanner *Scanner, data []byte, want []Match) {
 	b.Helper()
 	matches := make([]Match, 0, len(want))

@@ -5,6 +5,8 @@ import "math/bits"
 const (
 	maxFixedByteRegexSequences = 64
 	maxFixedByteRegexLength    = 128
+	maxFixedByteRegexChecks    = 3
+	maxFixedByteRegexCheckSize = 16
 )
 
 // fixedByteRegex 是纯字节定宽正则的有界展开。它从每个分支中选择性最强的字节直接分派，
@@ -25,6 +27,19 @@ type fixedByteRegexAnchor struct {
 	class  byteClass
 	offset int
 	width  int
+	checks *fixedByteRegexAnchorChecks
+}
+
+// fixedByteRegexAnchorChecks 保存触发位置之外的必要字符类。它只在编译期能得出定宽
+// 位置类时创建；扫描期全部通过后仍由 verifier 做最终语言判定。
+type fixedByteRegexAnchorChecks struct {
+	values [maxFixedByteRegexChecks]fixedByteRegexAnchorCheck
+	count  uint8
+}
+
+type fixedByteRegexAnchorCheck struct {
+	class  byteClass
+	offset int
 }
 
 type fixedByteRegexRun struct {
@@ -177,7 +192,7 @@ func combineFixedByteRegexSequences(left, right [][]byteClass) ([][]byteClass, b
 func mostSelectiveByteClass(classes []byteClass) int {
 	best, bestCount := 0, byteClassCardinality+1
 	for index, class := range classes {
-		count := bits.OnesCount64(class[0]) + bits.OnesCount64(class[1]) + bits.OnesCount64(class[2]) + bits.OnesCount64(class[3])
+		count := byteClassSize(class)
 		if count < bestCount {
 			best, bestCount = index, count
 		}
@@ -203,7 +218,7 @@ func fixedByteRegexClassAnchor(sequences []fixedByteRegexSequence) (fixedByteReg
 		}
 	}
 	offset := mostSelectiveByteClass(classes)
-	return fixedByteRegexAnchor{class: classes[offset], offset: offset, width: width}, true
+	return newFixedByteRegexAnchor(classes, offset), true
 }
 
 // extractFixedByteRegexAnchor 合并固定宽度分支在每个字节偏移的必要字符类。它不展开
@@ -214,7 +229,116 @@ func extractFixedByteRegexAnchor(root *regexNode) (fixedByteRegexAnchor, bool) {
 		return fixedByteRegexAnchor{}, false
 	}
 	offset := mostSelectiveByteClass(classes)
-	return fixedByteRegexAnchor{class: classes[offset], offset: offset, width: len(classes)}, true
+	return newFixedByteRegexAnchor(classes, offset), true
+}
+
+func newFixedByteRegexAnchor(classes []byteClass, offset int) fixedByteRegexAnchor {
+	return fixedByteRegexAnchor{
+		class:  classes[offset],
+		offset: offset,
+		width:  len(classes),
+		checks: selectFixedByteRegexAnchorChecks(classes, offset),
+	}
+}
+
+// selectFixedByteRegexAnchorChecks 选择少量独立的必要位置：先取最小字符类，再取距触发
+// 位置最远的选择性类，最后按选择性补齐。这样既能快速拒绝常见候选，也能覆盖模式末尾的
+// 格式错误；所有检查均只来自各分支同一固定偏移的并集。
+func selectFixedByteRegexAnchorChecks(classes []byteClass, anchorOffset int) *fixedByteRegexAnchorChecks {
+	candidates := make([]fixedByteRegexAnchorCheck, 0, len(classes))
+	for offset, class := range classes {
+		if offset == anchorOffset || byteClassSize(class) > maxFixedByteRegexCheckSize {
+			continue
+		}
+		candidates = append(candidates, fixedByteRegexAnchorCheck{class: class, offset: offset})
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	checks := &fixedByteRegexAnchorChecks{}
+	appendCheck := func(index int) {
+		candidate := candidates[index]
+		for existing := 0; existing < int(checks.count); existing++ {
+			if checks.values[existing].offset == candidate.offset {
+				return
+			}
+		}
+		checks.values[checks.count] = candidate
+		checks.count++
+	}
+	best := 0
+	for index := 1; index < len(candidates); index++ {
+		if fixedByteRegexAnchorCheckLess(candidates[index], candidates[best], anchorOffset) {
+			best = index
+		}
+	}
+	appendCheck(best)
+	if checks.count < maxFixedByteRegexChecks {
+		farthest := 0
+		for index := 1; index < len(candidates); index++ {
+			if fixedByteRegexAnchorCheckFurther(candidates[index], candidates[farthest], anchorOffset) {
+				farthest = index
+			}
+		}
+		appendCheck(farthest)
+	}
+	for checks.count < maxFixedByteRegexChecks {
+		best = -1
+		for index, candidate := range candidates {
+			alreadySelected := false
+			for existing := 0; existing < int(checks.count); existing++ {
+				if checks.values[existing].offset == candidate.offset {
+					alreadySelected = true
+					break
+				}
+			}
+			if !alreadySelected && (best == -1 || fixedByteRegexAnchorCheckLess(candidate, candidates[best], anchorOffset)) {
+				best = index
+			}
+		}
+		if best == -1 {
+			break
+		}
+		appendCheck(best)
+	}
+	return checks
+}
+
+func fixedByteRegexAnchorCheckLess(left, right fixedByteRegexAnchorCheck, anchorOffset int) bool {
+	leftSize, rightSize := byteClassSize(left.class), byteClassSize(right.class)
+	if leftSize != rightSize {
+		return leftSize < rightSize
+	}
+	return absoluteDistance(left.offset, anchorOffset) > absoluteDistance(right.offset, anchorOffset)
+}
+
+func fixedByteRegexAnchorCheckFurther(left, right fixedByteRegexAnchorCheck, anchorOffset int) bool {
+	leftDistance, rightDistance := absoluteDistance(left.offset, anchorOffset), absoluteDistance(right.offset, anchorOffset)
+	if leftDistance != rightDistance {
+		return leftDistance > rightDistance
+	}
+	return byteClassSize(left.class) < byteClassSize(right.class)
+}
+
+func fixedByteRegexAnchorChecksMatch(data []byte, start int, checks *fixedByteRegexAnchorChecks) bool {
+	for index := 0; index < int(checks.count); index++ {
+		check := checks.values[index]
+		if !check.class.contains(data[start+check.offset]) {
+			return false
+		}
+	}
+	return true
+}
+
+func byteClassSize(class byteClass) int {
+	return bits.OnesCount64(class[0]) + bits.OnesCount64(class[1]) + bits.OnesCount64(class[2]) + bits.OnesCount64(class[3])
+}
+
+func absoluteDistance(left, right int) int {
+	if left < right {
+		return right - left
+	}
+	return left - right
 }
 
 func fixedByteRegexPositionClasses(node *regexNode) ([]byteClass, bool) {

@@ -78,6 +78,9 @@ func TestCompileSelectsOnlySafeInternalLiteralAnchors(t *testing.T) {
 			if len(scanner.unanchoredGroups) != 0 || len(scanner.regexPrograms) != 1 || !scanner.regexPrograms[0].internalAnchor {
 				t.Fatalf("internal anchor did not replace always lane: groups=%d programs=%#v", len(scanner.unanchoredGroups), scanner.regexPrograms)
 			}
+			if len(scanner.blockScanPlan.triggers) != 1 || scanner.blockScanPlan.triggers[0].kind != blockTriggerInternalAnchored {
+				t.Fatalf("internal anchor trigger kind = %d, want internal lane", scanner.blockScanPlan.triggers[0].kind)
+			}
 		})
 	}
 }

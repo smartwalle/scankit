@@ -176,33 +176,102 @@ func leadingBoundedPrefixClass(root *regexNode, anchor regexAnchor) (byteClass, 
 	return prefix.children[0].class, true
 }
 
-// leadingAnchorSuffixClass 识别紧跟必需字节类或其正重复的固定字面量前缀。AC 找到前缀
-// 字面量后，非成员字节不可能开始匹配，因此可作为不改变起始位置选择的安全二级预过滤。
-func leadingAnchorSuffixClass(root *regexNode, anchor regexAnchor) (byteClass, bool) {
+const maxAnchoredSuffixChecks = 4
+
+// anchoredSuffixCheckPlan 保存锚点后的必经字节类。first 保持单字节预过滤的紧凑热路径；
+// additional 只用于能在编译期证明连续位置固定的额外检查。
+type anchoredSuffixCheckPlan struct {
+	first      byteClass
+	additional [maxAnchoredSuffixChecks - 1]byteClass
+	count      uint8
+}
+
+// anchoredSuffixChecks 是扫描计划使用的额外必经字节类。它不包含首个检查，首个检查
+// 继续内联在每个锚定通道中，以免常见的单检查规则多一次间接访问。
+type anchoredSuffixChecks struct {
+	classes [maxAnchoredSuffixChecks - 1]byteClass
+	count   uint8
+}
+
+func (plan anchoredSuffixCheckPlan) extra() *anchoredSuffixChecks {
+	if plan.count < 2 {
+		return nil
+	}
+	return &anchoredSuffixChecks{classes: plan.additional, count: plan.count - 1}
+}
+
+// leadingAnchorSuffixChecks 识别紧跟固定字面量锚点的连续必经字节类。每个已记录位置都
+// 必须在所有匹配中出现于相同偏移；遇到可选、变宽、断言或非字节节点立即停止。只有至少
+// 一个小成员类才保留预过滤；额外位置也只接受小成员类，避免宽类检查反向拖慢 verifier。
+func leadingAnchorSuffixChecks(root *regexNode, anchor regexAnchor) anchoredSuffixCheckPlan {
 	if root == nil || root.kind != regexConcat || anchor.minOffset != 0 || anchor.maxOffset != 0 || len(anchor.literal) == 0 {
-		return byteClass{}, false
+		return anchoredSuffixCheckPlan{}
 	}
 	matched := 0
+	var plan anchoredSuffixCheckPlan
+	hasSelective := false
+	appendClass := func(class byteClass, allowWide bool) bool {
+		if plan.count != 0 && !isSelectiveAnchorSuffixClass(class) {
+			return false
+		}
+		if !allowWide && !isSelectiveAnchorSuffixClass(class) {
+			return false
+		}
+		if plan.count == maxAnchoredSuffixChecks {
+			return false
+		}
+		if plan.count == 0 {
+			plan.first = class
+		} else {
+			plan.additional[plan.count-1] = class
+		}
+		hasSelective = hasSelective || isSelectiveAnchorSuffixClass(class)
+		plan.count++
+		return plan.count < maxAnchoredSuffixChecks
+	}
 	for _, child := range root.children {
 		if matched < len(anchor.literal) {
 			if child.kind != regexLiteral || child.literal != anchor.literal[matched] {
-				return byteClass{}, false
+				return anchoredSuffixCheckPlan{}
 			}
 			matched++
 			continue
 		}
 		if child.kind == regexClass {
-			return child.class, true
+			if !appendClass(child.class, true) {
+				break
+			}
+			continue
 		}
 		if child.kind == regexRepeat && child.min > 0 && len(child.children) == 1 {
 			class, ok := extractSingleByteClass(child.children[0])
-			if ok && isSelectiveAnchorSuffixClass(class) {
-				return class, true
+			if !ok || !isSelectiveAnchorSuffixClass(class) {
+				break
 			}
+			for count := 0; count < child.min; count++ {
+				if !appendClass(class, false) {
+					break
+				}
+			}
+			// 可变宽重复之后的字节偏移不再固定；已记录的最小重复次数仍然安全。
+			if child.min != child.max || plan.count == maxAnchoredSuffixChecks {
+				break
+			}
+			continue
 		}
-		return byteClass{}, false
+		break
 	}
-	return byteClass{}, false
+	if !hasSelective {
+		return anchoredSuffixCheckPlan{}
+	}
+	return plan
+}
+
+// leadingAnchorSuffixClass 保留首个必经类的内部测试入口。扫描器实际使用
+// leadingAnchorSuffixChecks，以便在固定宽度结构中再过滤少量后续字节。
+func leadingAnchorSuffixClass(root *regexNode, anchor regexAnchor) (byteClass, bool) {
+	plan := leadingAnchorSuffixChecks(root, anchor)
+	return plan.first, plan.count != 0
 }
 
 // isSelectiveAnchorSuffixClass 仅保留足以抵消一次额外字节检查的小类。宽类（如 \d）在

@@ -275,6 +275,7 @@ type compiledRegexProgram struct {
 	hasPrefixClass      bool
 	suffixClass         byteClass
 	hasSuffixClass      bool
+	suffixChecks        *anchoredSuffixChecks
 	anchorMinOffset     uint32
 	anchorMaxOffset     uint32
 	anchorLength        uint32
@@ -460,6 +461,7 @@ const (
 	blockTriggerInactive blockTriggerLaneKind = iota
 	blockTriggerLiteral
 	blockTriggerAnchored
+	blockTriggerInternalAnchored
 )
 
 type blockLiteralLane struct {
@@ -476,8 +478,10 @@ type blockAnchoredLane struct {
 	maxLength           int
 	prefixClass         byteClass
 	hasPrefixClass      bool
+	prefixDFAStates     []uint16
 	suffixClass         byteClass
 	hasSuffixClass      bool
+	suffixChecks        *anchoredSuffixChecks
 	leftmost            bool
 	internalAnchor      bool
 	internalPrefixClass byteClass
@@ -600,8 +604,12 @@ func buildBlockScanPlan(programs []compiledRegexProgram, expressions []compiledE
 					consumers = append(consumers, expressionIndex)
 				}
 			}
+			kind := blockTriggerAnchored
+			if regex.internalAnchor {
+				kind = blockTriggerInternalAnchored
+			}
 			plan.triggers[triggerIndex] = blockTriggerLane{
-				kind: blockTriggerAnchored,
+				kind: kind,
 				anchored: blockAnchoredLane{
 					contextIndex:        representative,
 					program:             regex.program,
@@ -611,8 +619,10 @@ func buildBlockScanPlan(programs []compiledRegexProgram, expressions []compiledE
 					maxLength:           regex.maxLength,
 					prefixClass:         regex.prefixClass,
 					hasPrefixClass:      regex.hasPrefixClass,
+					prefixDFAStates:     regex.prefixDFAStates,
 					suffixClass:         regex.suffixClass,
 					hasSuffixClass:      regex.hasSuffixClass,
+					suffixChecks:        regex.suffixChecks,
 					leftmost:            regex.leftmostOnly,
 					internalAnchor:      regex.internalAnchor,
 					internalPrefixClass: regex.internalPrefixClass,
@@ -652,6 +662,8 @@ type anchoredGroupKey struct {
 	hasPrefixClass      bool
 	suffixClass         byteClass
 	hasSuffixClass      bool
+	suffixChecks        anchoredSuffixChecks
+	hasSuffixChecks     bool
 	leftmost            bool
 }
 
@@ -720,7 +732,7 @@ func (scanner *Scanner) ScanInto(data []byte, matches []Match) ([]Match, error) 
 // appendBlockTriggerEvents 消费一个已解析的 Aho-Corasick 输出。该通道是编译阶段组装的
 // 不可变 Scanner 状态，因此热路径无需通过触发分组恢复锚定正则或过滤消费者。
 func (scanner *Scanner) appendBlockTriggerEvents(data []byte, offset int, triggerIndex uint32, ctx *context) {
-	lane := scanner.blockScanPlan.triggers[triggerIndex]
+	lane := &scanner.blockScanPlan.triggers[triggerIndex]
 	switch lane.kind {
 	case blockTriggerLiteral:
 		expression := scanner.expressions[lane.literal.expressionIndex]
@@ -729,70 +741,84 @@ func (scanner *Scanner) appendBlockTriggerEvents(data []byte, offset int, trigge
 			expressionIndex: lane.literal.expressionIndex,
 		})
 	case blockTriggerAnchored:
-		anchored := lane.anchored
-		anchorStart := offset + 1 - int(anchored.anchorLength)
-		if anchored.internalAnchor {
-			classStart := anchorStart
-			for classStart > 0 && anchored.internalPrefixClass.contains(data[classStart-1]) {
-				classStart--
-			}
-			if anchorStart-classStart < int(anchored.anchorMinOffset) {
-				return
-			}
-			start := classStart - len(anchored.internalLeading)
-			if start < 0 || !matchesInternalLeading(data, start, anchored.internalLeading) {
-				return
-			}
-			verifier := ctx.regexVerifiers[anchored.contextIndex]
-			for _, end := range verifier.matchFromLimit(anchored.program, data, start, regexMatchLimit(anchored.maxLength, len(data)-start)) {
-				for _, expressionIndex := range anchored.consumers {
-					expression := scanner.expressions[expressionIndex]
-					event := scanEvent{match: Match{Id: expression.id, From: uint64(start), To: uint64(end)}, expressionIndex: expressionIndex}
-					if end == offset+1 {
-						ctx.readyEvents = append(ctx.readyEvents, event)
-						continue
-					}
-					ctx.pushPendingEvent(event)
-				}
-			}
-			return
-		}
-		if anchorStart < int(anchored.anchorMinOffset) {
-			return
-		}
-		if !matchesAnchoredSuffix(data, anchorStart, anchored.anchorLength, anchored.suffixClass, anchored.hasSuffixClass) {
-			return
-		}
-		startMin := anchorStart - int(anchored.anchorMaxOffset)
-		if startMin < 0 {
-			startMin = 0
-		}
-		startMax := anchorStart - int(anchored.anchorMinOffset)
-		if anchored.hasPrefixClass {
-			startMin = anchorStart
-			for startMin > 0 && anchorStart-startMin < int(anchored.anchorMaxOffset) && anchored.prefixClass.contains(data[startMin-1]) {
-				startMin--
-			}
-			startMax = startMin
-		}
-		verifier := ctx.regexVerifiers[anchored.contextIndex]
-		for start := startMin; start <= startMax; start++ {
-			for _, end := range verifier.matchFromLimit(anchored.program, data, start, regexMatchLimit(anchored.maxLength, len(data)-start)) {
-				for _, expressionIndex := range anchored.consumers {
-					expression := scanner.expressions[expressionIndex]
-					event := scanEvent{match: Match{Id: expression.id, From: uint64(start), To: uint64(end)}, expressionIndex: expressionIndex}
-					if end == offset+1 {
-						ctx.readyEvents = append(ctx.readyEvents, event)
-						continue
-					}
-					ctx.pushPendingEvent(event)
-				}
-			}
-			if anchored.leftmost && len(verifier.ends) != 0 {
-				break
-			}
-		}
+		scanner.appendBlockAnchoredEvents(data, offset, &lane.anchored, ctx)
+	case blockTriggerInternalAnchored:
+		scanner.appendBlockInternalAnchoredEvents(data, offset, &lane.anchored, ctx)
 	default:
+	}
+}
+
+// appendBlockAnchoredEvents 只处理普通的固定字面量锚点。internal anchor 在编译期被分流，
+// 避免普通规则的每次 AC 命中都判断其专用恢复逻辑。
+func (scanner *Scanner) appendBlockAnchoredEvents(data []byte, offset int, anchored *blockAnchoredLane, ctx *context) {
+	anchorStart := offset + 1 - int(anchored.anchorLength)
+	if anchorStart < int(anchored.anchorMinOffset) || !matchesAnchoredSuffix(data, anchorStart, anchored.anchorLength, anchored.suffixClass, anchored.hasSuffixClass) ||
+		anchored.suffixChecks != nil && !matchesAdditionalAnchoredSuffix(data, anchorStart+int(anchored.anchorLength)+1, anchored.suffixChecks) {
+		return
+	}
+	startMin := anchorStart - int(anchored.anchorMaxOffset)
+	if startMin < 0 {
+		startMin = 0
+	}
+	startMax := anchorStart - int(anchored.anchorMinOffset)
+	if anchored.hasPrefixClass {
+		startMin = anchorStart
+		for startMin > 0 && anchorStart-startMin < int(anchored.anchorMaxOffset) && anchored.prefixClass.contains(data[startMin-1]) {
+			startMin--
+		}
+		startMax = startMin
+	}
+	verifier := ctx.regexVerifiers[anchored.contextIndex]
+	for start := startMin; start <= startMax; start++ {
+		var ends []int
+		prefixLength := anchorStart - start
+		if prefixLength > 0 && prefixLength < len(anchored.prefixDFAStates) {
+			endLimit := start + regexMatchLimit(anchored.maxLength, len(data)-start)
+			ends = verifier.matchFromDFAState(anchored.program.verifierDFA, data, anchorStart, endLimit, anchored.prefixDFAStates[prefixLength])
+		} else {
+			ends = verifier.matchFromLimit(anchored.program, data, start, regexMatchLimit(anchored.maxLength, len(data)-start))
+		}
+		for _, end := range ends {
+			for _, expressionIndex := range anchored.consumers {
+				expression := scanner.expressions[expressionIndex]
+				event := scanEvent{match: Match{Id: expression.id, From: uint64(start), To: uint64(end)}, expressionIndex: expressionIndex}
+				if end == offset+1 {
+					ctx.readyEvents = append(ctx.readyEvents, event)
+					continue
+				}
+				ctx.pushPendingEvent(event)
+			}
+		}
+		if anchored.leftmost && len(verifier.ends) != 0 {
+			break
+		}
+	}
+}
+
+func (scanner *Scanner) appendBlockInternalAnchoredEvents(data []byte, offset int, anchored *blockAnchoredLane, ctx *context) {
+	anchorStart := offset + 1 - int(anchored.anchorLength)
+	classStart := anchorStart
+	for classStart > 0 && anchored.internalPrefixClass.contains(data[classStart-1]) {
+		classStart--
+	}
+	if anchorStart-classStart < int(anchored.anchorMinOffset) {
+		return
+	}
+	start := classStart - len(anchored.internalLeading)
+	if start < 0 || !matchesInternalLeading(data, start, anchored.internalLeading) {
+		return
+	}
+	verifier := ctx.regexVerifiers[anchored.contextIndex]
+	for _, end := range verifier.matchFromLimit(anchored.program, data, start, regexMatchLimit(anchored.maxLength, len(data)-start)) {
+		for _, expressionIndex := range anchored.consumers {
+			expression := scanner.expressions[expressionIndex]
+			event := scanEvent{match: Match{Id: expression.id, From: uint64(start), To: uint64(end)}, expressionIndex: expressionIndex}
+			if end == offset+1 {
+				ctx.readyEvents = append(ctx.readyEvents, event)
+				continue
+			}
+			ctx.pushPendingEvent(event)
+		}
 	}
 }
 
@@ -816,6 +842,18 @@ func matchesAnchoredSuffix(data []byte, anchorStart int, anchorLength uint32, su
 	return suffixOffset < len(data) && suffixClass.contains(data[suffixOffset])
 }
 
+func matchesAdditionalAnchoredSuffix(data []byte, offset int, checks *anchoredSuffixChecks) bool {
+	if offset+int(checks.count) > len(data) {
+		return false
+	}
+	for index := 0; index < int(checks.count); index++ {
+		if !checks.classes[index].contains(data[offset+index]) {
+			return false
+		}
+	}
+	return true
+}
+
 // appendBlockUnanchoredEvents 在一个输入字节上推进已编译字节通道一次。常规块扫描器和
 // UCP 混合扫描器均使用此方法，UCP 规则仍只在已解码 rune 上推进。
 func (scanner *Scanner) appendBlockUnanchoredEvents(data []byte, value byte, offset int, ctx *context) {
@@ -836,6 +874,9 @@ func (scanner *Scanner) appendBlockUnanchoredEvents(data []byte, value byte, off
 		anchor := lane.anchor
 		start := offset - anchor.offset
 		if start < 0 || start+anchor.width > len(data) {
+			continue
+		}
+		if anchor.checks != nil && !fixedByteRegexAnchorChecksMatch(data, start, anchor.checks) {
 			continue
 		}
 		verifier := ctx.regexVerifiers[lane.contextIndex]
@@ -991,6 +1032,9 @@ func (scanner *Scanner) scanBlock(data []byte, ctx *context, matches *[]Match) e
 				anchor := lane.anchor
 				start := offset - anchor.offset
 				if start < 0 || start+anchor.width > len(data) {
+					continue
+				}
+				if anchor.checks != nil && !fixedByteRegexAnchorChecksMatch(data, start, anchor.checks) {
 					continue
 				}
 				verifier := ctx.regexVerifiers[lane.contextIndex]
@@ -1221,7 +1265,8 @@ func (scanner *Scanner) appendSingleByteTriggers(data []byte, ctx *context, offs
 		if anchorStart < int(regex.anchorMinOffset) {
 			continue
 		}
-		if !matchesAnchoredSuffix(data, anchorStart, regex.anchorLength, regex.suffixClass, regex.hasSuffixClass) {
+		if !matchesAnchoredSuffix(data, anchorStart, regex.anchorLength, regex.suffixClass, regex.hasSuffixClass) ||
+			regex.suffixChecks != nil && !matchesAdditionalAnchoredSuffix(data, anchorStart+int(regex.anchorLength)+1, regex.suffixChecks) {
 			continue
 		}
 		startMin := anchorStart - int(regex.anchorMaxOffset)
@@ -1276,7 +1321,8 @@ func (scanner *Scanner) appendSingleByteRegex(data []byte, ctx *context, offset 
 	if anchorStart < int(regex.anchorMinOffset) {
 		return
 	}
-	if !matchesAnchoredSuffix(data, anchorStart, regex.anchorLength, regex.suffixClass, regex.hasSuffixClass) {
+	if !matchesAnchoredSuffix(data, anchorStart, regex.anchorLength, regex.suffixClass, regex.hasSuffixClass) ||
+		regex.suffixChecks != nil && !matchesAdditionalAnchoredSuffix(data, anchorStart+int(regex.anchorLength)+1, regex.suffixChecks) {
 		return
 	}
 	startMin := anchorStart - int(regex.anchorMaxOffset)
@@ -1315,14 +1361,23 @@ func (scanner *Scanner) appendSingleByteRegex(data []byte, ctx *context, offset 
 	}
 }
 
-// scanBlockSingleByteAnchorsWord 针对两个常见 PII 触发字节，每次处理八个字节。unsafe 读取
-// 仅限完整的边界内机器字；生成事件前会重新检查每个候选。
+// scanBlockSingleByteAnchorsWord 针对一或两个单字节触发器，每次处理八个字节。触发字节
+// 数量在编译期已确定，因此分别进入单根或双根循环，避免无命中热路径的重复机器字比较。
 func (scanner *Scanner) scanBlockSingleByteAnchorsWord(data []byte, ctx *context, matches *[]Match) error {
 	first, second := scanner.singleByteValues[0], scanner.singleByteValues[1]
+	if first == second {
+		return scanner.scanBlockSingleByteAnchorWord(data, ctx, matches, first)
+	}
+	return scanner.scanBlockTwoSingleByteAnchorsWord(data, ctx, matches, first, second)
+}
+
+// scanBlockSingleByteAnchorWord 是单根触发器的机器字扫描器。unsafe 读取仅限完整的边界内
+// 机器字；生成事件前会重新检查每个候选。
+func (scanner *Scanner) scanBlockSingleByteAnchorWord(data []byte, ctx *context, matches *[]Match, value byte) error {
 	simple := scanner.singleByteSimple
 	offset := 0
 	for ; offset+8 <= len(data); offset += 8 {
-		mask := singleByteTriggerMask(data, offset, first, second)
+		mask := rootByteSingleTriggerMask(data, offset, value)
 		wordEnd := offset + 8
 		if mask == 0 && (ctx.pendingCount == 0 || ctx.pendingFirstEnd > uint64(wordEnd)) {
 			continue
@@ -1346,8 +1401,67 @@ func (scanner *Scanner) scanBlockSingleByteAnchorsWord(data []byte, ctx *context
 
 			if triggerEnd == end {
 				position := end - 1
-				value := data[position]
+				candidate := data[position]
 				// 位技巧在发生借位后可能保守地标记相邻字节通道，因此保留该字节级确认。
+				if candidate == value {
+					if simple {
+						scanner.appendSingleByteRegex(data, ctx, position, scanner.singleByteRegex[candidate])
+					} else {
+						scanner.appendSingleByteTriggers(data, ctx, position, scanner.singleByteTriggers[candidate])
+					}
+				}
+				mask &= mask - 1
+			}
+			if len(ctx.readyEvents) != 0 || ctx.pendingCount != 0 && ctx.pendingFirstEnd <= uint64(end) {
+				collectScanEvents(scanner, ctx, end, matches)
+			}
+		}
+	}
+	for ; offset < len(data); offset++ {
+		candidate := data[offset]
+		if candidate == value {
+			if simple {
+				scanner.appendSingleByteRegex(data, ctx, offset, scanner.singleByteRegex[candidate])
+			} else {
+				scanner.appendSingleByteTriggers(data, ctx, offset, scanner.singleByteTriggers[candidate])
+			}
+		}
+		end := uint64(offset + 1)
+		if len(ctx.readyEvents) != 0 || ctx.pendingCount != 0 && ctx.pendingFirstEnd <= end {
+			collectScanEvents(scanner, ctx, offset+1, matches)
+		}
+	}
+	return nil
+}
+
+// scanBlockTwoSingleByteAnchorsWord 是双根触发器的机器字扫描器。
+func (scanner *Scanner) scanBlockTwoSingleByteAnchorsWord(data []byte, ctx *context, matches *[]Match, first, second byte) error {
+	simple := scanner.singleByteSimple
+	offset := 0
+	for ; offset+8 <= len(data); offset += 8 {
+		mask := singleByteTriggerMask(data, offset, first, second)
+		wordEnd := offset + 8
+		if mask == 0 && (ctx.pendingCount == 0 || ctx.pendingFirstEnd > uint64(wordEnd)) {
+			continue
+		}
+
+		for mask != 0 || ctx.pendingCount != 0 && ctx.pendingFirstEnd <= uint64(wordEnd) {
+			triggerEnd := wordEnd + 1
+			if mask != 0 {
+				triggerEnd = offset + (bits.TrailingZeros64(mask) >> 3) + 1
+			}
+			pendingEnd := wordEnd + 1
+			if ctx.pendingCount != 0 && ctx.pendingFirstEnd <= uint64(wordEnd) {
+				pendingEnd = int(ctx.pendingFirstEnd)
+			}
+			end := triggerEnd
+			if pendingEnd < end {
+				end = pendingEnd
+			}
+
+			if triggerEnd == end {
+				position := end - 1
+				value := data[position]
 				if value == first || value == second {
 					if simple {
 						scanner.appendSingleByteRegex(data, ctx, position, scanner.singleByteRegex[value])
@@ -1408,7 +1522,8 @@ func (scanner *Scanner) scanBlockSingleByteAnchors(data []byte, ctx *context, ma
 			if anchorStart < int(regex.anchorMinOffset) {
 				continue
 			}
-			if !matchesAnchoredSuffix(data, anchorStart, regex.anchorLength, regex.suffixClass, regex.hasSuffixClass) {
+			if !matchesAnchoredSuffix(data, anchorStart, regex.anchorLength, regex.suffixClass, regex.hasSuffixClass) ||
+				regex.suffixChecks != nil && !matchesAdditionalAnchoredSuffix(data, anchorStart+int(regex.anchorLength)+1, regex.suffixChecks) {
 				continue
 			}
 			startMin := anchorStart - int(regex.anchorMaxOffset)

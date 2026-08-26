@@ -15,6 +15,7 @@ type byteRegexCompilePlan struct {
 	hasPrefixClass      bool
 	suffixClass         byteClass
 	hasSuffixClass      bool
+	suffixChecks        *anchoredSuffixChecks
 	simpleRepeat        byteRegexRepeat
 	hasSimpleRepeat     bool
 	fixed               *fixedByteRegex
@@ -47,7 +48,7 @@ func compileByteRegexPlan(root *regexNode, flags CompileFlag) (byteRegexCompileP
 			}
 		}
 	}
-	suffixClass, hasSuffixClass := leadingAnchorSuffixClass(root, anchor)
+	suffixChecks := leadingAnchorSuffixChecks(root, anchor)
 	hasBoundedAnchor = hasBoundedAnchor && anchor.maxOffset != unboundedRepeat && flags&CompileCaseless == 0
 	plan := byteRegexCompilePlan{
 		analysis:            analysis,
@@ -60,8 +61,9 @@ func compileByteRegexPlan(root *regexNode, flags CompileFlag) (byteRegexCompileP
 		internalLeading:     internalLeading,
 		prefixClass:         prefixClass,
 		hasPrefixClass:      hasPrefixClass,
-		suffixClass:         suffixClass,
-		hasSuffixClass:      hasSuffixClass,
+		suffixClass:         suffixChecks.first,
+		hasSuffixClass:      suffixChecks.count != 0,
+		suffixChecks:        suffixChecks.extra(),
 		leftmostOnly:        anchor.minOffset != anchor.maxOffset,
 	}
 	if plan.hasPrefixClass {

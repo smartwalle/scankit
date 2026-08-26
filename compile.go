@@ -305,6 +305,7 @@ func Compile(expressions []Expression) (*Scanner, error) {
 			compiledProgram.hasPrefixClass = plan.hasPrefixClass
 			compiledProgram.suffixClass = plan.suffixClass
 			compiledProgram.hasSuffixClass = plan.hasSuffixClass
+			compiledProgram.suffixChecks = plan.suffixChecks
 			regexPrograms = append(regexPrograms, compiledProgram)
 			candidateCount := 0
 			if !plan.hasInternalAnchor {
@@ -328,7 +329,11 @@ func Compile(expressions []Expression) (*Scanner, error) {
 				hasPrefixClass:      compiledProgram.hasPrefixClass,
 				suffixClass:         compiledProgram.suffixClass,
 				hasSuffixClass:      compiledProgram.hasSuffixClass,
+				hasSuffixChecks:     compiledProgram.suffixChecks != nil,
 				leftmost:            compiledProgram.leftmostOnly,
+			}
+			if compiledProgram.suffixChecks != nil {
+				key.suffixChecks = *compiledProgram.suffixChecks
 			}
 			if groupIndex, ok := anchoredGroupIndex[key]; ok {
 				anchoredGroups[groupIndex] = append(anchoredGroups[groupIndex], regexIndex)

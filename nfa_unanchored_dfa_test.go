@@ -277,6 +277,9 @@ func assertFixedByteRegexAnchorMatchesNFA(t testing.TB, anchor fixedByteRegexAnc
 		if start < 0 || start+anchor.width > len(data) {
 			continue
 		}
+		if anchor.checks != nil && !fixedByteRegexAnchorChecksMatch(data, start, anchor.checks) {
+			continue
+		}
 		for _, end := range verifier.matchFromLimit(program, data, start, anchor.width) {
 			got[[2]int{start, end}] = struct{}{}
 		}

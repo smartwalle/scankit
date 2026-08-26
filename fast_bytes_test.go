@@ -9,6 +9,9 @@ func TestFastByteMasksMatchScalarReference(t *testing.T) {
 	if got, want := singleByteTriggerMask(data, 0, 'a', '@'), scalarSingleByteTriggerMask(data, 0, 'a', '@'); got&want != want {
 		t.Fatalf("singleByteTriggerMask() = %#x omits scalar candidates %#x", got, want)
 	}
+	if got, want := singleByteTriggerMask(data, 0, 'a', 'a'), scalarSingleByteTriggerMask(data, 0, 'a', 'a'); got&want != want {
+		t.Fatalf("singleByteTriggerMask() with one value = %#x omits scalar candidates %#x", got, want)
+	}
 	if got, want := rootByteTriggerMask(data, 0, values, 3), scalarRootByteTriggerMask(data, 0, values, 3); got&want != want {
 		t.Fatalf("rootByteTriggerMask() = %#x omits scalar candidates %#x", got, want)
 	}

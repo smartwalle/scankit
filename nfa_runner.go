@@ -93,14 +93,36 @@ func (s *nfaVerifierContext) matchFromDFAState(dfa *nfaVerifierDFA, data []byte,
 			return s.matchFromDFAStateWordBoundary(dfa, data, start, end, state, false)
 		case nfaNotWordBoundary:
 			return s.matchFromDFAStateWordBoundary(dfa, data, start, end, state, true)
+		default:
+			return s.matchFromDFAStateTailAssertion(dfa, data, start, end, state)
 		}
 	}
+	transitions := dfa.transitions
+	matches := dfa.matches
 	for offset := start; offset < end; offset++ {
-		state = dfa.transitions[uint32(state)<<8|uint32(data[offset])]
+		state = transitions[uint32(state)<<8|uint32(data[offset])]
 		if state == nfaDFANoState {
 			break
 		}
-		if dfa.matches[state] && (!dfa.hasTailAssertion || nfaMatchesTailAssertion(dfa.tailAssertion, data, offset+1)) {
+		if matches[state] {
+			s.ends = append(s.ends, offset+1)
+		}
+	}
+	if len(s.ends) == 0 {
+		return nil
+	}
+	return s.ends
+}
+
+func (s *nfaVerifierContext) matchFromDFAStateTailAssertion(dfa *nfaVerifierDFA, data []byte, start, end int, state uint16) []int {
+	transitions := dfa.transitions
+	matches := dfa.matches
+	for offset := start; offset < end; offset++ {
+		state = transitions[uint32(state)<<8|uint32(data[offset])]
+		if state == nfaDFANoState {
+			break
+		}
+		if matches[state] && nfaMatchesTailAssertion(dfa.tailAssertion, data, offset+1) {
 			s.ends = append(s.ends, offset+1)
 		}
 	}
@@ -111,12 +133,14 @@ func (s *nfaVerifierContext) matchFromDFAState(dfa *nfaVerifierDFA, data []byte,
 }
 
 func (s *nfaVerifierContext) matchFromDFAStateWordBoundary(dfa *nfaVerifierDFA, data []byte, start, end int, state uint16, invert bool) []int {
+	transitions := dfa.transitions
+	matches := dfa.matches
 	for offset := start; offset < end; offset++ {
-		state = dfa.transitions[uint32(state)<<8|uint32(data[offset])]
+		state = transitions[uint32(state)<<8|uint32(data[offset])]
 		if state == nfaDFANoState {
 			break
 		}
-		if dfa.matches[state] && nfaMatchesWordBoundary(data, offset+1) != invert {
+		if matches[state] && nfaMatchesWordBoundary(data, offset+1) != invert {
 			s.ends = append(s.ends, offset+1)
 		}
 	}
