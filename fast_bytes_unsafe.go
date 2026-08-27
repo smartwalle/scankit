@@ -75,9 +75,22 @@ func byteWordRangeAndSingleMask(data []byte, offset int, minimum, maximum, value
 	return byteWordRangeMask(word, minimum, maximum) | byteWordMatchMask(word, value)
 }
 
+func byteWordRangeDataMask(data []byte, offset int, minimum, maximum byte) uint64 {
+	word := *(*uint64)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(data)), offset))
+	return byteWordRangeMask(word, minimum, maximum)
+}
+
 func byteWordMatchMask(word uint64, value byte) uint64 {
 	xor := word ^ uint64(value)*byteWordOnes
 	return (xor - byteWordOnes) &^ xor & byteWordHigh
+}
+
+// byteWordExactMatchMask 返回逐 byte lane 精确的等值掩码。与 byteWordMatchMask 不同，
+// 它不依赖跨 lane 借位，因此可用于需要精确首候选位置的范围混合调度。
+func byteWordExactMatchMask(word uint64, value byte) uint64 {
+	xor := word ^ uint64(value)*byteWordOnes
+	low := xor &^ byteWordHigh
+	return ^((low + uint64(0x7f)*byteWordOnes) | xor) & byteWordHigh
 }
 
 // byteWordRangeMask 精确标记 [minimum, maximum] 内的 ASCII byte lanes。计算先清除原

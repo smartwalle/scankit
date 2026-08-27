@@ -4,6 +4,7 @@ package scankit
 // 所有字段，扫描路径无需重新判断正则形态、锚点资格或有界执行限制。
 type byteRegexCompilePlan struct {
 	analysis            regexAnalysis
+	candidate           byteRegexCandidatePlan
 	program             nfaProgram
 	anchor              regexAnchor
 	hasBoundedAnchor    bool
@@ -18,6 +19,10 @@ type byteRegexCompilePlan struct {
 	suffixChecks        *anchoredSuffixChecks
 	simpleRepeat        byteRegexRepeat
 	hasSimpleRepeat     bool
+	prefixRepeat        byteRegexPrefixRepeat
+	hasPrefixRepeat     bool
+	boundedRepeat       *byteRegexBoundedRepeat
+	alternation         *byteRegexAlternation
 	fixed               *fixedByteRegex
 	fixedAnchor         *fixedByteRegexAnchor
 	leftmostOnly        bool
@@ -34,7 +39,8 @@ func compileByteRegexPlan(root *regexNode, flags CompileFlag) (byteRegexCompileP
 		return byteRegexCompilePlan{}, err
 	}
 	program.multiline = flags&CompileMultiline != 0
-	anchor, hasBoundedAnchor := selectRegexAnchor(analysis)
+	candidatePlan := buildByteRegexCandidatePlan(analysis)
+	anchor, hasBoundedAnchor := candidatePlan.anchor, candidatePlan.bounded
 	internalAnchor, internalPrefixClass, internalLeading, hasInternalAnchor := extractInternalLiteralAnchor(root)
 	hasInternalAnchor = hasInternalAnchor && flags&CompileCaseless == 0
 	// 前置单词边界会使浮动字面量锚点的候选起点与触发位置不再能由现有 verifier 安全关联。
@@ -44,9 +50,11 @@ func compileByteRegexPlan(root *regexNode, flags CompileFlag) (byteRegexCompileP
 	}
 	prefixClass, hasPrefixClass := leadingBoundedPrefixClass(root, anchor)
 	if !hasPrefixClass {
-		for _, candidate := range analysis.anchors {
-			if candidateClass, ok := leadingBoundedPrefixClass(root, candidate); ok {
-				anchor = candidate
+		for _, candidateAnchor := range analysis.anchors {
+			if candidateClass, ok := leadingBoundedPrefixClass(root, candidateAnchor); ok {
+				anchor = candidateAnchor
+				candidatePlan = buildByteRegexCandidatePlan(regexAnalysis{anchors: []regexAnchor{candidateAnchor}})
+				hasBoundedAnchor = candidatePlan.bounded
 				prefixClass = candidateClass
 				hasPrefixClass = true
 				break
@@ -57,6 +65,7 @@ func compileByteRegexPlan(root *regexNode, flags CompileFlag) (byteRegexCompileP
 	hasBoundedAnchor = hasBoundedAnchor && anchor.maxOffset != unboundedRepeat && flags&CompileCaseless == 0
 	plan := byteRegexCompilePlan{
 		analysis:            analysis,
+		candidate:           candidatePlan,
 		program:             program,
 		anchor:              anchor,
 		hasBoundedAnchor:    hasBoundedAnchor,
@@ -71,6 +80,14 @@ func compileByteRegexPlan(root *regexNode, flags CompileFlag) (byteRegexCompileP
 		suffixChecks:        suffixChecks.extra(),
 		leftmostOnly:        anchor.minOffset != anchor.maxOffset,
 	}
+	plan.candidate.anchor = anchor
+	plan.candidate.hasAnchor = len(anchor.literal) != 0
+	plan.candidate.bounded = hasBoundedAnchor
+	if hasBoundedAnchor {
+		plan.candidate.anchorSpan = anchor.maxOffset - anchor.minOffset
+		plan.candidate.anchorScore = byteRegexCandidateScore(anchor, plan.candidate.anchorSpan)
+	}
+	plan.candidate.setRequiredChecks(suffixChecks.count)
 	if plan.hasPrefixClass {
 		plan.prefixDFAStates = buildAnchoredPrefixDFAStates(plan.program, plan.prefixClass, plan.anchor.maxOffset)
 	}
@@ -80,6 +97,16 @@ func compileByteRegexPlan(root *regexNode, flags CompileFlag) (byteRegexCompileP
 	} else if repeat, ok := extractByteRegexRepeat(root); ok {
 		plan.simpleRepeat = repeat
 		plan.hasSimpleRepeat = true
+	}
+	if repeat, ok := extractByteRegexPrefixRepeat(root); ok && flags&CompileLeftmostStart == 0 {
+		plan.prefixRepeat = repeat
+		plan.hasPrefixRepeat = true
+	}
+	if bounded, ok := extractByteRegexBoundedRepeat(root); ok {
+		plan.boundedRepeat = bounded
+	}
+	if alternation, ok := extractByteRegexAlternation(root); ok {
+		plan.alternation = alternation
 	}
 	if flags&CompileLeftmostStart == 0 {
 		if fixed, ok := extractFixedByteRegex(root); ok {
@@ -165,10 +192,24 @@ func extractInternalLiteralAnchor(root *regexNode) (regexAnchor, byteClass, stri
 		}
 		literal = append(literal, child.literal)
 	}
-	if len(literal) == 0 || prefixClass.contains(literal[0]) {
+	if len(literal) == 0 {
+		return regexAnchor{}, byteClass{}, "", false
+	}
+	// 默认 . 不跨 LF。对于 .*<literal>，即使 literal 首字节也能被 . 消费，向左
+	// 扫到当前行首仍恰好是同一结束位置的最左有效起点。其他类保留原限制：它们若吞掉
+	// 锚点首字节，无法在不扩大候选验证范围的前提下恢复唯一前缀边界。
+	if prefixClass.contains(literal[0]) && !isNonDotAllClass(prefixClass) {
 		return regexAnchor{}, byteClass{}, "", false
 	}
 	return regexAnchor{literal: string(literal), minOffset: prefix.min, maxOffset: unboundedRepeat}, prefixClass, string(leading), true
+}
+
+// isNonDotAllClass 仅识别 applyRegexFlags 后默认 . 的字节类。DotAll 会跨行，单个触发器
+// 可能验证并产生多个后续命中，不能复用 internal anchor 的一次触发一次行级验证模型。
+func isNonDotAllClass(class byteClass) bool {
+	dot := allBytes()
+	dot.remove('\n')
+	return class == dot
 }
 
 // buildAnchoredPrefixDFAStates 记录一个字节类有界运行后的 DFA 状态。仅当每个成员字节

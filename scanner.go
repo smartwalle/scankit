@@ -4,6 +4,7 @@
 package scankit
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math/bits"
@@ -151,6 +152,7 @@ type Scanner struct {
 	unanchoredGroups   [][]uint32
 	unanchoredNeeded   []bool
 	blockScanPlan      blockScanPlan
+	roleGraph          executionRoleGraph
 	// eventNeeded 标记事件会影响可观察结果的生产者表达式；不被组合规则使用的
 	// Quiet 表达式会完全排除在扫描热路径之外。
 	eventNeeded           []bool
@@ -170,6 +172,10 @@ type Scanner struct {
 	fixedOnlyWordScan     bool
 	fixedOnlyTriggerCount uint8
 	fixedOnlyTriggers     [8]byte
+	simpleRepeatOnly      bool
+	simpleRepeatWordScan  bool
+	simpleRepeatRangeMin  byte
+	simpleRepeatRangeMax  byte
 	requiresUTF8          bool
 	singleByteOnly        bool
 	singleByteFast        bool
@@ -273,6 +279,10 @@ type compiledRegexProgram struct {
 	leftmostOnly        bool
 	simpleRepeat        byteRegexRepeat
 	hasSimpleRepeat     bool
+	prefixRepeat        byteRegexPrefixRepeat
+	hasPrefixRepeat     bool
+	boundedRepeat       *byteRegexBoundedRepeat
+	alternation         *byteRegexAlternation
 	fixed               *fixedByteRegex
 	fixedAnchor         *fixedByteRegexAnchor
 	prefixClass         byteClass
@@ -288,6 +298,7 @@ type compiledRegexProgram struct {
 	internalPrefixClass byteClass
 	internalLeading     string
 	prefixDFAStates     []uint16
+	candidate           byteRegexCandidatePlan
 	maxLength           int
 	program             nfaProgram
 }
@@ -305,6 +316,18 @@ type byteRegexRepeatRun struct {
 	start     int
 	length    int
 	wordStart bool
+}
+
+// byteRegexPrefixRepeat 是“前导 class + 后缀无界 class-repeat”的编译期执行器。它按前导
+// class 触发，并以前视一次连续后缀段代替每字节 NFA/DFA 线程推进。
+type byteRegexPrefixRepeat struct {
+	prefix  byteClass
+	tail    byteClass
+	minimum int
+}
+
+type byteRegexPrefixRepeatRun struct {
+	processedUntil int
 }
 
 // unicodePropertyProgram 是首个码点执行路径。它与字节 NFA 分离，确保 UCP 规则
@@ -458,6 +481,9 @@ type mixedTriggerPlan struct {
 	remainder    [2]byte
 	remainderLen uint8
 	remainderAC  [2]bool
+	acRoot       [byteClassCardinality]bool
+	prefixByte   byte
+	prefixOnly   bool
 }
 
 // blockUnicodePlan 记录 rune 感知扫描选择的字节侧工作。它与常规块扫描计划共享通道，
@@ -511,9 +537,13 @@ type blockAnchoredLane struct {
 }
 
 type blockUnanchoredPlan struct {
-	fixed       [256][]blockFixedLane
-	fixedAnchor [256][]blockFixedAnchorLane
-	always      []blockAlwaysLane
+	fixed           [256][]blockFixedLane
+	fixedAnchor     [256][]blockFixedAnchorLane
+	prefixRepeat    [256][]blockPrefixRepeatLane
+	boundedRepeat   [256][]blockBoundedRepeatLane
+	alternation     [256][]blockAlternationLane
+	hasPrefixRepeat [256]bool
+	always          []blockAlwaysLane
 }
 
 type blockFixedLane struct {
@@ -526,6 +556,25 @@ type blockFixedAnchorLane struct {
 	contextIndex uint32
 	program      nfaProgram
 	anchor       fixedByteRegexAnchor
+	alternation  *byteRegexAlternation
+	consumers    []uint32
+}
+
+type blockPrefixRepeatLane struct {
+	contextIndex uint32
+	repeat       byteRegexPrefixRepeat
+	consumers    []uint32
+}
+
+type blockBoundedRepeatLane struct {
+	contextIndex uint32
+	repeat       *byteRegexBoundedRepeat
+	consumers    []uint32
+}
+
+type blockAlternationLane struct {
+	contextIndex uint32
+	graph        *byteRegexAlternation
 	consumers    []uint32
 }
 
@@ -552,6 +601,59 @@ func (plan blockUnanchoredPlan) hasLanes() bool {
 			return true
 		}
 	}
+	for _, lanes := range plan.prefixRepeat {
+		if len(lanes) != 0 {
+			return true
+		}
+	}
+	for _, lanes := range plan.boundedRepeat {
+		if len(lanes) != 0 {
+			return true
+		}
+	}
+	for _, lanes := range plan.alternation {
+		if len(lanes) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (plan blockUnanchoredPlan) hasPrefixRepeatLanes() bool {
+	for _, lanes := range plan.prefixRepeat {
+		if len(lanes) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (plan blockUnanchoredPlan) hasBoundedRepeatLanes() bool {
+	for _, lanes := range plan.boundedRepeat {
+		if len(lanes) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (plan blockUnanchoredPlan) hasAlternationGraphs() bool {
+	for _, lanes := range plan.fixedAnchor {
+		for _, lane := range lanes {
+			if lane.alternation != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (plan blockUnanchoredPlan) hasAlternationLanes() bool {
+	for _, lanes := range plan.alternation {
+		if len(lanes) != 0 {
+			return true
+		}
+	}
 	return false
 }
 
@@ -571,6 +673,13 @@ func buildBlockScanPlan(programs []compiledRegexProgram, expressions []compiledE
 			}
 		}
 		switch {
+		case regex.boundedRepeat != nil:
+			lane := blockBoundedRepeatLane{contextIndex: representative, repeat: regex.boundedRepeat, consumers: consumers}
+			for value := range plan.unanchored.boundedRepeat {
+				if regex.boundedRepeat.trigger.contains(byte(value)) {
+					plan.unanchored.boundedRepeat[value] = append(plan.unanchored.boundedRepeat[value], lane)
+				}
+			}
 		case regex.fixed != nil:
 			lane := blockFixedLane{contextIndex: representative, fixed: regex.fixed, consumers: consumers}
 			for value := range plan.unanchored.fixed {
@@ -579,10 +688,18 @@ func buildBlockScanPlan(programs []compiledRegexProgram, expressions []compiledE
 				}
 			}
 		case regex.fixedAnchor != nil:
-			lane := blockFixedAnchorLane{contextIndex: representative, program: regex.program, anchor: *regex.fixedAnchor, consumers: consumers}
+			lane := blockFixedAnchorLane{contextIndex: representative, program: regex.program, anchor: *regex.fixedAnchor, alternation: regex.alternation, consumers: consumers}
 			for value := range plan.unanchored.fixedAnchor {
 				if regex.fixedAnchor.class.contains(byte(value)) {
 					plan.unanchored.fixedAnchor[value] = append(plan.unanchored.fixedAnchor[value], lane)
+				}
+			}
+		case regex.hasPrefixRepeat:
+			lane := blockPrefixRepeatLane{contextIndex: representative, repeat: regex.prefixRepeat, consumers: consumers}
+			for value := range plan.unanchored.prefixRepeat {
+				if regex.prefixRepeat.prefix.contains(byte(value)) {
+					plan.unanchored.prefixRepeat[value] = append(plan.unanchored.prefixRepeat[value], lane)
+					plan.unanchored.hasPrefixRepeat[value] = true
 				}
 			}
 		default:
@@ -687,18 +804,62 @@ func fixedOnlyBlockTriggers(plan blockScanPlan) (values [8]byte, count uint8, ok
 	return values, count, count != 0
 }
 
+// simpleRepeatOnlyBlockPlan 识别只含一条无锚定单 class-repeat 的 Scanner。该结构没有
+// AC、fixed 或扩展事件需要推进；连续八个不属于该 class 的字节可安全跳过，并重置该运行。
+func simpleRepeatOnlyBlockPlan(plan blockScanPlan, hasTriggers, advancedEvents bool) (minimum, maximum byte, wordScan, ok bool) {
+	if hasTriggers || advancedEvents || len(plan.unanchored.always) != 1 || !plan.unanchored.always[0].hasSimpleRepeat {
+		return 0, 0, false, false
+	}
+	for value := range plan.unanchored.fixed {
+		if len(plan.unanchored.fixed[value]) != 0 || len(plan.unanchored.fixedAnchor[value]) != 0 {
+			return 0, 0, false, false
+		}
+	}
+	minimum, maximum, ok = byteClassASCIIRange(plan.unanchored.always[0].repeat.class)
+	return minimum, maximum, ok && singleByteWordScanAvailable, true
+}
+
+// byteClassASCIIRange 仅接受恰好由一个 ASCII 连续区间组成的 class。它用于机器字预过滤；
+// 任何非 ASCII 成员或不连续成员都会回退标量扫描。
+func byteClassASCIIRange(class byteClass) (minimum, maximum byte, ok bool) {
+	first := -1
+	last := -1
+	for value := 0; value < 128; value++ {
+		if class.contains(byte(value)) {
+			if first == -1 {
+				first = value
+			}
+			last = value
+		}
+	}
+	if first == -1 {
+		return 0, 0, false
+	}
+	for value := first; value <= last; value++ {
+		if !class.contains(byte(value)) {
+			return 0, 0, false
+		}
+	}
+	for value := 128; value < byteClassCardinality; value++ {
+		if class.contains(byte(value)) {
+			return 0, 0, false
+		}
+	}
+	return byte(first), byte(last), true
+}
+
 // buildMixedTriggerPlan 合并 AC 根边与 fixed 通道的候选字节。只有所有无锚定规则都可由
 // 当前字节触发、没有扩展事件，且根边集合可由八字节预过滤完整表示时才启用。AC 一旦离开
 // 根状态仍必须逐字节推进，因此扫描期还会检查当前 state。
 func buildMixedTriggerPlan(automaton literalAutomaton, plan blockScanPlan, advancedEvents, hasUnicode bool) mixedTriggerPlan {
-	if automaton.sparse || advancedEvents || hasUnicode || len(plan.unanchored.always) != 0 || !plan.unanchored.hasLanes() {
+	if automaton.sparse || advancedEvents || hasUnicode || len(plan.unanchored.always) != 0 || plan.unanchored.hasBoundedRepeatLanes() || plan.unanchored.hasAlternationLanes() || !plan.unanchored.hasLanes() {
 		return mixedTriggerPlan{}
 	}
 	var result mixedTriggerPlan
-	add := func(value byte) bool {
+	add := func(value byte, prefixRepeat bool) bool {
 		// 字母在普通日志正文中通常过于密集。它们会让几乎每个机器字都回退到标量路径，
 		// 预过滤本身反而成为额外成本；这只收紧快路径资格，不影响原通用扫描语义。
-		if value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' {
+		if !prefixRepeat && (value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z') {
 			return false
 		}
 		for index := uint8(0); index < result.count; index++ {
@@ -718,7 +879,8 @@ func buildMixedTriggerPlan(automaton literalAutomaton, plan blockScanPlan, advan
 			return mixedTriggerPlan{}
 		}
 		for index := uint8(0); index < automaton.rootByteCount; index++ {
-			if !add(automaton.rootByteVals[index]) {
+			result.acRoot[automaton.rootByteVals[index]] = true
+			if !add(automaton.rootByteVals[index], false) {
 				return mixedTriggerPlan{}
 			}
 		}
@@ -727,10 +889,22 @@ func buildMixedTriggerPlan(automaton literalAutomaton, plan blockScanPlan, advan
 		if len(plan.unanchored.fixed[value]) == 0 && len(plan.unanchored.fixedAnchor[value]) == 0 {
 			continue
 		}
-		if !add(byte(value)) {
+		if !add(byte(value), false) {
 			return mixedTriggerPlan{}
 		}
 	}
+	prefixCount := 0
+	for value := range plan.unanchored.prefixRepeat {
+		if len(plan.unanchored.prefixRepeat[value]) == 0 {
+			continue
+		}
+		if !add(byte(value), true) {
+			return mixedTriggerPlan{}
+		}
+		result.prefixByte = byte(value)
+		prefixCount++
+	}
+	result.prefixOnly = prefixCount == 1
 	if result.count == 0 {
 		return mixedTriggerPlan{}
 	}
@@ -1061,6 +1235,11 @@ func (scanner *Scanner) appendBlockUnanchoredEvents(data []byte, value byte, off
 			}
 		}
 	}
+	if scanner.blockScanPlan.unanchored.hasPrefixRepeat[value] {
+		scanner.appendBlockPrefixRepeatEvents(data, value, offset, ctx)
+	}
+	scanner.appendBlockBoundedRepeatEvents(data, value, offset, ctx)
+	scanner.appendBlockAlternationEvents(data, value, offset, ctx)
 	for _, lane := range scanner.blockScanPlan.unanchored.always {
 		if lane.hasSimpleRepeat {
 			var start int
@@ -1094,6 +1273,63 @@ func (scanner *Scanner) appendBlockUnanchoredEvents(data []byte, value byte, off
 	}
 }
 
+func (scanner *Scanner) appendBlockPrefixRepeatEvents(data []byte, value byte, offset int, ctx *context) {
+	for _, lane := range scanner.blockScanPlan.unanchored.prefixRepeat[value] {
+		run := &ctx.regexPrefixRepeats[lane.contextIndex]
+		if offset < run.processedUntil {
+			continue
+		}
+		end := offset + 1
+		for end < len(data) && lane.repeat.tail.contains(data[end]) {
+			end++
+		}
+		run.processedUntil = end
+		for matchEnd := offset + 1 + lane.repeat.minimum; matchEnd <= end; matchEnd++ {
+			for _, expressionIndex := range lane.consumers {
+				expression := scanner.expressions[expressionIndex]
+				ctx.pushPendingEvent(scanEvent{match: Match{Id: expression.id, From: uint64(offset), To: uint64(matchEnd)}, expressionIndex: expressionIndex})
+			}
+		}
+	}
+}
+
+func (scanner *Scanner) appendBlockBoundedRepeatEvents(data []byte, value byte, offset int, ctx *context) {
+	for _, lane := range scanner.blockScanPlan.unanchored.boundedRepeat[value] {
+		run := &ctx.regexBounded[lane.contextIndex]
+		run.matches = lane.repeat.appendMatches(data, offset, run.matches[:0])
+		for _, found := range run.matches {
+			for _, expressionIndex := range lane.consumers {
+				expression := scanner.expressions[expressionIndex]
+				event := scanEvent{match: Match{Id: expression.id, From: uint64(found.start), To: uint64(found.end)}, expressionIndex: expressionIndex}
+				if found.end == offset+1 {
+					ctx.readyEvents = append(ctx.readyEvents, event)
+				} else {
+					ctx.pushPendingEvent(event)
+				}
+			}
+		}
+	}
+}
+
+func (scanner *Scanner) appendBlockAlternationEvents(data []byte, value byte, offset int, ctx *context) {
+	for _, lane := range scanner.blockScanPlan.unanchored.alternation[value] {
+		start := offset - lane.graph.anchor.offset
+		end := start + lane.graph.width
+		if !lane.graph.matchesAt(data, start) {
+			continue
+		}
+		for _, expressionIndex := range lane.consumers {
+			expression := scanner.expressions[expressionIndex]
+			event := scanEvent{match: Match{Id: expression.id, From: uint64(start), To: uint64(end)}, expressionIndex: expressionIndex}
+			if end == offset+1 {
+				ctx.readyEvents = append(ctx.readyEvents, event)
+			} else {
+				ctx.pushPendingEvent(event)
+			}
+		}
+	}
+}
+
 func (scanner *Scanner) scanBlock(data []byte, ctx *context, matches *[]Match) error {
 	if scanner.requiresUTF8 && !utf8.Valid(data) {
 		return ErrInvalidUTF8
@@ -1121,8 +1357,14 @@ func (scanner *Scanner) scanBlock(data []byte, ctx *context, matches *[]Match) e
 		for index := range ctx.regexRepeats {
 			ctx.regexRepeats[index].reset()
 		}
+		for index := range ctx.regexPrefixRepeats {
+			ctx.regexPrefixRepeats[index].processedUntil = 0
+		}
 		for index := range ctx.regexFixed {
 			ctx.regexFixed[index].matches = ctx.regexFixed[index].matches[:0]
+		}
+		for index := range ctx.regexBounded {
+			ctx.regexBounded[index].matches = ctx.regexBounded[index].matches[:0]
 		}
 		for index := range ctx.unicodeRuns {
 			ctx.unicodeRuns[index].starts = ctx.unicodeRuns[index].starts[:0]
@@ -1168,8 +1410,20 @@ func (scanner *Scanner) scanBlock(data []byte, ctx *context, matches *[]Match) e
 		}
 		return scanner.scanBlockFixedOnly(data, ctx, matches)
 	}
+	if scanner.simpleRepeatOnly {
+		return scanner.scanBlockSimpleRepeatOnly(data, ctx, matches)
+	}
 	if scanner.blockScanPlan.mixed.wordScan {
 		if scanner.blockScanPlan.mixed.rangeFast {
+			mixed := scanner.blockScanPlan.mixed
+			if mixed.remainderLen == 2 {
+				if mixed.prefixOnly && mixed.prefixByte == mixed.remainder[0] {
+					return scanner.scanBlockMixedTriggeredRangeWithPrefixByte(data, ctx, matches, mixed.rangeMinimum, mixed.rangeMaximum, mixed.remainder[1], mixed.remainder[0])
+				}
+				if mixed.prefixOnly && mixed.prefixByte == mixed.remainder[1] {
+					return scanner.scanBlockMixedTriggeredRangeWithPrefixByte(data, ctx, matches, mixed.rangeMinimum, mixed.rangeMaximum, mixed.remainder[0], mixed.remainder[1])
+				}
+			}
 			return scanner.scanBlockMixedTriggeredRange(data, ctx, matches)
 		}
 		return scanner.scanBlockMixedTriggered(data, ctx, matches)
@@ -1218,6 +1472,22 @@ func (scanner *Scanner) scanBlock(data []byte, ctx *context, matches *[]Match) e
 				if anchor.checks != nil && !fixedByteRegexAnchorChecksMatch(data, start, anchor.checks) {
 					continue
 				}
+				if lane.alternation != nil {
+					if !lane.alternation.matchesAt(data, start) {
+						continue
+					}
+					end := start + lane.alternation.width
+					for _, expressionIndex := range lane.consumers {
+						expression := scanner.expressions[expressionIndex]
+						event := scanEvent{match: Match{Id: expression.id, From: uint64(start), To: uint64(end)}, expressionIndex: expressionIndex}
+						if end == offset+1 {
+							ctx.readyEvents = append(ctx.readyEvents, event)
+						} else {
+							ctx.pushPendingEvent(event)
+						}
+					}
+					continue
+				}
 				verifier := ctx.regexVerifiers[lane.contextIndex]
 				for _, end := range verifier.matchFromLimit(lane.program, data, start, anchor.width) {
 					for _, expressionIndex := range lane.consumers {
@@ -1231,6 +1501,11 @@ func (scanner *Scanner) scanBlock(data []byte, ctx *context, matches *[]Match) e
 					}
 				}
 			}
+			if unanchoredPlan.hasPrefixRepeat[b] {
+				scanner.appendBlockPrefixRepeatEvents(data, b, offset, ctx)
+			}
+			scanner.appendBlockBoundedRepeatEvents(data, b, offset, ctx)
+			scanner.appendBlockAlternationEvents(data, b, offset, ctx)
 			for _, lane := range unanchoredPlan.always {
 				if lane.hasSimpleRepeat {
 					var start int
@@ -1302,14 +1577,23 @@ func (scanner *Scanner) scanBlockMixedTriggeredRange(data []byte, ctx *context, 
 			offset = wordEnd
 			continue
 		}
+		if state == 0 && wordEnd <= len(data) && mask != 0 {
+			next := bits.TrailingZeros64(mask) >> 3
+			if next != 0 && (ctx.pendingCount == 0 || ctx.pendingFirstEnd > uint64(offset+next)) {
+				offset += next
+				continue
+			}
+		}
 
 		value := data[offset]
-		state = transitions[state<<8|uint32(value)]
-		outputEnd := scanner.automaton.outputEnd[state]
-		if outputEnd != 0 {
-			outputStart := scanner.automaton.outputStart[state]
-			for outputIndex := outputStart; outputIndex < outputEnd; outputIndex++ {
-				scanner.appendBlockTriggerEvents(data, offset, scanner.automaton.outputs[outputIndex], ctx)
+		if state != 0 || mixed.acRoot[value] {
+			state = transitions[state<<8|uint32(value)]
+			outputEnd := scanner.automaton.outputEnd[state]
+			if outputEnd != 0 {
+				outputStart := scanner.automaton.outputStart[state]
+				for outputIndex := outputStart; outputIndex < outputEnd; outputIndex++ {
+					scanner.appendBlockTriggerEvents(data, offset, scanner.automaton.outputs[outputIndex], ctx)
+				}
 			}
 		}
 		for _, lane := range plan.fixed[value] {
@@ -1334,6 +1618,22 @@ func (scanner *Scanner) scanBlockMixedTriggeredRange(data []byte, ctx *context, 
 			if anchor.checks != nil && !fixedByteRegexAnchorChecksMatch(data, start, anchor.checks) {
 				continue
 			}
+			if lane.alternation != nil {
+				if !lane.alternation.matchesAt(data, start) {
+					continue
+				}
+				end := start + lane.alternation.width
+				for _, expressionIndex := range lane.consumers {
+					expression := scanner.expressions[expressionIndex]
+					event := scanEvent{match: Match{Id: expression.id, From: uint64(start), To: uint64(end)}, expressionIndex: expressionIndex}
+					if end == offset+1 {
+						ctx.readyEvents = append(ctx.readyEvents, event)
+					} else {
+						ctx.pushPendingEvent(event)
+					}
+				}
+				continue
+			}
 			verifier := ctx.regexVerifiers[lane.contextIndex]
 			for _, end := range verifier.matchFromLimit(lane.program, data, start, anchor.width) {
 				for _, expressionIndex := range lane.consumers {
@@ -1347,9 +1647,120 @@ func (scanner *Scanner) scanBlockMixedTriggeredRange(data []byte, ctx *context, 
 				}
 			}
 		}
+		if plan.hasPrefixRepeat[value] {
+			scanner.appendBlockPrefixRepeatEvents(data, value, offset, ctx)
+		}
 		end := uint64(offset + 1)
 		if len(ctx.readyEvents) != 0 || ctx.pendingCount != 0 && ctx.pendingFirstEnd <= end {
 			collectScanEvents(scanner, ctx, offset+1, matches)
+		}
+		offset++
+	}
+	return nil
+}
+
+// scanBlockMixedTriggeredRangeWithPrefixByte 处理“连续范围 + 一个普通离散字节 + 一个
+// prefix-repeat 字节”的结构。普通离散字节进入机器字掩码；只有 prefix-repeat 的稀疏
+// 前导字节通过标准库查找缓存下一个位置，避免为永不出现的前导字节额外预扫整块输入。
+func (scanner *Scanner) scanBlockMixedTriggeredRangeWithPrefixByte(data []byte, ctx *context, matches *[]Match, minimum, maximum, single, prefix byte) error {
+	plan := scanner.blockScanPlan.unanchored
+	mixed := scanner.blockScanPlan.mixed
+	transitions := scanner.automaton.transitions
+	state := uint32(0)
+	prefixOffset := bytes.IndexByte(data, prefix)
+	if prefixOffset < 0 {
+		// 当前块不存在 prefix-repeat 的唯一前导字节，因此该 lane 不可能产生事件。
+		// 退回范围加普通离散字节的专用循环，移除后续每个机器字的 prefix 分支。
+		return scanner.scanBlockMixedTriggeredRangeSingle(data, ctx, matches, minimum, maximum, single)
+	}
+	for offset := 0; offset < len(data); {
+		wordEnd := offset + 8
+		if state == 0 && wordEnd <= len(data) {
+			mask := byteWordRangeAndSingleMask(data, offset, minimum, maximum, single)
+			next := 8
+			if mask != 0 {
+				next = bits.TrailingZeros64(mask) >> 3
+			}
+			if prefixOffset-offset < next {
+				next = prefixOffset - offset
+			}
+			if next != 0 && (ctx.pendingCount == 0 || ctx.pendingFirstEnd > uint64(offset+next)) {
+				offset += next
+				continue
+			}
+		}
+		value := data[offset]
+		if state != 0 || mixed.acRoot[value] {
+			state = transitions[state<<8|uint32(value)]
+			if outputEnd := scanner.automaton.outputEnd[state]; outputEnd != 0 {
+				for outputIndex := scanner.automaton.outputStart[state]; outputIndex < outputEnd; outputIndex++ {
+					scanner.appendBlockTriggerEvents(data, offset, scanner.automaton.outputs[outputIndex], ctx)
+				}
+			}
+		}
+		for _, lane := range plan.fixed[value] {
+			for _, found := range ctx.regexFixed[lane.contextIndex].advance(lane.fixed, data, offset) {
+				for _, expressionIndex := range lane.consumers {
+					expression := scanner.expressions[expressionIndex]
+					event := scanEvent{match: Match{Id: expression.id, From: uint64(found.start), To: uint64(found.end)}, expressionIndex: expressionIndex}
+					if found.end == offset+1 {
+						ctx.readyEvents = append(ctx.readyEvents, event)
+					} else {
+						ctx.pushPendingEvent(event)
+					}
+				}
+			}
+		}
+		for _, lane := range plan.fixedAnchor[value] {
+			anchor := lane.anchor
+			start := offset - anchor.offset
+			if start < 0 || start+anchor.width > len(data) {
+				continue
+			}
+			if anchor.checks != nil && !fixedByteRegexAnchorChecksMatch(data, start, anchor.checks) {
+				continue
+			}
+			if lane.alternation != nil {
+				if lane.alternation.matchesAt(data, start) {
+					end := start + lane.alternation.width
+					for _, expressionIndex := range lane.consumers {
+						expression := scanner.expressions[expressionIndex]
+						event := scanEvent{match: Match{Id: expression.id, From: uint64(start), To: uint64(end)}, expressionIndex: expressionIndex}
+						if end == offset+1 {
+							ctx.readyEvents = append(ctx.readyEvents, event)
+						} else {
+							ctx.pushPendingEvent(event)
+						}
+					}
+				}
+				continue
+			}
+			verifier := ctx.regexVerifiers[lane.contextIndex]
+			for _, end := range verifier.matchFromLimit(lane.program, data, start, anchor.width) {
+				for _, expressionIndex := range lane.consumers {
+					expression := scanner.expressions[expressionIndex]
+					event := scanEvent{match: Match{Id: expression.id, From: uint64(start), To: uint64(end)}, expressionIndex: expressionIndex}
+					if end == offset+1 {
+						ctx.readyEvents = append(ctx.readyEvents, event)
+					} else {
+						ctx.pushPendingEvent(event)
+					}
+				}
+			}
+		}
+		if value == prefix {
+			scanner.appendBlockPrefixRepeatEvents(data, value, offset, ctx)
+		}
+		end := uint64(offset + 1)
+		if len(ctx.readyEvents) != 0 || ctx.pendingCount != 0 && ctx.pendingFirstEnd <= end {
+			collectScanEvents(scanner, ctx, offset+1, matches)
+		}
+		if offset == prefixOffset {
+			next := bytes.IndexByte(data[offset+1:], prefix)
+			prefixOffset = len(data)
+			if next >= 0 {
+				prefixOffset = offset + 1 + next
+			}
 		}
 		offset++
 	}
@@ -1360,6 +1771,7 @@ func (scanner *Scanner) scanBlockMixedTriggeredRange(data []byte, ctx *context, 
 // 编译期已固定，因此循环内不再判断剩余触发器数量。
 func (scanner *Scanner) scanBlockMixedTriggeredRangeSingle(data []byte, ctx *context, matches *[]Match, minimum, maximum, single byte) error {
 	plan := scanner.blockScanPlan.unanchored
+	mixed := scanner.blockScanPlan.mixed
 	transitions := scanner.automaton.transitions
 	state := uint32(0)
 	offset := 0
@@ -1380,12 +1792,14 @@ func (scanner *Scanner) scanBlockMixedTriggeredRangeSingle(data []byte, ctx *con
 			}
 		}
 		value := data[offset]
-		state = transitions[state<<8|uint32(value)]
-		outputEnd := scanner.automaton.outputEnd[state]
-		if outputEnd != 0 {
-			outputStart := scanner.automaton.outputStart[state]
-			for outputIndex := outputStart; outputIndex < outputEnd; outputIndex++ {
-				scanner.appendBlockTriggerEvents(data, offset, scanner.automaton.outputs[outputIndex], ctx)
+		if state != 0 || mixed.acRoot[value] {
+			state = transitions[state<<8|uint32(value)]
+			outputEnd := scanner.automaton.outputEnd[state]
+			if outputEnd != 0 {
+				outputStart := scanner.automaton.outputStart[state]
+				for outputIndex := outputStart; outputIndex < outputEnd; outputIndex++ {
+					scanner.appendBlockTriggerEvents(data, offset, scanner.automaton.outputs[outputIndex], ctx)
+				}
 			}
 		}
 		for _, lane := range plan.fixed[value] {
@@ -1410,6 +1824,22 @@ func (scanner *Scanner) scanBlockMixedTriggeredRangeSingle(data []byte, ctx *con
 			if anchor.checks != nil && !fixedByteRegexAnchorChecksMatch(data, start, anchor.checks) {
 				continue
 			}
+			if lane.alternation != nil {
+				if !lane.alternation.matchesAt(data, start) {
+					continue
+				}
+				end := start + lane.alternation.width
+				for _, expressionIndex := range lane.consumers {
+					expression := scanner.expressions[expressionIndex]
+					event := scanEvent{match: Match{Id: expression.id, From: uint64(start), To: uint64(end)}, expressionIndex: expressionIndex}
+					if end == offset+1 {
+						ctx.readyEvents = append(ctx.readyEvents, event)
+					} else {
+						ctx.pushPendingEvent(event)
+					}
+				}
+				continue
+			}
 			verifier := ctx.regexVerifiers[lane.contextIndex]
 			for _, end := range verifier.matchFromLimit(lane.program, data, start, anchor.width) {
 				for _, expressionIndex := range lane.consumers {
@@ -1422,6 +1852,9 @@ func (scanner *Scanner) scanBlockMixedTriggeredRangeSingle(data []byte, ctx *con
 					}
 				}
 			}
+		}
+		if plan.hasPrefixRepeat[value] {
+			scanner.appendBlockPrefixRepeatEvents(data, value, offset, ctx)
 		}
 		end := uint64(offset + 1)
 		if len(ctx.readyEvents) != 0 || ctx.pendingCount != 0 && ctx.pendingFirstEnd <= end {
@@ -1437,6 +1870,7 @@ func (scanner *Scanner) scanBlockMixedTriggeredRangeSingle(data []byte, ctx *con
 // 根边、也不含 fixed 触发字节的输入；候选位置仍按通用 Block 循环的原顺序执行。
 func (scanner *Scanner) scanBlockMixedTriggered(data []byte, ctx *context, matches *[]Match) error {
 	plan := scanner.blockScanPlan.unanchored
+	mixed := scanner.blockScanPlan.mixed
 	transitions := scanner.automaton.transitions
 	state := uint32(0)
 	offset := 0
@@ -1450,12 +1884,14 @@ func (scanner *Scanner) scanBlockMixedTriggered(data []byte, ctx *context, match
 		}
 
 		value := data[offset]
-		state = transitions[state<<8|uint32(value)]
-		outputEnd := scanner.automaton.outputEnd[state]
-		if outputEnd != 0 {
-			outputStart := scanner.automaton.outputStart[state]
-			for outputIndex := outputStart; outputIndex < outputEnd; outputIndex++ {
-				scanner.appendBlockTriggerEvents(data, offset, scanner.automaton.outputs[outputIndex], ctx)
+		if state != 0 || mixed.acRoot[value] {
+			state = transitions[state<<8|uint32(value)]
+			outputEnd := scanner.automaton.outputEnd[state]
+			if outputEnd != 0 {
+				outputStart := scanner.automaton.outputStart[state]
+				for outputIndex := outputStart; outputIndex < outputEnd; outputIndex++ {
+					scanner.appendBlockTriggerEvents(data, offset, scanner.automaton.outputs[outputIndex], ctx)
+				}
 			}
 		}
 		for _, lane := range plan.fixed[value] {
@@ -1480,6 +1916,22 @@ func (scanner *Scanner) scanBlockMixedTriggered(data []byte, ctx *context, match
 			if anchor.checks != nil && !fixedByteRegexAnchorChecksMatch(data, start, anchor.checks) {
 				continue
 			}
+			if lane.alternation != nil {
+				if !lane.alternation.matchesAt(data, start) {
+					continue
+				}
+				end := start + lane.alternation.width
+				for _, expressionIndex := range lane.consumers {
+					expression := scanner.expressions[expressionIndex]
+					event := scanEvent{match: Match{Id: expression.id, From: uint64(start), To: uint64(end)}, expressionIndex: expressionIndex}
+					if end == offset+1 {
+						ctx.readyEvents = append(ctx.readyEvents, event)
+					} else {
+						ctx.pushPendingEvent(event)
+					}
+				}
+				continue
+			}
 			verifier := ctx.regexVerifiers[lane.contextIndex]
 			for _, end := range verifier.matchFromLimit(lane.program, data, start, anchor.width) {
 				for _, expressionIndex := range lane.consumers {
@@ -1493,8 +1945,49 @@ func (scanner *Scanner) scanBlockMixedTriggered(data []byte, ctx *context, match
 				}
 			}
 		}
+		if plan.hasPrefixRepeat[value] {
+			scanner.appendBlockPrefixRepeatEvents(data, value, offset, ctx)
+		}
 		end := uint64(offset + 1)
 		if len(ctx.readyEvents) != 0 || ctx.pendingCount != 0 && ctx.pendingFirstEnd <= end {
+			collectScanEvents(scanner, ctx, offset+1, matches)
+		}
+		offset++
+	}
+	return nil
+}
+
+// scanBlockSimpleRepeatOnly 处理只含一条无锚定单 class-repeat 的 Scanner。它保留常规事件
+// 层，因此组合、QUIET、SINGLEMATCH 和 offset/length 约束与通用扫描完全一致；仅省去必然
+// 为空的 AC、fixed、fixed-anchor 与 always-lane 遍历。
+func (scanner *Scanner) scanBlockSimpleRepeatOnly(data []byte, ctx *context, matches *[]Match) error {
+	lane := scanner.blockScanPlan.unanchored.always[0]
+	run := &ctx.regexRepeats[lane.contextIndex]
+	for offset := 0; offset < len(data); {
+		if scanner.simpleRepeatWordScan && offset+8 <= len(data) &&
+			byteWordRangeDataMask(data, offset, scanner.simpleRepeatRangeMin, scanner.simpleRepeatRangeMax) == 0 {
+			run.reset()
+			offset += 8
+			continue
+		}
+		value := data[offset]
+		var start int
+		var matched bool
+		if lane.repeat.wordBounded {
+			start, matched = run.advanceWordBounded(lane.repeat, value, offset, data)
+		} else {
+			start, matched = run.advance(lane.repeat, value, offset)
+		}
+		if matched {
+			for _, expressionIndex := range lane.consumers {
+				expression := scanner.expressions[expressionIndex]
+				ctx.readyEvents = append(ctx.readyEvents, scanEvent{
+					match:           Match{Id: expression.id, From: uint64(start), To: uint64(offset + 1)},
+					expressionIndex: expressionIndex,
+				})
+			}
+		}
+		if len(ctx.readyEvents) != 0 {
 			collectScanEvents(scanner, ctx, offset+1, matches)
 		}
 		offset++
@@ -2354,7 +2847,7 @@ func collectScanEvents(scanner *Scanner, ctx *context, end int, matches *[]Match
 	prepareScanEvents(ctx, end)
 	if scanner.directSingleEvent && len(ctx.readyEvents) == 1 {
 		event := ctx.readyEvents[0]
-		*matches = append(*matches, event.match)
+		scanner.acceptScanEvent(ctx, matches, event)
 		ctx.readyEvents = ctx.readyEvents[:0]
 		return
 	}
@@ -2365,19 +2858,25 @@ func collectScanEvents(scanner *Scanner, ctx *context, end int, matches *[]Match
 		sortScanEvents(ctx.readyEvents)
 	}
 	for _, event := range ctx.readyEvents {
-		expression := scanner.expressions[event.expressionIndex]
-		if expression.flags&CompileSingleMatch != 0 && ctx.singleMatched[event.expressionIndex] {
-			continue
-		}
-		if expression.flags&CompileSingleMatch != 0 {
-			ctx.singleMatched[event.expressionIndex] = true
-		}
-		if expression.flags&CompileQuiet != 0 {
-			continue
-		}
-		*matches = append(*matches, event.match)
+		scanner.acceptScanEvent(ctx, matches, event)
 	}
 	ctx.readyEvents = ctx.readyEvents[:0]
+}
+
+// acceptScanEvent 是事件层唯一的可观察投递入口。直达通道已在编译期证明无需排序或
+// pending，但仍经过这里，确保 SINGLEMATCH、QUIET 等未来语义只需在一个位置维护。
+func (scanner *Scanner) acceptScanEvent(ctx *context, matches *[]Match, event scanEvent) {
+	expression := scanner.expressions[event.expressionIndex]
+	if expression.flags&CompileSingleMatch != 0 && ctx.singleMatched[event.expressionIndex] {
+		return
+	}
+	if expression.flags&CompileSingleMatch != 0 {
+		ctx.singleMatched[event.expressionIndex] = true
+	}
+	if expression.flags&CompileQuiet != 0 {
+		return
+	}
+	*matches = append(*matches, event.match)
 }
 
 // keepOneEventPerExpressionEnd 是所有执行器共用的公开事件边界。常规扫描中到达同一次

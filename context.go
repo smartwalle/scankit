@@ -2,15 +2,17 @@ package scankit
 
 // context 持有 Scanner 内部复用的可变扫描状态，不属于扫描 API，且不得在一次活动扫描外保留。
 type context struct {
-	state          uint32
-	regexVerifiers []*nfaVerifierContext
-	regexRunners   []*nfaSchedulerContext
-	regexRepeats   []byteRegexRepeatRun
-	regexFixed     []fixedByteRegexRun
-	unicodeRuns    []unicodePropertyRun
-	unicodeApprox  []unicodeApproximateRun
-	singleMatched  []bool
-	pendingEvents  []scanEvent
+	state              uint32
+	regexVerifiers     []*nfaVerifierContext
+	regexRunners       []*nfaSchedulerContext
+	regexRepeats       []byteRegexRepeatRun
+	regexPrefixRepeats []byteRegexPrefixRepeatRun
+	regexFixed         []fixedByteRegexRun
+	regexBounded       []fixedByteRegexRun
+	unicodeRuns        []unicodePropertyRun
+	unicodeApprox      []unicodeApproximateRun
+	singleMatched      []bool
+	pendingEvents      []scanEvent
 	// 当生产者按自然扫描顺序发现未来事件时，pendingFIFO 保持为 true。常见锚定正则路径
 	// 具有该性质，因此可无需通用 NFA/定宽执行器所需的堆维护而出队。
 	pendingFIFO     bool
@@ -122,7 +124,9 @@ func (scanner *Scanner) newContext() *context {
 		ctx.regexVerifiers = make([]*nfaVerifierContext, len(scanner.regexPrograms))
 		ctx.regexRunners = make([]*nfaSchedulerContext, len(scanner.regexPrograms))
 		ctx.regexRepeats = make([]byteRegexRepeatRun, len(scanner.regexPrograms))
+		ctx.regexPrefixRepeats = make([]byteRegexPrefixRepeatRun, len(scanner.regexPrograms))
 		ctx.regexFixed = make([]fixedByteRegexRun, len(scanner.regexPrograms))
+		ctx.regexBounded = make([]fixedByteRegexRun, len(scanner.regexPrograms))
 		for groupIndex, group := range scanner.anchoredGroups {
 			if !scanner.anchoredNeeded[groupIndex] {
 				continue
@@ -137,11 +141,17 @@ func (scanner *Scanner) newContext() *context {
 			}
 			representative := group[0]
 			program := scanner.regexPrograms[representative]
-			if !program.hasSimpleRepeat && program.fixedAnchor != nil {
+			if program.boundedRepeat != nil {
+				capacity := program.boundedRepeat.maximum - program.boundedRepeat.minimum + 1
+				if capacity < 1 {
+					capacity = 1
+				}
+				ctx.regexBounded[representative].matches = make([]fixedByteRegexMatch, 0, capacity)
+			} else if !program.hasSimpleRepeat && !program.hasPrefixRepeat && program.fixedAnchor != nil {
 				ctx.regexVerifiers[representative] = newNFAVerifierContext(program.program)
-			} else if !program.hasSimpleRepeat && program.fixed != nil {
+			} else if !program.hasSimpleRepeat && !program.hasPrefixRepeat && program.fixed != nil {
 				ctx.regexFixed[representative].matches = make([]fixedByteRegexMatch, 0, len(program.fixed.sequences))
-			} else if !program.hasSimpleRepeat {
+			} else if !program.hasSimpleRepeat && !program.hasPrefixRepeat {
 				leftmost := scanner.expressions[program.expressionIndex].flags&CompileLeftmostStart != 0
 				ctx.regexRunners[representative] = newNFASchedulerContext(program.program, leftmost)
 			}

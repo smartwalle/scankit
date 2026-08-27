@@ -264,8 +264,13 @@ func Compile(expressions []Expression) (*Scanner, error) {
 				program:         plan.program,
 				simpleRepeat:    plan.simpleRepeat,
 				hasSimpleRepeat: plan.hasSimpleRepeat,
+				prefixRepeat:    plan.prefixRepeat,
+				hasPrefixRepeat: plan.hasPrefixRepeat,
+				boundedRepeat:   plan.boundedRepeat,
+				alternation:     plan.alternation,
 				fixed:           plan.fixed,
 				fixedAnchor:     plan.fixedAnchor,
+				candidate:       plan.candidate,
 			}
 			if (!plan.hasBoundedAnchor && !plan.hasInternalAnchor) || plan.analysis.min == 0 {
 				compiledProgram.unanchored = true
@@ -511,6 +516,7 @@ func Compile(expressions []Expression) (*Scanner, error) {
 		}
 	}
 	blockPlan := buildBlockScanPlan(regexPrograms, compiled, unanchoredGroups, unanchoredNeeded, triggers, anchoredGroups, anchoredNeeded, eventNeeded, advancedEvents)
+	roleGraph := buildExecutionRoleGraph(blockPlan, triggers, regexPrograms, compiled, eventNeeded, unicodeProperties, unicodeApproximate, advancedEvents)
 	automaton := builder.freeze()
 	blockPlan.mixed = buildMixedTriggerPlan(automaton, blockPlan, advancedEvents, len(unicodeProperties) != 0 || len(unicodeApproximate) != 0)
 	directLiterals := false
@@ -528,18 +534,11 @@ func Compile(expressions []Expression) (*Scanner, error) {
 			}
 		}
 	}
-	directSingleEvent := len(combinations) == 0
-	if directSingleEvent {
-		for _, expression := range compiled {
-			if expression.flags&(CompileSingleMatch|CompileQuiet) != 0 || expression.constraint.hasMinOffset || expression.constraint.hasMaxOffset || expression.constraint.hasMinLength {
-				directSingleEvent = false
-				break
-			}
-		}
-	}
-	fixedOnlyBlock := !advancedEvents && len(triggers) == 0 && len(blockPlan.unanchored.always) == 0 && blockPlan.unanchored.hasLanes()
+	directSingleEvent := directEventDeliveryEligible(compiled, combinations)
+	fixedOnlyBlock := !advancedEvents && len(triggers) == 0 && len(blockPlan.unanchored.always) == 0 && !blockPlan.unanchored.hasPrefixRepeatLanes() && !blockPlan.unanchored.hasBoundedRepeatLanes() && !blockPlan.unanchored.hasAlternationLanes() && !blockPlan.unanchored.hasAlternationGraphs() && blockPlan.unanchored.hasLanes()
 	fixedOnlyTriggers, fixedOnlyTriggerCount, fixedOnlyWordScan := fixedOnlyBlockTriggers(blockPlan)
 	fixedOnlyWordScan = fixedOnlyWordScan && singleByteWordScanAvailable
+	simpleRepeatRangeMin, simpleRepeatRangeMax, simpleRepeatWordScan, simpleRepeatOnly := simpleRepeatOnlyBlockPlan(blockPlan, len(triggers) != 0, advancedEvents)
 	unicodePlan := blockPlan.unicode.scanPlan
 	// 单根字特化仅对选择性强的固定前导锚点有效。浮动锚点和单字节前缀的候选工作量较多，
 	// 通用扫描器更适合。
@@ -569,6 +568,7 @@ func Compile(expressions []Expression) (*Scanner, error) {
 		unanchoredGroups:      unanchoredGroups,
 		unanchoredNeeded:      unanchoredNeeded,
 		blockScanPlan:         blockPlan,
+		roleGraph:             roleGraph,
 		eventNeeded:           eventNeeded,
 		emptyRegex:            emptyRegex,
 		hammingLiterals:       hammingLiterals,
@@ -586,6 +586,10 @@ func Compile(expressions []Expression) (*Scanner, error) {
 		fixedOnlyWordScan:     fixedOnlyWordScan,
 		fixedOnlyTriggerCount: fixedOnlyTriggerCount,
 		fixedOnlyTriggers:     fixedOnlyTriggers,
+		simpleRepeatOnly:      simpleRepeatOnly,
+		simpleRepeatWordScan:  simpleRepeatWordScan,
+		simpleRepeatRangeMin:  simpleRepeatRangeMin,
+		simpleRepeatRangeMax:  simpleRepeatRangeMax,
 		requiresUTF8:          requiresUTF8,
 		singleByteOnly:        singleByteOnly,
 		singleByteFast:        singleByteFast,

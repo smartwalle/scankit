@@ -283,6 +283,7 @@ func piiBenchmarkFields(scenario string, index int, valid bool) []string {
 			piiBenchmarkField("ChineseID", index, valid),
 			piiBenchmarkField("BankCard", index, valid),
 			piiBenchmarkField("CreditCard", index, valid),
+			piiBenchmarkField("SensitiveToken", index, valid),
 		}
 	}
 	return []string{piiBenchmarkField(scenario, index, valid)}
@@ -301,6 +302,8 @@ func piiBenchmarkField(scenario string, index int, valid bool) string {
 			return "bank_card=6122021234567890"
 		case "CreditCard":
 			return "credit_card=2111111111111111"
+		case "SensitiveToken":
+			return "sensitive_token=0"
 		}
 	}
 	switch scenario {
@@ -314,6 +317,8 @@ func piiBenchmarkField(scenario string, index int, valid bool) string {
 		return fmt.Sprintf("bank_card=62%014d", index)
 	case "CreditCard":
 		return fmt.Sprintf("credit_card=4%015d", index)
+	case "SensitiveToken":
+		return "sensitive_token=zredaction"
 	default:
 		panic("unknown PII benchmark scenario: " + scenario)
 	}

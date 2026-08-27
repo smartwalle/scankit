@@ -38,6 +38,37 @@ func extractByteWordBoundedRegexRepeat(root *regexNode) (byteRegexRepeat, bool) 
 	return repeat, true
 }
 
+// extractByteRegexPrefixRepeat 识别“一个前导 class，后接同一运行内无界 class-repeat”的
+// 非空结构。前导 class 必须是后缀 class 的子集，因此同一连续后缀段只需保留最早前导位置，
+// 即可满足同一结束位置保留最左起点的事件契约。
+func extractByteRegexPrefixRepeat(root *regexNode) (byteRegexPrefixRepeat, bool) {
+	if root == nil || root.kind != regexConcat || len(root.children) != 2 {
+		return byteRegexPrefixRepeat{}, false
+	}
+	prefix, ok := extractSingleByteClass(root.children[0])
+	if !ok {
+		return byteRegexPrefixRepeat{}, false
+	}
+	repeat := root.children[1]
+	if repeat.kind != regexRepeat || len(repeat.children) != 1 || repeat.max != unboundedRepeat {
+		return byteRegexPrefixRepeat{}, false
+	}
+	tail, ok := extractSingleByteClass(repeat.children[0])
+	if !ok || !byteClassSubset(prefix, tail) {
+		return byteRegexPrefixRepeat{}, false
+	}
+	return byteRegexPrefixRepeat{prefix: prefix, tail: tail, minimum: repeat.min}, true
+}
+
+func byteClassSubset(candidate, container byteClass) bool {
+	for index := range candidate {
+		if candidate[index]&^container[index] != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // advance 返回 offset 后结束的匹配在公开事件契约下唯一可见的起点。投递层只保留每个
 // 表达式/终点对的最小有效起点，因此在此产生全部重叠起点只会制造立即丢弃的工作。
 func (run *byteRegexRepeatRun) advance(program byteRegexRepeat, value byte, offset int) (int, bool) {

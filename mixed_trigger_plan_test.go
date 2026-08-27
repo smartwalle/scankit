@@ -76,6 +76,32 @@ func TestMixedTriggerPlanRejectsByteStepLanes(t *testing.T) {
 	}
 }
 
+func TestMixedTriggerPlanFallsBackForSensitiveTokenRule(t *testing.T) {
+	scanner, err := Compile([]Expression{
+		{Id: 1, Pattern: `(?:\b|^)(?:\+86|86)?1[3-9]\d{9}(?:\b|$)`},
+		{Id: 2, Pattern: "[A-Za-z0-9.!#$%&'*+/?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\\b"},
+		{Id: 3, Pattern: `[1-9][0-9]{5}(18|19|20)[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]`},
+		{Id: 4, Pattern: `62[0-9]{14,17}`},
+		{Id: 5, Pattern: `4[0-9]{15}|5[1-5][0-9]{14}|3[47][0-9]{13}`},
+		{Id: 6, Pattern: `[z][a-z]{9,}`},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scanner.blockScanPlan.unanchored.always) != 0 {
+		t.Fatalf("always lane count = %d, want 0", len(scanner.blockScanPlan.unanchored.always))
+	}
+	if !scanner.blockScanPlan.unanchored.hasPrefixRepeatLanes() {
+		t.Fatal("fixture did not select a prefix-repeat lane")
+	}
+	if singleByteWordScanAvailable && !scanner.blockScanPlan.mixed.wordScan {
+		t.Fatal("mixed word scan did not select a prefix-repeat fixture")
+	}
+	if got := string(scanner.blockScanPlan.mixed.values[:scanner.blockScanPlan.mixed.count]); got != "123456@z" {
+		t.Fatalf("mixed trigger bytes = %q, want %q", got, "123456@z")
+	}
+}
+
 func TestMixedTriggerPlanRejectsMoreThanEightBytes(t *testing.T) {
 	expressions := []Expression{{Id: 1, Pattern: `0[0-9]{5}`}}
 	for index, value := range []string{"1", "2", "3", "4", "5", "6", "7", "8"} {

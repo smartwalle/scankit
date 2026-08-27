@@ -15,6 +15,7 @@ type fixedByteRegex struct {
 	sequences            []fixedByteRegexSequence
 	sequenceTrigger      [byteClassCardinality][]uint16
 	sharedSuffix         [byteClassCardinality]uint8
+	mayDuplicateMatches  bool
 	leadingWordBoundary  fixedByteRegexBoundary
 	trailingWordBoundary fixedByteRegexBoundary
 }
@@ -135,7 +136,37 @@ func extractFixedByteRegex(root *regexNode) (*fixedByteRegex, bool) {
 			program.sharedSuffix[value] = uint8(shared)
 		}
 	}
+	// 同一触发位置可能对应多个展开分支。只有两个等长分支的每个对应位置都存在
+	// 交集时，才可能在一次候选中生成相同的范围；其余情况无需在扫描期逐个回看
+	// 已产生的结果。这个判断只依赖已编译的字符类，不改变分支或重叠匹配语义。
+	program.mayDuplicateMatches = fixedByteRegexMayDuplicateMatches(program.sequences)
 	return program, true
+}
+
+func fixedByteRegexMayDuplicateMatches(sequences []fixedByteRegexSequence) bool {
+	for left := 0; left < len(sequences); left++ {
+		for right := left + 1; right < len(sequences); right++ {
+			first, second := sequences[left], sequences[right]
+			if len(first.classes) != len(second.classes) {
+				continue
+			}
+			overlaps := true
+			for index := range first.classes {
+				if !byteClassesOverlap(first.classes[index], second.classes[index]) {
+					overlaps = false
+					break
+				}
+			}
+			if overlaps {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func byteClassesOverlap(left, right byteClass) bool {
+	return left[0]&right[0] != 0 || left[1]&right[1] != 0 || left[2]&right[2] != 0 || left[3]&right[3] != 0
 }
 
 // commonFixedByteRegexTrigger 查找每个分支均包含的同一位置类。它只给出候选；调用方
@@ -614,19 +645,19 @@ func (run *fixedByteRegexRun) advance(program *fixedByteRegex, data []byte, offs
 	sharedSuffix := int(program.sharedSuffix[value])
 	if sharedSuffix != 0 {
 		if offset+sharedSuffix >= len(data) {
-			run.matches = matches
 			return matches
 		}
-		first := program.sequences[sequenceIndexes[0]]
+		first := &program.sequences[sequenceIndexes[0]]
 		for index := 0; index < sharedSuffix; index++ {
 			if !first.classes[first.triggerOffset+index+1].contains(data[offset+index+1]) {
-				run.matches = matches
 				return matches
 			}
 		}
 	}
 	for _, sequenceIndex := range sequenceIndexes {
-		sequence := program.sequences[sequenceIndex]
+		// sequence 含有一个 slice header。直接使用已编译数组元素的地址，避免在每个
+		// 触发候选上复制它；Scanner 在编译后不可变，因此指针在并发扫描中稳定。
+		sequence := &program.sequences[sequenceIndex]
 		start := offset - sequence.triggerOffset
 		end := start + len(sequence.classes)
 		if start < 0 || end > len(data) {
@@ -656,6 +687,10 @@ func (run *fixedByteRegexRun) advance(program *fixedByteRegex, data []byte, offs
 			!fixedByteRegexBoundaryMatches(program.trailingWordBoundary, data, end) {
 			continue
 		}
+		if !program.mayDuplicateMatches {
+			matches = append(matches, fixedByteRegexMatch{start: start, end: end})
+			continue
+		}
 		duplicate := false
 		for _, prior := range matches {
 			if prior.start == start && prior.end == end {
@@ -667,7 +702,11 @@ func (run *fixedByteRegexRun) advance(program *fixedByteRegex, data []byte, offs
 			matches = append(matches, fixedByteRegexMatch{start: start, end: end})
 		}
 	}
-	run.matches = matches
+	// 失败候选返回的 matches 始终是 run.matches[:0]；下一次 advance 也会从零长度
+	// 切片开始，无需把这个已知长度重复写回 context。只有产生结果时才更新复用容量。
+	if len(matches) != 0 {
+		run.matches = matches
+	}
 	return matches
 }
 

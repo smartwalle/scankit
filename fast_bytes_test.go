@@ -19,11 +19,14 @@ func TestFastByteMasksMatchScalarReference(t *testing.T) {
 		t.Fatalf("rootByteSingleTriggerMask() = %#x omits scalar candidates %#x", got, want)
 	}
 	values2 := [2]byte{'@', ':'}
-	if got, want := byteWordRangeAndValuesMask(data, 0, '1', '6', values2, 1), scalarRangeAndValuesMask(data, 0, '1', '6', values2, 1); got != want {
-		t.Fatalf("byteWordRangeAndValuesMask() = %#x, want %#x", got, want)
+	if got, want := byteWordRangeAndValuesMask(data, 0, '1', '6', values2, 1), scalarRangeAndValuesMask(data, 0, '1', '6', values2, 1); got&want != want {
+		t.Fatalf("byteWordRangeAndValuesMask() = %#x omits scalar candidates %#x", got, want)
 	}
-	if got, want := byteWordRangeAndSingleMask(data, 0, '1', '6', '@'), scalarRangeAndValuesMask(data, 0, '1', '6', [2]byte{'@'}, 1); got != want {
-		t.Fatalf("byteWordRangeAndSingleMask() = %#x, want %#x", got, want)
+	if got, want := byteWordRangeAndSingleMask(data, 0, '1', '6', '@'), scalarRangeAndValuesMask(data, 0, '1', '6', [2]byte{'@'}, 1); got&want != want {
+		t.Fatalf("byteWordRangeAndSingleMask() = %#x omits scalar candidates %#x", got, want)
+	}
+	if got, want := byteWordRangeDataMask(data, 0, 'a', 'z'), scalarRangeAndValuesMask(data, 0, 'a', 'z', [2]byte{}, 0); got != want {
+		t.Fatalf("byteWordRangeDataMask() = %#x, want %#x", got, want)
 	}
 }
 
@@ -55,11 +58,14 @@ func FuzzFastByteMasksMatchScalarReference(f *testing.F) {
 			}
 			var remainder [2]byte
 			remainder[0], remainder[1] = values[0], values[1]
-			if got, want := byteWordRangeAndValuesMask(data, offset, minimum, maximum, remainder, count%3), scalarRangeAndValuesMask(data, offset, minimum, maximum, remainder, count%3); got != want {
-				t.Fatalf("range mask at %d = %#x, want %#x", offset, got, want)
+			if got, want := byteWordRangeAndValuesMask(data, offset, minimum, maximum, remainder, count%3), scalarRangeAndValuesMask(data, offset, minimum, maximum, remainder, count%3); got&want != want {
+				t.Fatalf("range mask at %d = %#x omits scalar candidates %#x", offset, got, want)
 			}
-			if got, want := byteWordRangeAndSingleMask(data, offset, minimum, maximum, remainder[0]), scalarRangeAndValuesMask(data, offset, minimum, maximum, remainder, 1); got != want {
-				t.Fatalf("single range mask at %d = %#x, want %#x", offset, got, want)
+			if got, want := byteWordRangeAndSingleMask(data, offset, minimum, maximum, remainder[0]), scalarRangeAndValuesMask(data, offset, minimum, maximum, remainder, 1); got&want != want {
+				t.Fatalf("single range mask at %d = %#x omits scalar candidates %#x", offset, got, want)
+			}
+			if got, want := byteWordRangeDataMask(data, offset, minimum, maximum), scalarRangeAndValuesMask(data, offset, minimum, maximum, [2]byte{}, 0); got != want {
+				t.Fatalf("data range mask at %d = %#x, want %#x", offset, got, want)
 			}
 		}
 	})

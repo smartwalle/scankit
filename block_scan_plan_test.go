@@ -239,6 +239,7 @@ func TestDirectSingleEventRequiresUnfilteredExpressions(t *testing.T) {
 		{name: "single match", expressions: []Expression{{Id: 1, Pattern: `a`, Flags: CompileSingleMatch}, {Id: 2, Pattern: `b`}}, want: false},
 		{name: "quiet", expressions: []Expression{{Id: 1, Pattern: `a`, Flags: CompileQuiet}, {Id: 2, Pattern: `b`}}, want: false},
 		{name: "constraint", expressions: []Expression{{Id: 1, Pattern: `a`, Ext: &ExpressionExt{Flags: ExtMinOffset, MinOffset: 1}}, {Id: 2, Pattern: `b`}}, want: false},
+		{name: "leftmost", expressions: []Expression{{Id: 1, Pattern: `a`, Flags: CompileLeftmostStart}, {Id: 2, Pattern: `b`}}, want: false},
 		{name: "combination", expressions: []Expression{{Id: 1, Pattern: `a`}, {Id: 2, Pattern: `b`}, {Id: 3, Pattern: `1|2`, Flags: CompileCombination}}, want: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {

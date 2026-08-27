@@ -85,6 +85,46 @@ func TestCompileSelectsOnlySafeInternalLiteralAnchors(t *testing.T) {
 	}
 }
 
+func TestDotStarLiteralUsesLineScopedInternalAnchor(t *testing.T) {
+	optimized, err := Compile([]Expression{{Id: 1, Pattern: `.*error`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(optimized.unanchoredGroups) != 0 || len(optimized.blockScanPlan.triggers) != 1 || optimized.blockScanPlan.triggers[0].kind != blockTriggerInternalAnchored {
+		t.Fatalf(".*error did not select internal anchor: groups=%d triggers=%#v", len(optimized.unanchoredGroups), optimized.blockScanPlan.triggers)
+	}
+	// 加一层精确重复会保留相同语言，但不会命中 .*<literal> 的受限优化，用作语义基线。
+	reference, err := Compile([]Expression{{Id: 1, Pattern: `(?:.*){1}error`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, data := range [][]byte{
+		[]byte("error"),
+		[]byte("prefix error suffix error\nnext error\nno-match"),
+		[]byte("\nerror\nerror\n"),
+	} {
+		got, err := optimized.Scan(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := reference.Scan(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !equalMatches(got, want) {
+			t.Fatalf("Scan(%q) = %#v, want %#v", data, got, want)
+		}
+	}
+
+	dotAll, err := Compile([]Expression{{Id: 1, Pattern: `.*error`, Flags: CompileDotAll}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dotAll.unanchoredGroups) != 1 || len(dotAll.blockScanPlan.triggers) != 0 {
+		t.Fatalf("DotAll .*error must remain unanchored: groups=%d triggers=%d", len(dotAll.unanchoredGroups), len(dotAll.blockScanPlan.triggers))
+	}
+}
+
 func TestLeadingWordBoundaryFallsBackFromFloatingAnchor(t *testing.T) {
 	for _, pattern := range []string{
 		`\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b`,

@@ -486,6 +486,47 @@ func BenchmarkProfileMixedPII(b *testing.B) {
 	}
 }
 
+// BenchmarkProfileMixedPIIPrefixDispatch 将六规则日志集的范围预过滤与标量混合调度
+// 分开测量。它使用无命中的固定合成记录，专门定位“数字候选密集但验证拒绝”的路径。
+func BenchmarkProfileMixedPIIPrefixDispatch(b *testing.B) {
+	expressions := []Expression{
+		{Id: 1, Pattern: `(?:\b|^)(?:\+86|86)?1[3-9]\d{9}(?:\b|$)`},
+		{Id: 2, Pattern: `[A-Za-z0-9.!#$%&'*+/?^_` + "`" + `{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\b`},
+		{Id: 3, Pattern: `[1-9][0-9]{5}(18|19|20)[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]`},
+		{Id: 4, Pattern: `62[0-9]{14,17}`},
+		{Id: 5, Pattern: `4[0-9]{15}|5[1-5][0-9]{14}|3[47][0-9]{13}`},
+		{Id: 6, Pattern: `[z][a-z]{9,}`},
+	}
+	scanner, err := Compile(expressions)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if !scanner.blockScanPlan.mixed.wordScan || !scanner.blockScanPlan.mixed.rangeFast || !scanner.blockScanPlan.mixed.prefixOnly {
+		b.Fatalf("fixture did not select range-prefix dispatch: %#v", scanner.blockScanPlan.mixed)
+	}
+	data := bytes.Repeat([]byte(`ts=2026-08-20T09:30:00+08:00 mobile=12112312311 email=user@example..invalid identity_no=11010520000101002Z bank_card=6122021234567890 credit_card=2111111111111111 sensitive_token=0 status=processed`+"\n"), 128)
+	want, err := scanner.Scan(data)
+	if err != nil {
+		b.Fatal(err)
+	}
+	scalar := *scanner
+	scalar.blockScanPlan.mixed.wordScan = false
+	rangeOnly := *scanner
+	rangeOnly.blockScanPlan.mixed.prefixOnly = false
+	for _, test := range []struct {
+		name    string
+		scanner *Scanner
+	}{
+		{name: "RangePrefix", scanner: scanner},
+		{name: "RangeOnly", scanner: &rangeOnly},
+		{name: "Scalar", scanner: &scalar},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			benchmarkProfileScanInto(b, test.scanner, data, want)
+		})
+	}
+}
+
 func benchmarkProfileScanInto(b *testing.B, scanner *Scanner, data []byte, want []Match) {
 	b.Helper()
 	matches := make([]Match, 0, len(want))

@@ -60,3 +60,14 @@ func byteWordRangeAndSingleMask(data []byte, offset int, minimum, maximum, value
 	}
 	return mask
 }
+
+func byteWordRangeDataMask(data []byte, offset int, minimum, maximum byte) uint64 {
+	var mask uint64
+	for lane := 0; lane < 8; lane++ {
+		value := data[offset+lane]
+		if value >= minimum && value <= maximum {
+			mask |= uint64(0x80) << (lane * 8)
+		}
+	}
+	return mask
+}
