@@ -30,15 +30,19 @@ type executionPlanDiagnostics struct {
 type executionProgramDiagnostic struct {
 	expressionIndex uint32
 	candidate       string
-	executor        string
-	fallback        byteRegexCandidateFallback
-	anchorLength    uint16
-	anchorSpan      int
-	anchorScore     uint32
-	requiredChecks  uint8
-	verifierStates  uint16
-	consumerCount   uint16
-	directEligible  bool
+	// structuralExecutor 表示编译期可识别的最优结构；planOwner 表示该结构实际下沉到
+	// blockScanPlan 的执行通道。两者可以不同，例如一个规则既可识别有界重复又已被
+	// fixed executor 接管时，性能归因必须以 planOwner 为准。
+	structuralExecutor string
+	planOwner          string
+	fallback           byteRegexCandidateFallback
+	anchorLength       uint16
+	anchorSpan         int
+	anchorScore        uint32
+	requiredChecks     uint8
+	verifierStates     uint16
+	consumerCount      uint16
+	directEligible     bool
 }
 
 func inspectExecutionPlan(scanner *Scanner, data []byte) executionPlanDiagnostics {
@@ -105,20 +109,21 @@ func inspectExecutionProgram(scanner *Scanner, programIndex uint32, program comp
 	}
 	switch {
 	case program.boundedRepeat != nil:
-		diagnostic.executor = "bounded-repeat"
+		diagnostic.structuralExecutor = "bounded-repeat"
 	case program.fixed != nil:
-		diagnostic.executor = "fixed"
+		diagnostic.structuralExecutor = "fixed"
 	case program.fixedAnchor != nil && program.alternation != nil:
-		diagnostic.executor = "equal-alternation"
+		diagnostic.structuralExecutor = "equal-alternation"
 	case program.fixedAnchor != nil:
-		diagnostic.executor = "fixed-anchor"
+		diagnostic.structuralExecutor = "fixed-anchor"
 	case program.hasPrefixRepeat:
-		diagnostic.executor = "prefix-repeat"
+		diagnostic.structuralExecutor = "prefix-repeat"
 	case program.hasSimpleRepeat:
-		diagnostic.executor = "simple-repeat"
+		diagnostic.structuralExecutor = "simple-repeat"
 	default:
-		diagnostic.executor = "nfa-dfa-fallback"
+		diagnostic.structuralExecutor = "nfa-dfa-fallback"
 	}
+	diagnostic.planOwner = executionPlanOwner(scanner, programIndex)
 	for _, edge := range scanner.roleGraph.edges {
 		if edge.kind != executionRoleReports || edge.from >= uint32(len(scanner.roleGraph.roles)) {
 			continue
@@ -129,6 +134,71 @@ func inspectExecutionProgram(scanner *Scanner, programIndex uint32, program comp
 		}
 	}
 	return diagnostic
+}
+
+// executionPlanOwner 仅在测试中反查实际下沉到 blockScanPlan 的 lane。它不参与编译或
+// 扫描，避免为了诊断而向热路径增加 program 标记或分支。
+func executionPlanOwner(scanner *Scanner, contextIndex uint32) string {
+	plan := scanner.blockScanPlan.unanchored
+	for _, lanes := range plan.boundedRepeat {
+		for _, lane := range lanes {
+			if lane.contextIndex == contextIndex {
+				return "bounded-repeat"
+			}
+		}
+	}
+	for _, lanes := range plan.fixed {
+		for _, lane := range lanes {
+			if lane.contextIndex == contextIndex {
+				return "fixed"
+			}
+		}
+	}
+	for _, lanes := range plan.fixedAnchor {
+		for _, lane := range lanes {
+			if lane.contextIndex == contextIndex {
+				if lane.alternation != nil {
+					return "equal-alternation"
+				}
+				return "fixed-anchor"
+			}
+		}
+	}
+	for _, lanes := range plan.prefixRepeat {
+		for _, lane := range lanes {
+			if lane.contextIndex == contextIndex {
+				return "prefix-repeat"
+			}
+		}
+	}
+	for _, lanes := range plan.alternation {
+		for _, lane := range lanes {
+			if lane.contextIndex == contextIndex {
+				return "equal-alternation"
+			}
+		}
+	}
+	for _, lane := range plan.always {
+		if lane.contextIndex == contextIndex {
+			if lane.hasSimpleRepeat {
+				return "simple-repeat"
+			}
+			return "nfa-dfa-fallback"
+		}
+	}
+	for _, trigger := range scanner.blockScanPlan.triggers {
+		if !isBlockTriggerAnchored(trigger.kind) && trigger.kind != blockTriggerInternalAnchored {
+			continue
+		}
+		if trigger.anchored.contextIndex != contextIndex {
+			continue
+		}
+		if trigger.kind == blockTriggerInternalAnchored {
+			return "internal-literal"
+		}
+		return "anchored-verifier"
+	}
+	return "inactive"
 }
 
 func TestExecutionPlanDiagnosticsExplainMixedRules(t *testing.T) {
@@ -159,7 +229,7 @@ func TestExecutionPlanDiagnosticsExplainMixedRules(t *testing.T) {
 		t.Fatalf("program diagnostics = %d, want %d", len(diagnostics.programs), len(scanner.regexPrograms))
 	}
 	for _, program := range diagnostics.programs {
-		if program.executor == "" || program.candidate == "" || program.verifierStates == 0 || program.consumerCount == 0 {
+		if program.structuralExecutor == "" || program.planOwner == "" || program.candidate == "" || program.verifierStates == 0 || program.consumerCount == 0 {
 			t.Fatalf("incomplete program diagnostic: %#v", program)
 		}
 	}
@@ -201,15 +271,15 @@ func TestExecutionPlanDiagnosticsDescribeCandidateAndExecutor(t *testing.T) {
 		candidate string
 		executor  string
 	}{
-		0: {candidate: "internal-literal", executor: "nfa-dfa-fallback"},
+		0: {candidate: "internal-literal", executor: "internal-literal"},
 		1: {candidate: "every-byte", executor: "bounded-repeat"},
-		2: {candidate: "bounded-literal", executor: "equal-alternation"},
+		2: {candidate: "bounded-literal", executor: "anchored-verifier"},
 		3: {candidate: "every-byte", executor: "simple-repeat"},
 	}
 	for _, program := range diagnostics.programs {
 		expected := want[program.expressionIndex]
-		if program.candidate != expected.candidate || program.executor != expected.executor {
-			t.Fatalf("expression %d diagnostic = %#v, want candidate=%q executor=%q", program.expressionIndex, program, expected.candidate, expected.executor)
+		if program.candidate != expected.candidate || program.planOwner != expected.executor {
+			t.Fatalf("expression %d diagnostic = %#v, want candidate=%q owner=%q", program.expressionIndex, program, expected.candidate, expected.executor)
 		}
 	}
 }
@@ -229,14 +299,14 @@ func TestExecutionPlanDiagnosticsLogMixedDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, program := range inspectExecutionPlan(scanner, nil).programs {
-		t.Logf("expression=%d candidate=%s executor=%s checks=%d states=%d", program.expressionIndex+1, program.candidate, program.executor, program.requiredChecks, program.verifierStates)
+		t.Logf("expression=%d candidate=%s structural=%s owner=%s checks=%d states=%d", program.expressionIndex+1, program.candidate, program.structuralExecutor, program.planOwner, program.requiredChecks, program.verifierStates)
 	}
 	for index, program := range scanner.regexPrograms {
 		if program.fixed != nil {
 			t.Logf("expression=%d fixed sequences=%d duplicate=%t", index+1, len(program.fixed.sequences), program.fixed.mayDuplicateMatches)
-			for value, shared := range program.fixed.sharedSuffix {
-				if shared != 0 {
-					t.Logf("expression=%d fixed shared suffix byte=%q length=%d", index+1, byte(value), shared)
+			for value, triggerRange := range program.fixed.sequenceTrigger {
+				if triggerRange.sharedSuffix != 0 {
+					t.Logf("expression=%d fixed shared suffix byte=%q length=%d", index+1, byte(value), triggerRange.sharedSuffix)
 				}
 			}
 		}

@@ -252,11 +252,16 @@ func planHasNaturallyDirectEvents(plan blockScanPlan, expressions []compiledExpr
 	return true
 }
 
-func directEventDeliveryEligible(expressions []compiledExpression, combinations []combinationProgram) bool {
+func directEventDeliveryEligible(expressions []compiledExpression, eventNeeded []bool, combinations []combinationProgram) bool {
 	if len(combinations) != 0 {
 		return false
 	}
-	for _, expression := range expressions {
+	for index, expression := range expressions {
+		// 未参与组合的 QUIET 表达式在编译阶段已不进入任何事件生产通道，不能阻止
+		// 其他可观察表达式使用直达投递。
+		if !eventNeeded[index] {
+			continue
+		}
 		if expressionRequiresDeferredDelivery(expression) {
 			return false
 		}

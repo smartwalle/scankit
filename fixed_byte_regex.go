@@ -1,23 +1,45 @@
 package scankit
 
-import "math/bits"
+import (
+	"math/bits"
+	"slices"
+)
 
 const (
 	maxFixedByteRegexSequences = 64
 	maxFixedByteRegexLength    = 128
 	maxFixedByteRegexChecks    = 3
 	maxFixedByteRegexCheckSize = 16
+	maxFixedLiteralAnchors     = 8
+	maxFixedLiteralAnchorWidth = 4
 )
 
 // fixedByteRegex 是纯字节定宽正则的有界展开。它从每个分支中选择性最强的字节直接分派，
 // 避免为每个可能起点维护活跃 DFA 线程。
 type fixedByteRegex struct {
 	sequences            []fixedByteRegexSequence
-	sequenceTrigger      [byteClassCardinality][]uint16
-	sharedSuffix         [byteClassCardinality]uint8
+	sequenceIndexes      []uint16
+	sequenceTrigger      [byteClassCardinality]fixedByteRegexTriggerRange
 	mayDuplicateMatches  bool
 	leadingWordBoundary  fixedByteRegexBoundary
 	trailingWordBoundary fixedByteRegexBoundary
+}
+
+// fixedByteRegexTriggerRange 指向 sequenceIndexes 中同一个触发字节的连续序列。编译阶段
+// 将原本分散的 slice 收紧为一个连续数组，扫描期只读取两个小整数并顺序访问分支索引。
+// 这不会合并不同 triggerOffset，因此每个合法候选起点仍会独立验证。
+type fixedByteRegexTriggerRange struct {
+	start        uint16
+	end          uint16
+	sharedSuffix uint8
+}
+
+func (r fixedByteRegexTriggerRange) empty() bool {
+	return r.start == r.end
+}
+
+func (r fixedByteRegexTriggerRange) length() int {
+	return int(r.end - r.start)
 }
 
 // fixedByteRegexBoundary 表示定长字节执行器可在首尾独立验证的单词边界断言。
@@ -34,7 +56,15 @@ const (
 
 type fixedByteRegexSequence struct {
 	classes       []byteClass
+	asciiRanges   []fixedByteRegexASCIIRange
 	triggerOffset int
+}
+
+// fixedByteRegexASCIIRange 是纯 ASCII 连续字符类的紧凑表示。它只用于整个序列的每个
+// 位置都可精确表达为 ASCII 区间时；其他序列继续使用 byteClass 位图，不会改变语义。
+type fixedByteRegexASCIIRange struct {
+	minimum byte
+	maximum byte
 }
 
 // fixedByteRegexAnchor 是定宽表达式每个分支在固定偏移处的必要字节类条件。完整语言仍由
@@ -98,19 +128,46 @@ func extractFixedByteRegex(root *regexNode) (*fixedByteRegex, bool) {
 	}
 	for index, classes := range sequences {
 		triggerOffset := triggerOffsets[index]
-		program.sequences[index] = fixedByteRegexSequence{classes: classes, triggerOffset: triggerOffset}
-		trigger := classes[triggerOffset]
-		for value := range program.sequenceTrigger {
+		program.sequences[index] = fixedByteRegexSequence{
+			classes:       classes,
+			asciiRanges:   fixedByteRegexASCIIRanges(classes),
+			triggerOffset: triggerOffset,
+		}
+	}
+	var triggerCounts [byteClassCardinality]uint16
+	for _, sequence := range program.sequences {
+		trigger := sequence.classes[sequence.triggerOffset]
+		for value := range triggerCounts {
 			if trigger.contains(byte(value)) {
-				program.sequenceTrigger[value] = append(program.sequenceTrigger[value], uint16(index))
+				triggerCounts[value]++
 			}
 		}
 	}
-	for value, sequenceIndexes := range program.sequenceTrigger {
-		if len(sequenceIndexes) < 2 {
+	total := 0
+	for value, count := range triggerCounts {
+		program.sequenceTrigger[value].start = uint16(total)
+		total += int(count)
+		program.sequenceTrigger[value].end = uint16(total)
+	}
+	// 一个程序最多展开 64 个序列，每个序列最多覆盖 256 个字节；总索引数小于 uint16。
+	program.sequenceIndexes = make([]uint16, total)
+	cursors := program.sequenceTrigger
+	for index, sequence := range program.sequences {
+		trigger := sequence.classes[sequence.triggerOffset]
+		for value := range cursors {
+			if !trigger.contains(byte(value)) {
+				continue
+			}
+			cursor := cursors[value].start
+			program.sequenceIndexes[cursor] = uint16(index)
+			cursors[value].start++
+		}
+	}
+	for value, triggerRange := range program.sequenceTrigger {
+		if triggerRange.length() < 2 {
 			continue
 		}
-		first := program.sequences[sequenceIndexes[0]]
+		first := program.sequences[program.sequenceIndexes[triggerRange.start]]
 		shared := 0
 		for {
 			position := first.triggerOffset + shared + 1
@@ -119,7 +176,8 @@ func extractFixedByteRegex(root *regexNode) (*fixedByteRegex, bool) {
 			}
 			class := first.classes[position]
 			matchesAll := true
-			for _, sequenceIndex := range sequenceIndexes[1:] {
+			for index := triggerRange.start + 1; index < triggerRange.end; index++ {
+				sequenceIndex := program.sequenceIndexes[index]
 				sequence := program.sequences[sequenceIndex]
 				otherPosition := sequence.triggerOffset + shared + 1
 				if otherPosition >= len(sequence.classes) || sequence.classes[otherPosition] != class {
@@ -133,7 +191,7 @@ func extractFixedByteRegex(root *regexNode) (*fixedByteRegex, bool) {
 			shared++
 		}
 		if shared != 0 {
-			program.sharedSuffix[value] = uint8(shared)
+			program.sequenceTrigger[value].sharedSuffix = uint8(shared)
 		}
 	}
 	// 同一触发位置可能对应多个展开分支。只有两个等长分支的每个对应位置都存在
@@ -141,6 +199,20 @@ func extractFixedByteRegex(root *regexNode) (*fixedByteRegex, bool) {
 	// 已产生的结果。这个判断只依赖已编译的字符类，不改变分支或重叠匹配语义。
 	program.mayDuplicateMatches = fixedByteRegexMayDuplicateMatches(program.sequences)
 	return program, true
+}
+
+func fixedByteRegexASCIIRanges(classes []byteClass) []fixedByteRegexASCIIRange {
+	for _, class := range classes {
+		if _, _, ok := byteClassASCIIRange(class); !ok {
+			return nil
+		}
+	}
+	ranges := make([]fixedByteRegexASCIIRange, len(classes))
+	for index, class := range classes {
+		minimum, maximum, _ := byteClassASCIIRange(class)
+		ranges[index] = fixedByteRegexASCIIRange{minimum: minimum, maximum: maximum}
+	}
+	return ranges
 }
 
 func fixedByteRegexMayDuplicateMatches(sequences []fixedByteRegexSequence) bool {
@@ -456,6 +528,81 @@ func fixedByteRegexClassAnchor(sequences []fixedByteRegexSequence) (fixedByteReg
 	return newFixedByteRegexAnchor(classes, offset), true
 }
 
+// fixedByteRegexLiteralAnchors 查找定宽展开分支共同覆盖的、同一固定偏移的短字面量集合。
+// 每个序列都必须在该窗口内由单字节类组成，且不同字面量数量受严格上限约束；因此任一
+// 完整匹配必然经过其中一个 AC 锚点。它只提供候选，不参与最终语言判断。
+func fixedByteRegexLiteralAnchors(sequences []fixedByteRegexSequence) (anchors []string, offset int, ok bool) {
+	if len(sequences) < 2 {
+		return nil, 0, false
+	}
+	width := len(sequences[0].classes)
+	if width < 2 {
+		return nil, 0, false
+	}
+	for _, sequence := range sequences[1:] {
+		if len(sequence.classes) != width {
+			return nil, 0, false
+		}
+	}
+	maximum := maxFixedLiteralAnchorWidth
+	if maximum > width {
+		maximum = width
+	}
+	for length := maximum; length >= 2; length-- {
+		for start := 0; start+length <= width; start++ {
+			values := make(map[string]struct{}, len(sequences))
+			valid := true
+			for _, sequence := range sequences {
+				bytes := make([]byte, length)
+				for index := range bytes {
+					value, single := byteClassSingleValue(sequence.classes[start+index])
+					if !single {
+						valid = false
+						break
+					}
+					bytes[index] = value
+				}
+				if !valid {
+					break
+				}
+				values[string(bytes)] = struct{}{}
+				if len(values) > maxFixedLiteralAnchors {
+					valid = false
+					break
+				}
+			}
+			if !valid || len(values) < 2 {
+				continue
+			}
+			anchors = make([]string, 0, len(values))
+			for value := range values {
+				anchors = append(anchors, value)
+			}
+			slices.Sort(anchors)
+			return anchors, start, true
+		}
+	}
+	return nil, 0, false
+}
+
+func byteClassSingleValue(class byteClass) (byte, bool) {
+	for word, values := range class {
+		if values == 0 {
+			continue
+		}
+		if values&(values-1) != 0 {
+			return 0, false
+		}
+		for following := word + 1; following < len(class); following++ {
+			if class[following] != 0 {
+				return 0, false
+			}
+		}
+		return byte(word*64 + bits.TrailingZeros64(values)), true
+	}
+	return 0, false
+}
+
 // extractFixedByteRegexAnchor 合并固定宽度分支在每个字节偏移的必要字符类。它不展开
 // 分支组合：合并后的类仅作候选预过滤，完整 NFA 验证仍决定实际匹配。
 func extractFixedByteRegexAnchor(root *regexNode) (fixedByteRegexAnchor, bool) {
@@ -639,22 +786,44 @@ func fixedByteRegexPositionClasses(node *regexNode) ([]byteClass, bool) {
 // advance 仅验证选定锚点接受 value 的分支。选择性锚点可位于序列结束前，因此调用方应立即
 // 投递结果，或经由常规待处理事件队列投递。
 func (run *fixedByteRegexRun) advance(program *fixedByteRegex, data []byte, offset int) []fixedByteRegexMatch {
+	triggerRange := program.sequenceTrigger[data[offset]]
+	if triggerRange.empty() {
+		return run.matches[:0]
+	}
+	return run.advanceKnownTrigger(program, data, offset, triggerRange)
+}
+
+// advanceKnownTrigger 由已按触发字节分桶的 Block 扫描循环调用。调用方已证明 triggerRange
+// 非空，因此这里不再重复读取输入字节或查询 256 项触发表；直接入口 advance 仍保留给测试
+// 和未知候选调用方。
+func (run *fixedByteRegexRun) advanceKnownTrigger(program *fixedByteRegex, data []byte, offset int, triggerRange fixedByteRegexTriggerRange) []fixedByteRegexMatch {
 	matches := run.matches[:0]
-	value := data[offset]
-	sequenceIndexes := program.sequenceTrigger[value]
-	sharedSuffix := int(program.sharedSuffix[value])
+	sharedSuffix := int(triggerRange.sharedSuffix)
 	if sharedSuffix != 0 {
 		if offset+sharedSuffix >= len(data) {
 			return matches
 		}
-		first := &program.sequences[sequenceIndexes[0]]
-		for index := 0; index < sharedSuffix; index++ {
-			if !first.classes[first.triggerOffset+index+1].contains(data[offset+index+1]) {
-				return matches
+		first := &program.sequences[program.sequenceIndexes[triggerRange.start]]
+		if first.asciiRanges != nil {
+			for index := 0; index < sharedSuffix; index++ {
+				position := first.triggerOffset + index + 1
+				value := data[offset+index+1]
+				asciiRange := first.asciiRanges[position]
+				if value < asciiRange.minimum || value > asciiRange.maximum {
+					return matches
+				}
+			}
+		} else {
+			for index := 0; index < sharedSuffix; index++ {
+				position := first.triggerOffset + index + 1
+				if !first.classes[position].contains(data[offset+index+1]) {
+					return matches
+				}
 			}
 		}
 	}
-	for _, sequenceIndex := range sequenceIndexes {
+	for index := triggerRange.start; index < triggerRange.end; index++ {
+		sequenceIndex := program.sequenceIndexes[index]
 		// sequence 含有一个 slice header。直接使用已编译数组元素的地址，避免在每个
 		// 触发候选上复制它；Scanner 在编译后不可变，因此指针在并发扫描中稳定。
 		sequence := &program.sequences[sequenceIndex]
@@ -663,20 +832,41 @@ func (run *fixedByteRegexRun) advance(program *fixedByteRegex, data []byte, offs
 		if start < 0 || end > len(data) {
 			continue
 		}
-		// sequenceTrigger 已证明 triggerOffset 处的选定字符类。避免重新加载它，并直接索引
-		// classes，防止 range 为每个候选字节复制四个字的 byteClass。
+		// sequenceTrigger 已证明 triggerOffset 处的选定字符类。纯 ASCII 连续类使用
+		// 紧凑范围比较；其余表达式继续直接索引 byteClass 位图。
 		matched := true
-		for index := 0; index < sequence.triggerOffset; index++ {
-			if !sequence.classes[index].contains(data[start+index]) {
-				matched = false
-				break
+		if sequence.asciiRanges != nil {
+			for index := 0; index < sequence.triggerOffset; index++ {
+				value := data[start+index]
+				asciiRange := sequence.asciiRanges[index]
+				if value < asciiRange.minimum || value > asciiRange.maximum {
+					matched = false
+					break
+				}
 			}
-		}
-		if matched {
-			for index := sequence.triggerOffset + sharedSuffix + 1; index < len(sequence.classes); index++ {
+			if matched {
+				for index := sequence.triggerOffset + sharedSuffix + 1; index < len(sequence.asciiRanges); index++ {
+					value := data[start+index]
+					asciiRange := sequence.asciiRanges[index]
+					if value < asciiRange.minimum || value > asciiRange.maximum {
+						matched = false
+						break
+					}
+				}
+			}
+		} else {
+			for index := 0; index < sequence.triggerOffset; index++ {
 				if !sequence.classes[index].contains(data[start+index]) {
 					matched = false
 					break
+				}
+			}
+			if matched {
+				for index := sequence.triggerOffset + sharedSuffix + 1; index < len(sequence.classes); index++ {
+					if !sequence.classes[index].contains(data[start+index]) {
+						matched = false
+						break
+					}
 				}
 			}
 		}

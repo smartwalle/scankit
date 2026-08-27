@@ -2,6 +2,7 @@ package scankit
 
 import (
 	"bytes"
+	"slices"
 	"testing"
 )
 
@@ -110,17 +111,26 @@ func TestExtractFixedByteRegexSupportsBoundariesAndBoundedWidth(t *testing.T) {
 		t.Fatalf("boundaries = (%d, %d), want word-or-start and word-or-end", fixed.leadingWordBoundary, fixed.trailingWordBoundary)
 	}
 	widths := map[int]bool{}
-	for _, sequence := range fixed.sequences {
+	for index, sequence := range fixed.sequences {
 		widths[len(sequence.classes)] = true
+		if sequence.asciiRanges == nil || len(sequence.asciiRanges) != len(sequence.classes) {
+			t.Fatalf("sequence %d does not have complete ASCII range metadata", index)
+		}
 	}
 	if len(fixed.sequences) != 3 || !widths[11] || !widths[13] || !widths[14] {
 		t.Fatalf("sequence widths = %#v, want 11, 13 and 14", widths)
 	}
-	if len(fixed.sequenceTrigger['1']) != 3 || len(fixed.sequenceTrigger['+']) != 0 || len(fixed.sequenceTrigger['8']) != 0 {
-		t.Fatalf("shared trigger counts = 1:%d +:%d 8:%d, want 3/0/0", len(fixed.sequenceTrigger['1']), len(fixed.sequenceTrigger['+']), len(fixed.sequenceTrigger['8']))
+	if fixed.sequenceTrigger['1'].length() != 3 || !fixed.sequenceTrigger['+'].empty() || !fixed.sequenceTrigger['8'].empty() {
+		t.Fatalf("shared trigger counts = 1:%d +:%d 8:%d, want 3/0/0", fixed.sequenceTrigger['1'].length(), fixed.sequenceTrigger['+'].length(), fixed.sequenceTrigger['8'].length())
 	}
-	if fixed.sharedSuffix['1'] != 10 {
-		t.Fatalf("shared trigger suffix length = %d, want 10", fixed.sharedSuffix['1'])
+	if fixed.sequenceTrigger['1'].sharedSuffix != 10 {
+		t.Fatalf("shared trigger suffix length = %d, want 10", fixed.sequenceTrigger['1'].sharedSuffix)
+	}
+	triggerRange := fixed.sequenceTrigger['1']
+	for index := triggerRange.start; index < triggerRange.end; index++ {
+		if got, want := fixed.sequenceIndexes[index], uint16(index-triggerRange.start); got != want {
+			t.Fatalf("trigger sequence index %d = %d, want %d", index, got, want)
+		}
 	}
 	scanner, err := Compile([]Expression{{Id: 1, Pattern: `(?:\b|^)(?:\+86|86)?1[3-9][0-9]{9}(?:\b|$)`}})
 	if err != nil {
@@ -128,6 +138,59 @@ func TestExtractFixedByteRegexSupportsBoundariesAndBoundedWidth(t *testing.T) {
 	}
 	if !scanner.fixedOnlyBlock {
 		t.Fatalf("compiled scanner did not select fixed-only block path: fixed=%t fixedAnchor=%t always=%d triggers=%d advanced=%t", scanner.regexPrograms[0].fixed != nil, scanner.regexPrograms[0].fixedAnchor != nil, len(scanner.blockScanPlan.unanchored.always), len(scanner.triggers), scanner.advancedEvents)
+	}
+}
+
+func TestFixedByteRegexASCIIRangesRejectsNonContinuousClass(t *testing.T) {
+	root, err := parseRegex(`a[0-9][A-Z]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixed, ok := extractFixedByteRegex(root)
+	if !ok {
+		t.Fatal("extractFixedByteRegex() failed")
+	}
+	if fixed.sequences[0].asciiRanges == nil {
+		t.Fatal("continuous ASCII classes did not receive range metadata")
+	}
+	root, err = parseRegex(`a[^0-9]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixed, ok = extractFixedByteRegex(root)
+	if !ok {
+		t.Fatal("extractFixedByteRegex() failed")
+	}
+	if fixed.sequences[0].asciiRanges != nil {
+		t.Fatal("non-continuous class unexpectedly received ASCII range metadata")
+	}
+}
+
+func TestFixedByteRegexLiteralAnchorsCoverEveryFixedBranch(t *testing.T) {
+	root, err := parseRegex(`[1-9][0-9]{5}(18|19|20)[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixed, ok := extractFixedByteRegex(root)
+	if !ok {
+		t.Fatal("extractFixedByteRegex() failed")
+	}
+	anchors, offset, ok := fixedByteRegexLiteralAnchors(fixed.sequences)
+	if !ok || offset != 6 || !slices.Equal(anchors, []string{"18", "19", "20"}) {
+		t.Fatalf("fixedByteRegexLiteralAnchors() = (%q, %d, %t), want ([18 19 20], 6, true)", anchors, offset, ok)
+	}
+	for _, sequence := range fixed.sequences {
+		value := make([]byte, len(anchors[0]))
+		for index := range value {
+			byteValue, single := byteClassSingleValue(sequence.classes[offset+index])
+			if !single {
+				t.Fatalf("sequence has non-literal anchor byte at offset %d", offset+index)
+			}
+			value[index] = byteValue
+		}
+		if !slices.Contains(anchors, string(value)) {
+			t.Fatalf("sequence anchor %q is not covered by %q", value, anchors)
+		}
 	}
 }
 

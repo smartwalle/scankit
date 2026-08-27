@@ -272,7 +272,8 @@ func Compile(expressions []Expression) (*Scanner, error) {
 				fixedAnchor:     plan.fixedAnchor,
 				candidate:       plan.candidate,
 			}
-			if (!plan.hasBoundedAnchor && !plan.hasInternalAnchor) || plan.analysis.min == 0 {
+			hasFixedLiteralAnchors := len(plan.fixedLiteralAnchors) != 0 && !plan.hasBoundedAnchor && !plan.hasInternalAnchor
+			if (!plan.hasBoundedAnchor && !plan.hasInternalAnchor && !hasFixedLiteralAnchors) || plan.analysis.min == 0 {
 				compiledProgram.unanchored = true
 				regexPrograms = append(regexPrograms, compiledProgram)
 				unanchoredRegex = append(unanchoredRegex, regexIndex)
@@ -297,6 +298,12 @@ func Compile(expressions []Expression) (*Scanner, error) {
 				compiledProgram.internalAnchor = true
 				compiledProgram.internalPrefixClass = plan.internalPrefixClass
 				compiledProgram.internalLeading = plan.internalLeading
+			} else if hasFixedLiteralAnchors {
+				selectedAnchor = regexAnchor{
+					literal:   plan.fixedLiteralAnchors[0],
+					minOffset: plan.fixedLiteralOffset,
+					maxOffset: plan.fixedLiteralOffset,
+				}
 			}
 			compiledProgram.anchorMinOffset = uint32(selectedAnchor.minOffset)
 			if selectedAnchor.maxOffset != unboundedRepeat {
@@ -346,13 +353,19 @@ func Compile(expressions []Expression) (*Scanner, error) {
 				groupIndex := len(anchoredGroups)
 				anchoredGroupIndex[key] = groupIndex
 				anchoredGroups = append(anchoredGroups, []uint32{regexIndex})
-				builder.add([]byte(selectedAnchor.literal), uint32(len(triggers)))
-				triggers = append(triggers, scanTrigger{
-					kind:            scanRegex,
-					expressionIndex: uint32(index),
-					regexIndex:      regexIndex,
-					regexGroupIndex: uint32(groupIndex),
-				})
+				anchorLiterals := []string{selectedAnchor.literal}
+				if hasFixedLiteralAnchors {
+					anchorLiterals = plan.fixedLiteralAnchors
+				}
+				for _, literal := range anchorLiterals {
+					builder.add([]byte(literal), uint32(len(triggers)))
+					triggers = append(triggers, scanTrigger{
+						kind:            scanRegex,
+						expressionIndex: uint32(index),
+						regexIndex:      regexIndex,
+						regexGroupIndex: uint32(groupIndex),
+					})
+				}
 			}
 			continue
 		}
@@ -534,7 +547,7 @@ func Compile(expressions []Expression) (*Scanner, error) {
 			}
 		}
 	}
-	directSingleEvent := directEventDeliveryEligible(compiled, combinations)
+	directSingleEvent := directEventDeliveryEligible(compiled, eventNeeded, combinations)
 	fixedOnlyBlock := !advancedEvents && len(triggers) == 0 && len(blockPlan.unanchored.always) == 0 && !blockPlan.unanchored.hasPrefixRepeatLanes() && !blockPlan.unanchored.hasBoundedRepeatLanes() && !blockPlan.unanchored.hasAlternationLanes() && !blockPlan.unanchored.hasAlternationGraphs() && blockPlan.unanchored.hasLanes()
 	fixedOnlyTriggers, fixedOnlyTriggerCount, fixedOnlyWordScan := fixedOnlyBlockTriggers(blockPlan)
 	fixedOnlyWordScan = fixedOnlyWordScan && singleByteWordScanAvailable

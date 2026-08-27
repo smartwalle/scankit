@@ -7,12 +7,17 @@ import "testing"
 type executionPlanObservation struct {
 	rootCandidates              uint64
 	fixedCandidates             uint64
+	fixedSequenceCandidates     uint64
+	fixedSequenceGroups         uint64
 	fixedAnchorCandidates       uint64
 	fixedAnchorWindowRejected   uint64
 	fixedAnchorChecksRejected   uint64
 	fixedAnchorVerifierCalls    uint64
 	fixedAnchorAlternationCalls uint64
 	prefixRepeatCandidates      uint64
+	boundedRepeatCandidates     uint64
+	alternationCandidates       uint64
+	alwaysCandidates            uint64
 	finalEvents                 uint64
 }
 
@@ -28,7 +33,12 @@ func observeExecutionPlan(scanner *Scanner, data []byte) (executionPlanObservati
 				}
 			}
 		}
-		observation.fixedCandidates += uint64(len(plan.fixed[value]))
+		for _, lane := range plan.fixed[value] {
+			observation.fixedCandidates++
+			triggerRange := lane.fixed.sequenceTrigger[value]
+			observation.fixedSequenceCandidates += uint64(triggerRange.length())
+			observation.fixedSequenceGroups += uint64(fixedByteRegexSequenceGroupCount(lane.fixed, value))
+		}
 		for _, lane := range plan.fixedAnchor[value] {
 			anchor := lane.anchor
 			start := offset - anchor.offset
@@ -48,6 +58,9 @@ func observeExecutionPlan(scanner *Scanner, data []byte) (executionPlanObservati
 			}
 		}
 		observation.prefixRepeatCandidates += uint64(len(plan.prefixRepeat[value]))
+		observation.boundedRepeatCandidates += uint64(len(plan.boundedRepeat[value]))
+		observation.alternationCandidates += uint64(len(plan.alternation[value]))
+		observation.alwaysCandidates += uint64(len(plan.always))
 	}
 	matches, err := scanner.ScanInto(data, nil)
 	if err != nil {
@@ -55,6 +68,24 @@ func observeExecutionPlan(scanner *Scanner, data []byte) (executionPlanObservati
 	}
 	observation.finalEvents = uint64(len(matches))
 	return observation, nil
+}
+
+func fixedByteRegexSequenceGroupCount(program *fixedByteRegex, value byte) int {
+	triggerRange := program.sequenceTrigger[value]
+	if triggerRange.empty() {
+		return 0
+	}
+	var seen [maxFixedByteRegexLength + 1]bool
+	count := 0
+	for index := triggerRange.start; index < triggerRange.end; index++ {
+		sequenceIndex := program.sequenceIndexes[index]
+		offset := program.sequences[sequenceIndex].triggerOffset
+		if !seen[offset] {
+			seen[offset] = true
+			count++
+		}
+	}
+	return count
 }
 
 func TestExecutionPlanRuntimeObservation(t *testing.T) {
@@ -74,11 +105,23 @@ func TestExecutionPlanRuntimeObservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observation.rootCandidates == 0 || observation.fixedCandidates == 0 || observation.fixedAnchorCandidates == 0 || observation.prefixRepeatCandidates == 0 || observation.finalEvents != 6 {
+	if observation.rootCandidates == 0 || observation.fixedCandidates == 0 || observation.prefixRepeatCandidates == 0 || observation.finalEvents != 6 {
 		t.Fatalf("incomplete runtime observation: %#v", observation)
 	}
-	if observation.fixedAnchorVerifierCalls == 0 || observation.fixedAnchorAlternationCalls != 0 {
-		t.Fatalf("unexpected fixed-anchor execution: %#v", observation)
-	}
 	t.Logf("runtime candidates: %#v", observation)
+}
+
+func TestExecutionPlanObservationCountsFixedSequenceGroups(t *testing.T) {
+	t.Parallel()
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: `a[0-9]{2}|b[0-9]{2}|c[0-9]{3}`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := observeExecutionPlan(scanner, []byte("a12 b34 c567"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.fixedCandidates == 0 || observation.fixedSequenceCandidates == 0 || observation.fixedSequenceGroups == 0 {
+		t.Fatalf("missing fixed sequence observation: %#v", observation)
+	}
 }

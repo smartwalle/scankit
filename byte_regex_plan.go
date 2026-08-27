@@ -25,6 +25,8 @@ type byteRegexCompilePlan struct {
 	alternation         *byteRegexAlternation
 	fixed               *fixedByteRegex
 	fixedAnchor         *fixedByteRegexAnchor
+	fixedLiteralAnchors []string
+	fixedLiteralOffset  int
 	leftmostOnly        bool
 	prefixDFAStates     []uint16
 }
@@ -111,6 +113,13 @@ func compileByteRegexPlan(root *regexNode, flags CompileFlag) (byteRegexCompileP
 	if flags&CompileLeftmostStart == 0 {
 		if fixed, ok := extractFixedByteRegex(root); ok {
 			plan.fixed = fixed
+			if flags&CompileCaseless == 0 && plan.alternation == nil {
+				anchors, offset, ok := fixedByteRegexLiteralAnchors(fixed.sequences)
+				if ok {
+					plan.fixedLiteralAnchors = anchors
+					plan.fixedLiteralOffset = offset
+				}
+			}
 			if anchor, ok := fixedByteRegexClassAnchor(fixed.sequences); ok {
 				plan.fixed = nil
 				plan.fixedAnchor = &anchor

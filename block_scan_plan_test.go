@@ -86,6 +86,34 @@ func TestCompileUsesFixedAnchorForLargeFixedWidthAlternation(t *testing.T) {
 	}
 }
 
+func TestCompileUsesFixedLiteralAnchorSetForLargeFixedWidthAlternation(t *testing.T) {
+	pattern := `[1-9][0-9]{5}(18|19|20)[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]`
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: pattern}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scanner.unanchoredGroups) != 0 || len(scanner.triggers) != 3 {
+		t.Fatalf("plan = unanchored:%d triggers:%d, want 0 and 3", len(scanner.unanchoredGroups), len(scanner.triggers))
+	}
+	regex := scanner.regexPrograms[0]
+	if regex.anchorMinOffset != 6 || regex.anchorMaxOffset != 6 || regex.anchorLength != 2 {
+		t.Fatalf("anchor = offset:%d-%d length:%d, want 6-6 and 2", regex.anchorMinOffset, regex.anchorMaxOffset, regex.anchorLength)
+	}
+	data := []byte("invalid=11010517000101002X first=11010518000101002X second=11010519000101002X third=11010520000101002X")
+	matches, err := scanner.Scan(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 3 {
+		t.Fatalf("matches = %#v, want three fixed-literal-anchor matches", matches)
+	}
+	for _, match := range matches {
+		if got := string(data[match.From:match.To]); got != "11010518000101002X" && got != "11010519000101002X" && got != "11010520000101002X" {
+			t.Fatalf("unexpected match %q", got)
+		}
+	}
+}
+
 func TestFixedOnlyBlockScanPreservesGenericSemantics(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -237,7 +265,7 @@ func TestDirectSingleEventRequiresUnfilteredExpressions(t *testing.T) {
 	}{
 		{name: "plain expressions", expressions: []Expression{{Id: 1, Pattern: `a`}, {Id: 2, Pattern: `b`}}, want: true},
 		{name: "single match", expressions: []Expression{{Id: 1, Pattern: `a`, Flags: CompileSingleMatch}, {Id: 2, Pattern: `b`}}, want: false},
-		{name: "quiet", expressions: []Expression{{Id: 1, Pattern: `a`, Flags: CompileQuiet}, {Id: 2, Pattern: `b`}}, want: false},
+		{name: "quiet", expressions: []Expression{{Id: 1, Pattern: `a`, Flags: CompileQuiet}, {Id: 2, Pattern: `b`}}, want: true},
 		{name: "constraint", expressions: []Expression{{Id: 1, Pattern: `a`, Ext: &ExpressionExt{Flags: ExtMinOffset, MinOffset: 1}}, {Id: 2, Pattern: `b`}}, want: false},
 		{name: "leftmost", expressions: []Expression{{Id: 1, Pattern: `a`, Flags: CompileLeftmostStart}, {Id: 2, Pattern: `b`}}, want: false},
 		{name: "combination", expressions: []Expression{{Id: 1, Pattern: `a`}, {Id: 2, Pattern: `b`}, {Id: 3, Pattern: `1|2`, Flags: CompileCombination}}, want: false},
