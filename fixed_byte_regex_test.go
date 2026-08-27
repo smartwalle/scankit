@@ -194,6 +194,58 @@ func TestFixedByteRegexLiteralAnchorsCoverEveryFixedBranch(t *testing.T) {
 	}
 }
 
+func TestFixedByteRegexLiteralAnchorsCoverVariableWidthBranches(t *testing.T) {
+	root, err := parseRegex(`(?:ab[0-9]{3}|cd[0-9]{4}|ef[0-9]{5})`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixed, ok := extractFixedByteRegex(root)
+	if !ok {
+		t.Fatal("extractFixedByteRegex() failed")
+	}
+	anchors, offset, ok := fixedByteRegexLiteralAnchors(fixed.sequences)
+	if !ok || offset != 0 || !slices.Equal(anchors, []string{"ab", "cd", "ef"}) {
+		t.Fatalf("fixedByteRegexLiteralAnchors() = (%q, %d, %t), want ([ab cd ef], 0, true)", anchors, offset, ok)
+	}
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: `(?:ab[0-9]{3}|cd[0-9]{4}|ef[0-9]{5})`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scanner.triggers) != 3 {
+		t.Fatalf("literal trigger count = %d, want 3", len(scanner.triggers))
+	}
+	data := []byte("ab123 cd1234 ef12345 invalid=ab12 cd123 ef1234")
+	matches, err := scanner.Scan(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 3 {
+		t.Fatalf("match count = %d, want 3: %#v", len(matches), matches)
+	}
+}
+
+func TestFixedByteRegexLiteralAnchorsAllowOneSharedLiteral(t *testing.T) {
+	root, err := parseRegex(`62[0-9]{14,17}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixed, ok := extractFixedByteRegex(root)
+	if !ok {
+		t.Fatal("extractFixedByteRegex() failed")
+	}
+	anchors, offset, ok := fixedByteRegexLiteralAnchors(fixed.sequences)
+	if !ok || offset != 0 || !slices.Equal(anchors, []string{"62"}) {
+		t.Fatalf("fixedByteRegexLiteralAnchors() = (%q, %d, %t), want ([62], 0, true)", anchors, offset, ok)
+	}
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: `62[0-9]{14,17}`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scanner.triggers) != 1 || scanner.blockScanPlan.triggers[0].kind != blockTriggerAnchoredAtStart {
+		t.Fatalf("compiled trigger = %#v, want one start-anchored literal trigger", scanner.blockScanPlan.triggers)
+	}
+}
+
 func BenchmarkFixedByteRegexLargeAlternation(b *testing.B) {
 	const pattern = `(?:ab|cd|ef|gh){4}`
 	data := bytes.Repeat([]byte("xxabcdefghyy"), 256)

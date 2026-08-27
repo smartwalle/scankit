@@ -504,26 +504,39 @@ func BenchmarkProfileMixedPIIPrefixDispatch(b *testing.B) {
 	if !scanner.blockScanPlan.mixed.wordScan || !scanner.blockScanPlan.mixed.rangeFast || !scanner.blockScanPlan.mixed.prefixOnly {
 		b.Fatalf("fixture did not select range-prefix dispatch: %#v", scanner.blockScanPlan.mixed)
 	}
-	data := bytes.Repeat([]byte(`ts=2026-08-20T09:30:00+08:00 mobile=12112312311 email=user@example..invalid identity_no=11010520000101002Z bank_card=6122021234567890 credit_card=2111111111111111 sensitive_token=0 status=processed`+"\n"), 128)
-	want, err := scanner.Scan(data)
-	if err != nil {
-		b.Fatal(err)
-	}
 	scalar := *scanner
 	scalar.blockScanPlan.mixed.wordScan = false
 	rangeOnly := *scanner
 	rangeOnly.blockScanPlan.mixed.prefixOnly = false
-	for _, test := range []struct {
-		name    string
-		scanner *Scanner
+	for _, fixture := range []struct {
+		name string
+		data []byte
 	}{
-		{name: "RangePrefix", scanner: scanner},
-		{name: "RangeOnly", scanner: &rangeOnly},
-		{name: "Scalar", scanner: &scalar},
+		{
+			name: "NoMatch",
+			data: bytes.Repeat([]byte(`ts=2026-08-20T09:30:00+08:00 mobile=12112312311 email=user@example..invalid identity_no=11010520000101002Z bank_card=6122021234567890 credit_card=2111111111111111 sensitive_token=0 status=processed`+"\n"), 128),
+		},
+		{
+			name: "HighMatch",
+			data: bytes.Repeat([]byte(`ts=2026-08-20T09:30:00+08:00 mobile=13800138000 email=alice@example.com identity_no=11010520000101002X bank_card=6222021234567890 credit_card=4111111111111111 sensitive_token=zredaction status=processed`+"\n"), 128),
+		},
 	} {
-		b.Run(test.name, func(b *testing.B) {
-			benchmarkProfileScanInto(b, test.scanner, data, want)
-		})
+		want, err := scanner.Scan(fixture.data)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for _, test := range []struct {
+			name    string
+			scanner *Scanner
+		}{
+			{name: "RangePrefix", scanner: scanner},
+			{name: "RangeOnly", scanner: &rangeOnly},
+			{name: "Scalar", scanner: &scalar},
+		} {
+			b.Run(fixture.name+"/"+test.name, func(b *testing.B) {
+				benchmarkProfileScanInto(b, test.scanner, fixture.data, want)
+			})
+		}
 	}
 }
 

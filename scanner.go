@@ -508,6 +508,7 @@ const (
 	blockTriggerLiteral
 	blockTriggerAnchored
 	blockTriggerAnchoredAtStart
+	blockTriggerAnchoredFixedOffset
 	blockTriggerInternalAnchored
 )
 
@@ -750,6 +751,8 @@ func buildBlockScanPlan(programs []compiledRegexProgram, expressions []compiledE
 				kind = blockTriggerInternalAnchored
 			} else if regex.anchorMinOffset == 0 && regex.anchorMaxOffset == 0 {
 				kind = blockTriggerAnchoredAtStart
+			} else if regex.anchorMinOffset == regex.anchorMaxOffset {
+				kind = blockTriggerAnchoredFixedOffset
 			}
 			plan.triggers[triggerIndex] = blockTriggerLane{
 				kind: kind,
@@ -966,7 +969,7 @@ func buildMixedTriggerPlan(automaton literalAutomaton, plan blockScanPlan, advan
 }
 
 func isBlockTriggerAnchored(kind blockTriggerLaneKind) bool {
-	return kind == blockTriggerAnchored || kind == blockTriggerAnchoredAtStart
+	return kind == blockTriggerAnchored || kind == blockTriggerAnchoredAtStart || kind == blockTriggerAnchoredFixedOffset
 }
 
 // anchoredGroupKey 与无锚点 NFA 共享使用相同的语言键。编译器对同一模式的锚点选择
@@ -1066,6 +1069,8 @@ func (scanner *Scanner) appendBlockTriggerEvents(data []byte, offset int, trigge
 		scanner.appendBlockAnchoredEvents(data, offset, &lane.anchored, ctx)
 	case blockTriggerAnchoredAtStart:
 		scanner.appendBlockAnchoredAtStartEvents(data, offset, &lane.anchored, ctx)
+	case blockTriggerAnchoredFixedOffset:
+		scanner.appendBlockAnchoredFixedOffsetEvents(data, offset, &lane.anchored, ctx)
 	case blockTriggerInternalAnchored:
 		scanner.appendBlockInternalAnchoredEvents(data, offset, &lane.anchored, ctx)
 	default:
@@ -1132,6 +1137,30 @@ func (scanner *Scanner) appendBlockAnchoredAtStartEvents(data []byte, offset int
 		for _, expressionIndex := range anchored.consumers {
 			expression := scanner.expressions[expressionIndex]
 			event := scanEvent{match: Match{Id: expression.id, From: uint64(anchorStart), To: uint64(end)}, expressionIndex: expressionIndex}
+			if end == offset+1 {
+				ctx.readyEvents = append(ctx.readyEvents, event)
+				continue
+			}
+			ctx.pushPendingEvent(event)
+		}
+	}
+}
+
+// appendBlockAnchoredFixedOffsetEvents 处理字面量锚点与表达式起点距离固定的规则。与
+// 一般锚定路径相比，它只有一个合法起点，不需要枚举浮动窗口或恢复前缀 DFA；完整
+// verifier 仍负责确认整个表达式及全部断言。
+func (scanner *Scanner) appendBlockAnchoredFixedOffsetEvents(data []byte, offset int, anchored *blockAnchoredLane, ctx *context) {
+	anchorStart := offset + 1 - int(anchored.anchorLength)
+	start := anchorStart - int(anchored.anchorMinOffset)
+	if start < 0 || !matchesAnchoredSuffix(data, anchorStart, anchored.anchorLength, anchored.suffixClass, anchored.hasSuffixClass) ||
+		anchored.suffixChecks != nil && !matchesAdditionalAnchoredSuffix(data, anchorStart+int(anchored.anchorLength)+1, anchored.suffixChecks) {
+		return
+	}
+	verifier := ctx.regexVerifiers[anchored.contextIndex]
+	for _, end := range verifier.matchFromLimit(anchored.program, data, start, regexMatchLimit(anchored.maxLength, len(data)-start)) {
+		for _, expressionIndex := range anchored.consumers {
+			expression := scanner.expressions[expressionIndex]
+			event := scanEvent{match: Match{Id: expression.id, From: uint64(start), To: uint64(end)}, expressionIndex: expressionIndex}
 			if end == offset+1 {
 				ctx.readyEvents = append(ctx.readyEvents, event)
 				continue

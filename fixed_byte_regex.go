@@ -536,13 +536,13 @@ func fixedByteRegexLiteralAnchors(sequences []fixedByteRegexSequence) (anchors [
 		return nil, 0, false
 	}
 	width := len(sequences[0].classes)
+	for _, sequence := range sequences[1:] {
+		if len(sequence.classes) < width {
+			width = len(sequence.classes)
+		}
+	}
 	if width < 2 {
 		return nil, 0, false
-	}
-	for _, sequence := range sequences[1:] {
-		if len(sequence.classes) != width {
-			return nil, 0, false
-		}
 	}
 	maximum := maxFixedLiteralAnchorWidth
 	if maximum > width {
@@ -571,7 +571,7 @@ func fixedByteRegexLiteralAnchors(sequences []fixedByteRegexSequence) (anchors [
 					break
 				}
 			}
-			if !valid || len(values) < 2 {
+			if !valid {
 				continue
 			}
 			anchors = make([]string, 0, len(values))
@@ -805,18 +805,19 @@ func (run *fixedByteRegexRun) advanceKnownTrigger(program *fixedByteRegex, data 
 		}
 		first := &program.sequences[program.sequenceIndexes[triggerRange.start]]
 		if first.asciiRanges != nil {
-			for index := 0; index < sharedSuffix; index++ {
-				position := first.triggerOffset + index + 1
+			// 切出已证明共同的后缀，避免每个候选在循环内重复计算相对于
+			// sequence 起点的位置；窗口边界已由上方检查保证。
+			suffix := first.asciiRanges[first.triggerOffset+1 : first.triggerOffset+sharedSuffix+1]
+			for index, asciiRange := range suffix {
 				value := data[offset+index+1]
-				asciiRange := first.asciiRanges[position]
 				if value < asciiRange.minimum || value > asciiRange.maximum {
 					return matches
 				}
 			}
 		} else {
-			for index := 0; index < sharedSuffix; index++ {
-				position := first.triggerOffset + index + 1
-				if !first.classes[position].contains(data[offset+index+1]) {
+			suffix := first.classes[first.triggerOffset+1 : first.triggerOffset+sharedSuffix+1]
+			for index, class := range suffix {
+				if !class.contains(data[offset+index+1]) {
 					return matches
 				}
 			}

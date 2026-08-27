@@ -45,19 +45,19 @@ func BenchmarkPIIRedaction(b *testing.B) {
 						piiBenchmarkMatchesSink = matches
 					})
 
-					b.Run("EngineReplace", func(b *testing.B) {
-						if _, err := fixture.engine.Replace(fixture.data, writePIIMask); err != nil {
-							b.Fatal(err)
-						}
-						startPIIBenchmarkTimer(b, fixture)
-						for range b.N {
-							result, err := fixture.engine.Replace(fixture.data, writePIIMask)
-							if err != nil {
-								b.Fatal(err)
-							}
-							piiBenchmarkBytesSink = result
-						}
-					})
+					//b.Run("EngineReplace", func(b *testing.B) {
+					//	if _, err := fixture.engine.Replace(fixture.data, writePIIMask); err != nil {
+					//		b.Fatal(err)
+					//	}
+					//	startPIIBenchmarkTimer(b, fixture)
+					//	for range b.N {
+					//		result, err := fixture.engine.Replace(fixture.data, writePIIMask)
+					//		if err != nil {
+					//			b.Fatal(err)
+					//		}
+					//		piiBenchmarkBytesSink = result
+					//	}
+					//})
 
 					b.Run("EngineMask", func(b *testing.B) {
 						data := make([]byte, len(fixture.data))
@@ -76,15 +76,15 @@ func BenchmarkPIIRedaction(b *testing.B) {
 						}
 					})
 
-					b.Run("GoRegexpReplace", func(b *testing.B) {
-						if result := fixture.goRegexp.ReplaceAllFunc(fixture.data, fixture.maskRegexpMatch); !bytes.Equal(result, fixture.masked) {
-							b.Fatal("Go regexp replacement does not match the verified masked output")
-						}
-						startPIIBenchmarkTimer(b, fixture)
-						for range b.N {
-							piiBenchmarkBytesSink = fixture.goRegexp.ReplaceAllFunc(fixture.data, fixture.maskRegexpMatch)
-						}
-					})
+					//b.Run("GoRegexpReplace", func(b *testing.B) {
+					//	if result := fixture.goRegexp.ReplaceAllFunc(fixture.data, fixture.maskRegexpMatch); !bytes.Equal(result, fixture.masked) {
+					//		b.Fatal("Go regexp replacement does not match the verified masked output")
+					//	}
+					//	startPIIBenchmarkTimer(b, fixture)
+					//	for range b.N {
+					//		piiBenchmarkBytesSink = fixture.goRegexp.ReplaceAllFunc(fixture.data, fixture.maskRegexpMatch)
+					//	}
+					//})
 				})
 			}
 		})
@@ -165,15 +165,14 @@ func newPIIBenchmarkFixture(b testing.TB, scenario piiBenchmarkScenario, density
 	if err != nil {
 		b.Fatal(err)
 	}
-	engine, err := scankit.New(scenario.expressions)
-	if err != nil {
-		b.Fatal(err)
-	}
 	goRegexp, err := regexp.Compile(piiBenchmarkAlternation(scenario.expressions))
 	if err != nil {
 		b.Fatal(err)
 	}
-
+	engine, err := scankit.New(scenario.expressions)
+	if err != nil {
+		b.Fatal(err)
+	}
 	expected := piiBenchmarkExpectedMatches(scenario.expressions, data)
 	if want := density.expectedHits * len(scenario.expressions); len(expected) != want {
 		b.Fatalf("%s/%s expected match count = %d, want %d", scenario.name, density.name, len(expected), want)

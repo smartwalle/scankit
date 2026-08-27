@@ -99,6 +99,11 @@ func TestCompileUsesFixedLiteralAnchorSetForLargeFixedWidthAlternation(t *testin
 	if regex.anchorMinOffset != 6 || regex.anchorMaxOffset != 6 || regex.anchorLength != 2 {
 		t.Fatalf("anchor = offset:%d-%d length:%d, want 6-6 and 2", regex.anchorMinOffset, regex.anchorMaxOffset, regex.anchorLength)
 	}
+	for _, trigger := range scanner.blockScanPlan.triggers {
+		if trigger.kind != blockTriggerAnchoredFixedOffset {
+			t.Fatalf("trigger kind = %d, want fixed-offset anchored", trigger.kind)
+		}
+	}
 	data := []byte("invalid=11010517000101002X first=11010518000101002X second=11010519000101002X third=11010520000101002X")
 	matches, err := scanner.Scan(data)
 	if err != nil {
@@ -111,6 +116,18 @@ func TestCompileUsesFixedLiteralAnchorSetForLargeFixedWidthAlternation(t *testin
 		if got := string(data[match.From:match.To]); got != "11010518000101002X" && got != "11010519000101002X" && got != "11010520000101002X" {
 			t.Fatalf("unexpected match %q", got)
 		}
+	}
+	reference := *scanner
+	reference.blockScanPlan.triggers = append([]blockTriggerLane(nil), scanner.blockScanPlan.triggers...)
+	for index := range reference.blockScanPlan.triggers {
+		reference.blockScanPlan.triggers[index].kind = blockTriggerAnchored
+	}
+	want, err := reference.Scan(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(matches, want) {
+		t.Fatalf("fixed-offset anchored Scan() = %#v, generic anchored Scan() = %#v", matches, want)
 	}
 }
 
