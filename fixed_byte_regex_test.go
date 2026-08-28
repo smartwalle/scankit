@@ -166,6 +166,28 @@ func TestFixedByteRegexASCIIRangesRejectsNonContinuousClass(t *testing.T) {
 	}
 }
 
+func TestFixedByteRegexBuildsNextByteSubset(t *testing.T) {
+	root, err := parseRegex(`[a]0b|[a]1c|[a]2d|[a]3e|[a]4f|[a]5g|[a]6h|[a]7i`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixed, ok := extractFixedByteRegex(root)
+	if !ok {
+		t.Fatal("extractFixedByteRegex() failed")
+	}
+	trigger := fixed.sequenceTrigger['a']
+	if trigger.nextSubset == nil {
+		t.Fatalf("next-byte subset is nil: %#v", trigger)
+	}
+	run := fixedByteRegexRun{}
+	if got := run.advanceKnownTrigger(fixed, []byte("az"), 0, trigger); len(got) != 0 {
+		t.Fatalf("subset accepted truncated candidate: %#v", got)
+	}
+	if got := run.advanceKnownTrigger(fixed, []byte("a0b a1c axe aye"), 0, trigger); len(got) != 1 {
+		t.Fatalf("subset result count = %d, want 1", len(got))
+	}
+}
+
 func TestFixedByteRegexLiteralAnchorsCoverEveryFixedBranch(t *testing.T) {
 	root, err := parseRegex(`[1-9][0-9]{5}(18|19|20)[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]`)
 	if err != nil {

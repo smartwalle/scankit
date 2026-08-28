@@ -32,6 +32,7 @@ type fixedByteRegexTriggerRange struct {
 	start        uint16
 	end          uint16
 	sharedSuffix uint8
+	nextSubset   *[byteClassCardinality]uint64
 }
 
 func (r fixedByteRegexTriggerRange) empty() bool {
@@ -128,11 +129,12 @@ func extractFixedByteRegex(root *regexNode) (*fixedByteRegex, bool) {
 	}
 	for index, classes := range sequences {
 		triggerOffset := triggerOffsets[index]
-		program.sequences[index] = fixedByteRegexSequence{
+		sequence := fixedByteRegexSequence{
 			classes:       classes,
 			asciiRanges:   fixedByteRegexASCIIRanges(classes),
 			triggerOffset: triggerOffset,
 		}
+		program.sequences[index] = sequence
 	}
 	var triggerCounts [byteClassCardinality]uint16
 	for _, sequence := range program.sequences {
@@ -192,6 +194,33 @@ func extractFixedByteRegex(root *regexNode) (*fixedByteRegex, bool) {
 		}
 		if shared != 0 {
 			program.sequenceTrigger[value].sharedSuffix = uint8(shared)
+		}
+		// 分支较多且下一位置字符类足够稀疏时，预先为每个下一字节建立分支位集。
+		// 扫描时只遍历可能接受该字节的序列；位集按原 sequenceIndexes 顺序消费，
+		// 因此不会改变重叠结果或事件顺序。共享后缀已经是更短路径时不再叠加。
+		if shared == 0 && triggerRange.length() >= 8 {
+			var subsets [byteClassCardinality]uint64
+			valid := true
+			members := 0
+			for index := triggerRange.start; index < triggerRange.end && valid; index++ {
+				sequence := program.sequences[program.sequenceIndexes[index]]
+				position := sequence.triggerOffset + 1
+				if position >= len(sequence.classes) {
+					valid = false
+					break
+				}
+				for value := 0; value < byteClassCardinality; value++ {
+					if sequence.classes[position].contains(byte(value)) {
+						subsets[value] |= uint64(1) << uint(index-triggerRange.start)
+						members++
+					}
+				}
+			}
+			// 平均候选密度不超过一半时，位集才有机会抵消一次下一字节读取。
+			if valid && members*2 <= triggerRange.length()*byteClassCardinality {
+				subsetCopy := subsets
+				program.sequenceTrigger[value].nextSubset = &subsetCopy
+			}
 		}
 	}
 	// 同一触发位置可能对应多个展开分支。只有两个等长分支的每个对应位置都存在
@@ -823,8 +852,27 @@ func (run *fixedByteRegexRun) advanceKnownTrigger(program *fixedByteRegex, data 
 			}
 		}
 	}
-	for index := triggerRange.start; index < triggerRange.end; index++ {
-		sequenceIndex := program.sequenceIndexes[index]
+	sequenceIndexCursor := triggerRange.start
+	var subset uint64
+	if triggerRange.nextSubset != nil {
+		if offset+1 >= len(data) {
+			return matches
+		}
+		subset = triggerRange.nextSubset[data[offset+1]]
+	}
+	for sequenceIndexCursor < triggerRange.end {
+		if triggerRange.nextSubset != nil {
+			if subset == 0 {
+				break
+			}
+			bit := bits.TrailingZeros64(subset)
+			sequenceIndexCursor = triggerRange.start + uint16(bit)
+			subset &^= uint64(1) << uint(bit)
+		}
+		sequenceIndex := program.sequenceIndexes[sequenceIndexCursor]
+		if triggerRange.nextSubset == nil {
+			sequenceIndexCursor++
+		}
 		// sequence 含有一个 slice header。直接使用已编译数组元素的地址，避免在每个
 		// 触发候选上复制它；Scanner 在编译后不可变，因此指针在并发扫描中稳定。
 		sequence := &program.sequences[sequenceIndex]
