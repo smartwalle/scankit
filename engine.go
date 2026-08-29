@@ -29,8 +29,9 @@ func (engine *Engine) Replace(data []byte, fn ReplaceFunc) ([]byte, error) {
 		engine.recycleMatches(matches)
 		return nil, err
 	}
-	defer engine.recycleMatches(matches)
-	return Replace(data, matches, fn), nil
+	result := Replace(data, matches, fn)
+	engine.recycleMatches(matches)
+	return result, nil
 }
 
 // Mask 使用 fn 原地修改 data 中的命中片段，并返回 data。
@@ -40,8 +41,9 @@ func (engine *Engine) Mask(data []byte, fn MaskFunc) ([]byte, error) {
 		engine.recycleMatches(matches)
 		return data, err
 	}
-	defer engine.recycleMatches(matches)
-	return Mask(data, matches, fn), nil
+	result := Mask(data, matches, fn)
+	engine.recycleMatches(matches)
+	return result, nil
 }
 
 func (engine *Engine) scanIntoReusableMatches(data []byte) ([]Match, error) {
