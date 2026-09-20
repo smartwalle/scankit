@@ -806,6 +806,12 @@ func (p *Program) findRole(id uint32) (Role, bool) {
 	return Role{}, false
 }
 
+// RoleByID 返回共享底层字面量切片的角色。仅在只读场景使用，避免对字面量做防御性复制。
+// 调用方不得修改返回 Role 的 Literal 字段；如需独立副本请使用 FindRole。
+func (p *Program) RoleByID(id uint32) (Role, bool) {
+	return p.findRole(id)
+}
+
 // HasRole 判断角色编号是否存在。
 func (p *Program) HasRole(id uint32) bool { _, ok := p.FindRole(id); return ok }
 

@@ -1201,7 +1201,8 @@ func (scanner *Scanner) scanRoseDirectInto(data []byte, dst []Match) []Match {
 		scanner.roseSinglePool.Put(singlePtr)
 	}()
 	for _, state := range states {
-		role, ok := program.FindRole(state.RoleID)
+		// 只读场景使用 RoleByID 避免对 Literal 做防御性复制。
+		role, ok := program.RoleByID(state.RoleID)
 		if !ok {
 			continue
 		}
