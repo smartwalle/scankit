@@ -211,7 +211,7 @@ func (p *Program) FindMatchesInto(data []byte, dst []State) []State {
 			out = make([]State, 0, len(matches))
 		}
 		for _, match := range matches {
-			role, ok := p.FindRole(match.ID)
+			role, ok := p.findRole(match.ID)
 			if !ok || !role.Eligible(data, match.From) {
 				continue
 			}
@@ -304,7 +304,7 @@ func (p *Program) FindMatchesLimit(data []byte, limit int) []State {
 	out := make([]State, 0, limit)
 	seen := make(map[[2]uint64]struct{}, limit)
 	for _, match := range matcher.Find(data) {
-		role, ok := p.FindRole(match.ID)
+		role, ok := p.findRole(match.ID)
 		if !ok || !role.Eligible(data, match.From) {
 			continue
 		}
@@ -341,7 +341,7 @@ func (p *Program) FindMatchesRange(data []byte, from, to int) []State {
 		out := make([]State, 0, len(matches))
 		seen := make(map[[2]uint64]struct{}, len(matches))
 		for _, match := range matches {
-			role, ok := p.FindRole(match.ID)
+			role, ok := p.findRole(match.ID)
 			if !ok || !role.Eligible(data, match.From) {
 				continue
 			}
@@ -359,7 +359,7 @@ func (p *Program) FindMatchesRange(data []byte, from, to int) []State {
 	}
 	out := make([]State, 0)
 	for _, state := range p.FindMatches(data) {
-		role, ok := p.FindRole(state.RoleID)
+		role, ok := p.findRole(state.RoleID)
 		if ok && int(state.Offset)+len(role.Literal) <= to && int(state.Offset) >= from {
 			out = append(out, state)
 		}
@@ -380,7 +380,7 @@ func (p *Program) FindMatchesRangeLimit(data []byte, from, to, limit int) []Stat
 		out := make([]State, 0, limit)
 		seen := make(map[[2]uint64]struct{}, limit)
 		for _, match := range p.matcher.FindRangeLimit(data, from, to, 0) {
-			role, ok := p.FindRole(match.ID)
+			role, ok := p.findRole(match.ID)
 			if !ok || !role.Eligible(data, match.From) {
 				continue
 			}
@@ -436,7 +436,7 @@ func (p *Program) FindMatchesEndRange(data []byte, from, to int) []State {
 		out := make([]State, 0, len(matches))
 		seen := make(map[[2]uint64]struct{}, len(matches))
 		for _, match := range matches {
-			role, ok := p.FindRole(match.ID)
+			role, ok := p.findRole(match.ID)
 			if !ok || !role.Eligible(data, match.From) {
 				continue
 			}
@@ -514,7 +514,7 @@ func (p *Program) MatchReportIDs(states []State) []uint32 {
 	}
 	seen := make(map[uint32]struct{}, len(states))
 	for _, state := range states {
-		if role, ok := p.FindRole(state.RoleID); ok {
+		if role, ok := p.findRole(state.RoleID); ok {
 			seen[role.ReportID] = struct{}{}
 		}
 	}
@@ -783,6 +783,17 @@ func (p *Program) LiteralLengths() map[uint32]int {
 	return out
 }
 func (p *Program) FindRole(id uint32) (Role, bool) {
+	r, ok := p.findRole(id)
+	if !ok {
+		return Role{}, false
+	}
+	// 保留对外返回值的隔离性，调用方修改 Literal 不会影响程序状态。
+	r.Literal = append([]byte(nil), r.Literal...)
+	return r, true
+}
+
+// findRole 返回共享底层字面量切片的角色，避免在只读路径上重复分配。
+func (p *Program) findRole(id uint32) (Role, bool) {
 	if p == nil {
 		return Role{}, false
 	}
@@ -790,9 +801,7 @@ func (p *Program) FindRole(id uint32) (Role, bool) {
 		p.index = buildRoleIndex(p.Roles)
 	}
 	if i, ok := p.index[id]; ok && i >= 0 && i < len(p.Roles) {
-		r := p.Roles[i]
-		r.Literal = append([]byte(nil), r.Literal...)
-		return r, true
+		return p.Roles[i], true
 	}
 	return Role{}, false
 }
