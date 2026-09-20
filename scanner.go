@@ -1184,6 +1184,12 @@ func (scanner *Scanner) scanRoseDirectInto(data []byte, dst []Match) []Match {
 		stateBuffer = new([]rose.State)
 	}
 	states := program.FindMatchesInto(data, (*stateBuffer)[:0])
+	// 当结果切片容量超过当前池缓冲时，回收新的结果切片以避免下次扫描
+	// 重新分配；这与 matcher 的 findRole 路径在 dst 不够大时分配新切片的
+	// 行为配合，确保状态缓冲在跨多次扫描时逐步成长到最大需求。
+	if cap(states) > cap(*stateBuffer) {
+		*stateBuffer = states[:0]
+	}
 	defer func() {
 		if cap(states) > 1<<20 {
 			*stateBuffer = nil
@@ -1192,6 +1198,14 @@ func (scanner *Scanner) scanRoseDirectInto(data []byte, dst []Match) []Match {
 		}
 		pool.Put(stateBuffer)
 	}()
+	// 按状态数预分配目标切片，避免 append 多次扩容。
+	need := len(states)
+	if need == 0 {
+		return dst[:0]
+	}
+	if cap(dst) < need {
+		dst = make([]Match, 0, need+cap(dst))
+	}
 	out := dst[:0]
 	// 复用 SingleMatch 规则的去重表，避免每次扫描都分配 map。
 	singlePtr, _ := scanner.roseSinglePool.Get().(*map[uint32]struct{})
