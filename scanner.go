@@ -1200,7 +1200,12 @@ func (scanner *Scanner) scanRoseDirectInto(data []byte, dst []Match) []Match {
 	}
 	single := *singlePtr
 	defer func() {
-		clear(single)
+		// 池中 map 的桶大小不应随单次扫描无限增长，超出限制时丢弃避免泄漏。
+		if len(single) > 1<<16 {
+			*singlePtr = nil
+		} else {
+			clear(single)
+		}
 		scanner.roseSinglePool.Put(singlePtr)
 	}()
 	for _, state := range states {
