@@ -859,7 +859,7 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 	}
 	if fastLiteral && scanner.literalFind != nil {
 		// 复用栈上缓冲，避免每次扫描都重新分配候选切片。
-		var candBuf [64]literalCandidate
+		var candBuf [128]literalCandidate
 		var candidates []literalCandidate
 		if scanner.literalFindInto != nil {
 			candidates = scanner.literalFindInto(data, candBuf[:0])
