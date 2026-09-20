@@ -5848,9 +5848,8 @@ func (p *goughProgram) acceptsBit(data []byte, start, end int) bool {
 				word &= word - 1
 			}
 		}
-		for i := range active {
-			active[i] = next[i]
-		}
+		// 直接拷贝 next 到 active，减少显式索引循环。
+		copy(active, next)
 		clear(next)
 		p.reverseClosureBitsInto(active, next)
 		active, next = next, active
