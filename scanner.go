@@ -65,6 +65,8 @@ type Scanner struct {
 	contextPool     *sync.Pool
 	roseStatePool   *sync.Pool
 	roseSinglePool  *sync.Pool
+	// canUseRoseInScan 缓存 canUseRoseInScan 的结果，避免每次 Scan 重复遍历。
+	canUseRoseInScan bool
 	rules           []compiledRule
 	ruleIndex       map[uint32]int
 	ruleOrder       map[uint32]int
@@ -174,6 +176,7 @@ func newScanner(rules []compiledRule) *Scanner {
 	// Rose 角色图与文字候选索引随规则计划不可变，构造阶段完成一次，
 	// 扫描时直接复用，避免每个 Block 重建角色、指令和自动机。
 	scanner.rosePlan = scanner.buildRoseProgram()
+	scanner.canUseRoseInScan = scanner.computeCanUseRoseInScan()
 	// 编译结果不可变，计划校验只需在构造时执行一次；扫描热路径复用该结论。
 	scanner.validationErr = scanner.validate()
 	return scanner
@@ -814,7 +817,7 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 	// 当全部规则都能安全转换为 Rose 角色时，整块扫描直接复用角色调度器；
 	// 只要存在无法转换的规则或组合规则，就保留原有统一确认路径，避免候选
 	// 调度改变未覆盖规则的结果语义。
-	if scanner.canUseRoseInScan() {
+	if scanner.canUseRoseInScan {
 		// 纯文字角色没有状态迁移或确认依赖，直接消费共享候选索引，
 		// 避免为每个候选创建调度队列和执行去重表。
 		roseMatches := scanner.scanRoseDirectInto(data, matches[base:base])
@@ -1125,9 +1128,9 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 	return matches, nil
 }
 
-// canUseRoseInScan 判断 Rose 是否覆盖全部规则且不包含组合依赖。
-// 该检查只允许完整覆盖的角色集合进入 Scan，部分覆盖继续走安全回退。
-func (scanner *Scanner) canUseRoseInScan() bool {
+// computeCanUseRoseInScan 一次性计算 Rose 是否覆盖全部规则且不包含组合依赖。
+// 编译期缓存结果，运行时直接读取，避免每次 Scan 重复遍历规则。
+func (scanner *Scanner) computeCanUseRoseInScan() bool {
 	if scanner == nil || len(scanner.rules) == 0 || scanner.hasCombo {
 		return false
 	}
