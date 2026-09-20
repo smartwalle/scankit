@@ -228,16 +228,12 @@ func (p *Program) FindMatchesInto(data []byte, dst []State) []State {
 	if p.miracleReady {
 		return p.findMiracleMulti(data, 0, len(data), 0)
 	}
+	// 此分支在每个角色至多被处理一次的条件下，不存在 (role.ID, off) 重复。
+	// 直接写入结果缓冲，避免每次扫描都分配去重 map。
 	out := dst[:0]
-	seen := map[[2]uint64]struct{}{}
 	for _, role := range p.Roles {
 		for off := 0; off+len(role.Literal) <= len(data); off++ {
 			if role.Eligible(data, off) {
-				key := [2]uint64{uint64(role.ID), uint64(off)}
-				if _, ok := seen[key]; ok {
-					continue
-				}
-				seen[key] = struct{}{}
 				out = append(out, State{RoleID: role.ID, Offset: uint64(off)})
 			}
 		}
