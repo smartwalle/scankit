@@ -2,6 +2,7 @@
 package rose
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"github.com/smartwalle/scankit/internal/dispatch"
@@ -62,15 +63,17 @@ func (r Role) MatchAt(data []byte, off int) bool {
 		}
 		return len(literal) == 0 && len(input) == 0
 	}
+	if !r.CaseInsensitive {
+		// 大小写不敏感且全 ASCII 走 bytes.Equal。
+		return bytes.Equal(data[off:off+len(r.Literal)], r.Literal)
+	}
 	for i, c := range r.Literal {
 		got := data[off+i]
-		if r.CaseInsensitive {
-			if c >= 'A' && c <= 'Z' {
-				c += 'a' - 'A'
-			}
-			if got >= 'A' && got <= 'Z' {
-				got += 'a' - 'A'
-			}
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if got >= 'A' && got <= 'Z' {
+			got += 'a' - 'A'
 		}
 		if got != c {
 			return false
