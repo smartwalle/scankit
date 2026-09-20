@@ -1,0 +1,95 @@
+//go:build arm64
+
+package arm64
+
+import (
+	"math/rand"
+	"testing"
+
+	"github.com/smartwalle/scankit/internal/simd"
+)
+
+// TestNativeByteSetMask32CoversAllValues 验证 32 字节原生判定对全部 256 个取值
+// 的命中/未命中判定都正确，覆盖两个 128 位半区。
+func TestNativeByteSetMask32CoversAllValues(t *testing.T) {
+	for _, raw := range bytesetSets() {
+		set := simd.NewByteSet(raw)
+		for b := 0; b < 256; b++ {
+			window := make([]byte, simd.SuperWidth)
+			for i := range window {
+				window[i] = byte(b)
+			}
+			want := uint32(0)
+			if raw[b/64]&(1<<uint(b%64)) != 0 {
+				want = ^uint32(0)
+			}
+			if got := nativeByteSetMask32(window, set.TableVector()); got != want {
+				t.Fatalf("raw=%v byte=%d got=%032b want=%032b", raw, b, got, want)
+			}
+		}
+	}
+}
+
+// TestNativeByteSetMask32PinsBitOrder 使用单字节集合逐位置验证掩码位序。
+func TestNativeByteSetMask32PinsBitOrder(t *testing.T) {
+	for b := 0; b < 256; b++ {
+		var raw [4]uint64
+		raw[b/64] = 1 << uint(b%64)
+		set := simd.NewByteSet(raw)
+		for lane := 0; lane < simd.SuperWidth; lane++ {
+			window := make([]byte, simd.SuperWidth)
+			for i := range window {
+				window[i] = byte(b + 1)
+			}
+			window[lane] = byte(b)
+			want := uint32(1) << uint(lane)
+			if got := nativeByteSetMask32(window, set.TableVector()); got != want {
+				t.Fatalf("byte=%d lane=%d got=%032b want=%032b", b, lane, got, want)
+			}
+		}
+	}
+}
+
+// TestNativeByteSetMask32RandomWindows 使用随机窗口核对原生路径与通用实现一致。
+func TestNativeByteSetMask32RandomWindows(t *testing.T) {
+	rng := rand.New(rand.NewSource(17))
+	sets := bytesetSets()
+	for i := 0; i < 20000; i++ {
+		raw := sets[rng.Intn(len(sets))]
+		set := simd.NewByteSet(raw)
+		window := make([]byte, simd.SuperWidth)
+		want := uint32(0)
+		for j := range window {
+			value := byte(rng.Intn(256))
+			window[j] = value
+			if raw[value/64]&(1<<uint(value%64)) != 0 {
+				want |= 1 << uint(j)
+			}
+		}
+		if got := nativeByteSetMask32(window, set.TableVector()); got != want {
+			t.Fatalf("raw=%v window=%v got=%032b want=%032b", raw, window, got, want)
+		}
+	}
+}
+
+// BenchmarkNativeByteSetMask32 记录 32 字节 NEON 判定的单次成本。
+func BenchmarkNativeByteSetMask32(b *testing.B) {
+	var raw [4]uint64
+	for value := 'a'; value <= 'z'; value += 2 {
+		raw[value/64] |= 1 << uint(value%64)
+	}
+	set := simd.NewByteSet(raw)
+	tables := set.TableVector()
+	window := make([]byte, simd.SuperWidth)
+	for i := range window {
+		window[i] = byte('a' + i%26)
+	}
+	b.ReportAllocs()
+	var acc uint32
+	for i := 0; i < b.N; i++ {
+		acc |= nativeByteSetMask32(window, tables)
+	}
+	if acc == 0 {
+		b.Fatal("掩码不应全为零")
+	}
+}

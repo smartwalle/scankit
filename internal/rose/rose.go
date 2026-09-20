@@ -12,6 +12,7 @@ import (
 	"github.com/smartwalle/scankit/internal/parser"
 	"github.com/smartwalle/scankit/internal/report"
 	"github.com/smartwalle/scankit/internal/simd"
+	"math/bits"
 	"sort"
 	"unicode"
 	"unicode/utf8"
@@ -31,6 +32,101 @@ type Role struct {
 }
 
 func (r Role) Length() int { return len(r.Literal) }
+
+// roleCostLengthCap 是角色代价对文字长度的封顶值，避免超长文字压过其他约束。
+const roleCostLengthCap = 64
+
+// RoleCost 描述角色候选扫描代价的构成分量。
+// 结构本身不参与命中判定，只用于在等价角色之间选取代表角色。
+type RoleCost struct {
+	// LiteralLength 是角色文字长度（封顶到 roleCostLengthCap）。
+	LiteralLength int `json:"literal_length"`
+	// Anchored 表示角色只允许在输入起点命中。
+	Anchored bool `json:"anchored,omitempty"`
+	// EndOfData 表示角色必须以输入末尾结束。
+	EndOfData bool `json:"end_of_data,omitempty"`
+	// NeedsConfirm 表示角色命中后仍需完整规则确认。
+	NeedsConfirm bool `json:"needs_confirm,omitempty"`
+	// CaseFolded 表示角色按大小写不敏感扫描。
+	CaseFolded bool `json:"case_folded,omitempty"`
+	// BoundedOffset 表示角色带有结束偏移上界。
+	BoundedOffset bool `json:"bounded_offset,omitempty"`
+}
+
+// Cost 返回角色的扫描代价分量快照。
+func (r Role) Cost() RoleCost {
+	length := len(r.Literal)
+	if length > roleCostLengthCap {
+		length = roleCostLengthCap
+	}
+	return RoleCost{
+		LiteralLength: length,
+		Anchored:      r.Anchored,
+		EndOfData:     r.EndOfData,
+		NeedsConfirm:  r.Confirm,
+		CaseFolded:    r.CaseInsensitive,
+		BoundedOffset: r.HasMaxOffset,
+	}
+}
+
+// Weight 返回按扫描代价分量折算的权值：越小表示候选越稀疏、越应优先选中。
+// 文字越长候选越少，锚定、末尾约束和偏移上界都会进一步收紧候选集合；
+// 需要额外确认或大小写折叠的放宽项会提高权值。
+func (r Role) Weight() int {
+	cost := r.Cost()
+	weight := (roleCostLengthCap - cost.LiteralLength) * 4
+	if cost.Anchored {
+		weight -= 24
+	}
+	if cost.EndOfData {
+		weight -= 24
+	}
+	if cost.BoundedOffset {
+		weight -= 8
+	}
+	if cost.CaseFolded {
+		weight += 2
+	}
+	if cost.NeedsConfirm {
+		weight += 4
+	}
+	if weight < 0 {
+		weight = 0
+	}
+	return weight
+}
+
+// ScanEquivalent 判断两个角色的候选扫描是否完全等价。
+// 等价角色在相同输入上产生完全相同的候选与报告，因此只需保留一个代表。
+func (r Role) ScanEquivalent(other Role) bool {
+	if r.ReportID != other.ReportID ||
+		r.Anchored != other.Anchored ||
+		r.EndOfData != other.EndOfData ||
+		r.Confirm != other.Confirm ||
+		r.MinOffset != other.MinOffset ||
+		r.HasMaxOffset != other.HasMaxOffset ||
+		!bytes.Equal(r.Literal, other.Literal) {
+		return false
+	}
+	if r.HasMaxOffset && r.MaxOffset != other.MaxOffset {
+		return false
+	}
+	if r.CaseInsensitive != other.CaseInsensitive {
+		// 不含 ASCII 字母时大小写折叠是恒等变换，敏感与不敏感扫描产生相同候选。
+		return !containsASCIILetter(r.Literal)
+	}
+	return true
+}
+
+// containsASCIILetter 判断文字中是否含有会改变大小写折叠结果的 ASCII 字母。
+func containsASCIILetter(literal []byte) bool {
+	for _, value := range literal {
+		if value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z' {
+			return true
+		}
+	}
+	return false
+}
 func (r Role) Clone() Role { r.Literal = append([]byte(nil), r.Literal...); return r }
 
 func (r Role) MatchAt(data []byte, off int) bool {
@@ -111,17 +207,21 @@ func roleEnd(offset uint64, length int) (uint64, bool) {
 }
 
 type Program struct {
-	Roles           []Role
-	Instructions    []Instruction
-	matcher         *fdr.Matcher
+	Roles        []Role
+	Instructions []Instruction
+	matcher      *fdr.Matcher
 	// matchBuf 复用 matcher 返回的命中缓冲，避免每次 FindMatchesInto 都重新分配。
 	matchBuf        []fdr.Match
 	miracles        []*Miracle
 	miracleBuckets  [256][]int
 	miracleFirstSet [4]uint64
-	miracleReady    bool
-	index           map[uint32]int
-	instructions    map[uint32][]Instruction
+	// miracleFirstTable 是 miracleFirstSet 的预编译窗口查找表，供候选取点热路径
+	// 一次判定 32 字节；只在 miracleReady 为真时构建，与首字节集合同步维护。
+	miracleFirstTable simd.ByteSetTables
+	miracleReady      bool
+	index             map[uint32]int
+	byReport          map[uint32][]int
+	instructions      map[uint32][]Instruction
 }
 
 // InstructionKind 表示角色状态执行时的动作类型。
@@ -187,8 +287,10 @@ func (p *Program) FindMatchesInto(data []byte, dst []State) []State {
 	if p == nil {
 		return dst[:0]
 	}
+	// matcher 为 nil 且已启用候选器时属于构建期有意为之的“跳过通用匹配器”，
+	// 不能在这里重新构建，否则候选路径会永远不可达并反复付出构建代价。
 	matcher := p.matcher
-	if matcher == nil {
+	if matcher == nil && !p.miracleReady {
 		matcher = buildRoleMatcher(p.Roles)
 	}
 	if matcher != nil {
@@ -325,8 +427,9 @@ func (p *Program) FindMatchesRange(data []byte, from, to int) []State {
 	if p == nil || from < 0 || to < from || to > len(data) {
 		return nil
 	}
+	// 与 FindMatchesInto 一致：候选器就绪时保留构建期的 nil matcher 决定。
 	matcher := p.matcher
-	if matcher == nil {
+	if matcher == nil && !p.miracleReady {
 		matcher = buildRoleMatcher(p.Roles)
 	}
 	if matcher != nil {
@@ -528,23 +631,40 @@ func New(roles []Role) *Program {
 			out[i].ReportID = out[i].ID
 		}
 	}
-	matcher := buildRoleMatcher(out)
-	// 单角色使用轻量候选路径，多角色继续使用共享自动机。
-	if len(out) == 1 {
-		matcher = nil
-	}
-	p := &Program{Roles: out, matcher: matcher, index: buildRoleIndex(out)}
-	for _, role := range out {
+	p := &Program{Roles: out, index: buildRoleIndex(out)}
+	p.rebuildCandidateState()
+	p.rebuildInstructionIndex()
+	return p
+}
+
+// rebuildCandidateState 由当前 Roles 重新推导 matcher、候选器与首字节集合。
+//
+// 这是 New 与 Normalize 共用的唯一派生入口：两处分别推导会让“跳过通用匹配器”
+// 的决定在 Normalize 之后被还原，候选路径随之永久失效。
+func (p *Program) rebuildCandidateState() {
+	p.miracles = p.miracles[:0]
+	for _, role := range p.Roles {
 		if miracle := newMiracle(role); miracle != nil {
 			p.miracles = append(p.miracles, miracle)
 		}
 	}
-	if len(p.miracles) == len(out) && len(out) > 1 {
+	p.miracleReady = false
+	p.miracleFirstSet = [4]uint64{}
+	for i := range p.miracleBuckets {
+		p.miracleBuckets[i] = nil
+	}
+	p.miracleFirstTable = simd.ByteSetTables{}
+	p.matcher = buildRoleMatcher(p.Roles)
+	// 单角色使用轻量候选路径，多角色继续使用共享自动机。
+	if len(p.Roles) == 1 {
+		p.matcher = nil
+	}
+	if len(p.miracles) == len(p.Roles) && len(p.Roles) > 1 {
 		p.miracleReady = true
 		// 所有角色均可由候选器直接定位时跳过通用多模式匹配器。
 		// 完整 Role.Eligible 仍在候选确认阶段执行。
 		p.matcher = nil
-		for i, role := range out {
+		for i, role := range p.Roles {
 			if len(role.Literal) > 0 {
 				first := role.Literal[0]
 				outFirst := first
@@ -566,9 +686,8 @@ func New(roles []Role) *Program {
 				}
 			}
 		}
+		p.miracleFirstTable = simd.FirstByteTables(p.miracleFirstSet)
 	}
-	p.rebuildInstructionIndex()
-	return p
 }
 
 func (p *Program) findMiracleMulti(data []byte, from, to, limit int) []State {
@@ -594,23 +713,35 @@ func (p *Program) findMiracleMultiInto(data []byte, from, to, limit int, dst []S
 		return true
 	}
 	backend := dispatch.DefaultBackend()
-	const width = simd.SuperWidth / 2
-	for off := from; off+width <= to; off += width {
-		vec, ok := backend.Load(data, off)
+	// 候选枚举优先按宽窗口批量判定，剩余不足一个宽窗口时先用超向量窗口补齐，
+	// 最后再逐字节回退判定；三段区间按起始位置无缝衔接，不会重复访问同一偏移。
+	off := from
+	for ; off+simd.WideWidth <= to; off += simd.WideWidth {
+		mask, ok := backend.WindowMask64(data, off, &p.miracleFirstTable, 1)
 		if !ok {
 			break
 		}
-		mask := backend.ByteSetMask(vec, p.miracleFirstSet)
 		for mask != 0 {
-			bit := trailingZeros16(mask)
+			bit := bits.TrailingZeros64(mask)
 			if !visit(off + bit) {
 				return SortStates(out)
 			}
 			mask &^= 1 << uint(bit)
 		}
 	}
-	start := from + ((to-from)/width)*width
-	for off := start; off < to; off++ {
+	if off+simd.SuperWidth <= to {
+		if mask, ok := backend.WindowMask(data, off, &p.miracleFirstTable, 1); ok {
+			for mask != 0 {
+				bit := bits.TrailingZeros32(mask)
+				if !visit(off + bit) {
+					return SortStates(out)
+				}
+				mask &^= 1 << uint(bit)
+			}
+			off += simd.SuperWidth
+		}
+	}
+	for ; off < to; off++ {
 		if p.miracleFirstSet[data[off]/64]&(1<<uint(data[off]%64)) == 0 {
 			continue
 		}
@@ -623,18 +754,6 @@ func (p *Program) findMiracleMultiInto(data []byte, from, to, limit int, dst []S
 		out = out[:limit]
 	}
 	return out
-}
-
-func trailingZeros16(v uint16) int {
-	if v == 0 {
-		return 0
-	}
-	n := 0
-	for v&1 == 0 {
-		v >>= 1
-		n++
-	}
-	return n
 }
 
 func (p *Program) rebuildInstructionIndex() {
@@ -717,17 +836,9 @@ func (p *Program) Normalize() {
 		out = append(out, role)
 	}
 	p.Roles = out
-	p.matcher = buildRoleMatcher(p.Roles)
-	if len(p.Roles) == 1 {
-		p.matcher = nil
-	}
-	p.miracles = p.miracles[:0]
-	for _, role := range p.Roles {
-		if miracle := newMiracle(role); miracle != nil {
-			p.miracles = append(p.miracles, miracle)
-		}
-	}
+	p.rebuildCandidateState()
 	p.index = buildRoleIndex(p.Roles)
+	p.byReport = nil
 	p.rebuildInstructionIndex()
 }
 func (p *Program) Clone() *Program {
@@ -820,6 +931,66 @@ func (p *Program) FindRolesByReportID(reportID uint32) []Role {
 		}
 	}
 	return out
+}
+
+// ensureReportIndex 返回按报告编号分组的角色下标，组内按扫描代价升序（相同代价按编号）。
+// 索引惰性构建，调用方不得修改返回切片。
+func (p *Program) ensureReportIndex() map[uint32][]int {
+	if p.byReport != nil {
+		return p.byReport
+	}
+	index := make(map[uint32][]int)
+	for i, role := range p.Roles {
+		index[role.ReportID] = append(index[role.ReportID], i)
+	}
+	for _, positions := range index {
+		sort.SliceStable(positions, func(i, j int) bool {
+			left, right := p.Roles[positions[i]], p.Roles[positions[j]]
+			leftWeight, rightWeight := left.Weight(), right.Weight()
+			if leftWeight != rightWeight {
+				return leftWeight < rightWeight
+			}
+			return left.ID < right.ID
+		})
+	}
+	p.byReport = index
+	return index
+}
+
+// RolesForReport 按扫描代价升序返回指定报告编号的角色。
+// 返回的角色共享程序底层字面量，调用方不得修改；如需独立副本请使用 FindRolesByReportID。
+func (p *Program) RolesForReport(reportID uint32) []Role {
+	if p == nil {
+		return nil
+	}
+	positions := p.ensureReportIndex()[reportID]
+	if len(positions) == 0 {
+		return nil
+	}
+	out := make([]Role, 0, len(positions))
+	for _, position := range positions {
+		if position >= 0 && position < len(p.Roles) {
+			out = append(out, p.Roles[position])
+		}
+	}
+	return out
+}
+
+// CheapestRoleForReport 返回指定报告编号下扫描代价最低的角色代表。
+// 代价相同时返回编号最小的角色，保证选择结果稳定。
+func (p *Program) CheapestRoleForReport(reportID uint32) (Role, bool) {
+	if p == nil {
+		return Role{}, false
+	}
+	positions := p.ensureReportIndex()[reportID]
+	if len(positions) == 0 {
+		return Role{}, false
+	}
+	position := positions[0]
+	if position < 0 || position >= len(p.Roles) {
+		return Role{}, false
+	}
+	return p.Roles[position].Clone(), true
 }
 
 // ReportIDs 返回角色对应的报告编号快照并去重排序。
@@ -992,6 +1163,7 @@ func (q *Queue) Push(s State) {
 }
 
 // stateBefore 定义调度队列的稳定顺序：优先级、输入偏移、角色编号依次比较。
+// 三个字段都是严格小于比较，保证等价状态不互相重排。
 func stateBefore(a, b State) bool {
 	if a.Priority != b.Priority {
 		return a.Priority < b.Priority
@@ -999,17 +1171,60 @@ func stateBefore(a, b State) bool {
 	if a.Offset != b.Offset {
 		return a.Offset < b.Offset
 	}
-	return a.RoleID <= b.RoleID
+	return a.RoleID < b.RoleID
 }
 
-// PushAll 批量加入状态并按优先级稳定排序。
+// PushAll 批量加入状态：队列内容与逐个 Push 完全一致，
+// 但只做一次整体排序，避免逐元素插入排序退化为 O(n²)。
 func (q *Queue) PushAll(states []State) {
-	if q == nil {
+	if q == nil || len(states) == 0 {
 		return
 	}
+	appended := 0
 	for _, state := range states {
-		q.Push(state)
+		if state.Validate() != nil {
+			continue
+		}
+		q.items = append(q.items, state)
+		appended++
 	}
+	if appended == 0 {
+		return
+	}
+	sort.SliceStable(q.items, func(i, j int) bool { return stateBefore(q.items[i], q.items[j]) })
+}
+
+// Compact 就地压缩队列：过滤非法状态，按 (优先级, 偏移, 角色编号) 稳定排序，
+// 并对同一角色/偏移只保留优先级最低（数值最小）的状态。返回被移除的状态数量。
+func (q *Queue) Compact() int {
+	if q == nil || len(q.items) == 0 {
+		return 0
+	}
+	total := len(q.items)
+	valid := q.items[:0]
+	for _, state := range q.items {
+		if state.Validate() != nil {
+			continue
+		}
+		valid = append(valid, state)
+	}
+	sort.SliceStable(valid, func(i, j int) bool { return stateBefore(valid[i], valid[j]) })
+	out := valid[:0]
+	seen := make(map[[2]uint64]struct{}, len(valid))
+	for _, state := range valid {
+		key := stateKey(state)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, state)
+	}
+	for i := len(out); i < total; i++ {
+		q.items[i] = State{}
+	}
+	removed := total - len(out)
+	q.items = out
+	return removed
 }
 
 // PopLimit 取出不超过 limit 个状态；零值表示取出全部。
@@ -1104,7 +1319,12 @@ func (s *Scheduler) SetMaxPending(n int) {
 		return
 	}
 	s.maxPending = n
-	if n == 0 || s.Queue.Len() <= n {
+	if n <= 0 {
+		return
+	}
+	// 截断前先压缩队列，去除重复状态并保证尾部截断保留的都是最低优先级候选。
+	s.Queue.Compact()
+	if s.Queue.Len() <= n {
 		return
 	}
 	for _, st := range s.Queue.items[n:] {
@@ -1157,13 +1377,8 @@ func (s *Scheduler) Activate(state State) {
 	}
 	s.active[key] = state
 	s.Queue.Push(state)
-	if s.maxPending > 0 && s.Queue.Len() > s.maxPending {
-		// 队列已按优先级排序，截断尾部即可保留最早候选。
-		for _, dropped := range s.Queue.items[s.maxPending:] {
-			delete(s.active, stateKey(dropped))
-		}
-		s.Queue.items = s.Queue.items[:s.maxPending]
-	}
+	// 队列已按优先级排序，截断尾部即可保留最早候选。
+	s.enforcePendingLimit()
 }
 
 // ActivateChecked 仅激活已在程序中声明的角色。
@@ -1240,9 +1455,7 @@ func (s *Scheduler) ActivateMatches(data []byte) int {
 		return 0
 	}
 	matches := s.Program.FindMatches(data)
-	for _, state := range matches {
-		s.Activate(state)
-	}
+	s.activateBatch(matches)
 	return len(matches)
 }
 
@@ -1252,10 +1465,64 @@ func (s *Scheduler) ActivateMatchesRange(data []byte, from, to int) int {
 		return 0
 	}
 	matches := s.Program.FindMatchesRange(data, from, to)
-	for _, state := range matches {
-		s.Activate(state)
-	}
+	s.activateBatch(matches)
 	return len(matches)
+}
+
+// activateBatch 批量激活状态：先在批内压缩键，再补齐 active 表并把整批
+// 状态一次性并入队列。等价于逐个 Activate，但队列只压缩一次。
+func (s *Scheduler) activateBatch(states []State) {
+	if s == nil || len(states) == 0 {
+		return
+	}
+	if s.active == nil {
+		s.active = make(map[[2]uint64]State)
+	}
+	batch := make([]State, 0, len(states))
+	index := make(map[[2]uint64]int, len(states))
+	for _, state := range states {
+		if state.Validate() != nil {
+			continue
+		}
+		key := stateKey(state)
+		if position, exists := index[key]; exists {
+			if state.Priority < batch[position].Priority {
+				batch[position] = state
+			}
+			continue
+		}
+		index[key] = len(batch)
+		batch = append(batch, state)
+	}
+	pending := batch[:0]
+	for _, state := range batch {
+		key := stateKey(state)
+		if existing, ok := s.active[key]; ok {
+			if existing.Priority <= state.Priority {
+				continue
+			}
+			// 更低优先级的状态会替换既有待执行项，需要先移除旧队列项。
+			s.Queue.remove(existing)
+		}
+		s.active[key] = state
+		pending = append(pending, state)
+	}
+	if len(pending) == 0 {
+		return
+	}
+	s.Queue.PushAll(pending)
+	s.enforcePendingLimit()
+}
+
+// enforcePendingLimit 按 maxPending 截断队列尾巴并同步 active 表。
+func (s *Scheduler) enforcePendingLimit() {
+	if s == nil || s.maxPending <= 0 || s.Queue.Len() <= s.maxPending {
+		return
+	}
+	for _, dropped := range s.Queue.items[s.maxPending:] {
+		delete(s.active, stateKey(dropped))
+	}
+	s.Queue.items = s.Queue.items[:s.maxPending]
 }
 
 // ActivateStateAt 将角色命中按输入绝对偏移激活，并返回是否新增状态。

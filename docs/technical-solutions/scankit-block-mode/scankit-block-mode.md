@@ -8,7 +8,7 @@
 > 范围：Go 后端库（Block Mode）  
 > 最后更新：2026-08-29  
 > 实施阻塞项：无（Q-001～Q-005 均已确认；`.codex/vectorscan` 仅作源码参考）  
-> 技术栈：Go 1.26（公开 API 与实现）、标准库 `regexp/syntax` 仅可用于对照测试；自有 Parser/IR/Engine、`go:build` 架构分派、可选 Go assembly；测试使用 `testing`/fuzz/benchmark；仓库内 `.codex/vectorscan` 源码、头文件、现有测试和工具仅作实现参考，不编译/运行其代码，不做 Go 包装  
+> 技术栈：Go 1.27（公开 API 与实现）、标准库 `regexp/syntax` 仅可用于对照测试；自有 Parser/IR/Engine、`go:build` 架构分派、可选 Go assembly；测试使用 `testing`/fuzz/benchmark；仓库内 `.codex/vectorscan` 源码、头文件、现有测试和工具仅作实现参考，不编译/运行其代码，不做 Go 包装
 > 实现验证：[`scankit-block-mode.verify.md`](./scankit-block-mode.verify.md)
 
 ## 1. 背景与目标

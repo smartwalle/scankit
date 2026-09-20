@@ -15,7 +15,7 @@ TEXT ·nativeEqualByteMask(SB), NOSPLIT, $0-18
 	RET
 
 // SSE2 双向量比较掩码实现。
-TEXT ·nativeEqualMask(SB), NOSPLIT, $0-24
+TEXT ·nativeEqualMask(SB), NOSPLIT, $0-18
 	MOVQ a+0(FP), AX
 	MOVQ b+8(FP), CX
 	MOVOU (AX), X0
@@ -26,7 +26,7 @@ TEXT ·nativeEqualMask(SB), NOSPLIT, $0-24
 	RET
 
 // AVX2 双向量比较掩码实现。
-TEXT ·nativeEqualMaskAVX2(SB), NOSPLIT, $0-24
+TEXT ·nativeEqualMaskAVX2(SB), NOSPLIT, $0-18
 	MOVQ a+0(FP), AX
 	MOVQ b+8(FP), CX
 	VMOVDQU (AX), X0

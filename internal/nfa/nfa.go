@@ -221,6 +221,34 @@ func (p *Program) HasReports() bool {
 	return false
 }
 
+// ReportIDs 返回图中报告节点携带的报告编号，升序去重。
+// NFA 通用执行器在每个报告节点经过时暂存编号，
+// 这里的快照用于与 DFA 后端做报告集合一致性校验。
+func (p *Program) ReportIDs() []uint32 {
+	if p == nil || p.Graph == nil {
+		return nil
+	}
+	ids := make([]uint32, 0, len(p.Graph.Nodes))
+	for _, id := range p.Graph.NodeIDs() {
+		node := p.Graph.Nodes[id]
+		if node == nil || node.Kind != nfagraph.KindReport || node.ReportID == 0 {
+			continue
+		}
+		ids = append(ids, node.ReportID)
+	}
+	if len(ids) < 2 {
+		return ids
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	out := ids[:1]
+	for _, id := range ids[1:] {
+		if id != out[len(out)-1] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // HasUnicode 判断图中是否包含 Unicode 字符类。
 func (p *Program) HasUnicode() bool {
 	if p == nil || p.Graph == nil {

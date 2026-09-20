@@ -671,3 +671,31 @@ func (p *Program) StateCount() int {
 	}
 	return 0
 }
+
+// ReportIDs 返回后端携带的报告编号快照，升序去重。
+// DFA 取确定化阶段传播到接受状态的报告，NFA 取图中的报告节点。
+func (p *Program) ReportIDs() []uint32 {
+	if p == nil {
+		return nil
+	}
+	if p.DFA != nil {
+		return p.DFA.AcceptReportIDs()
+	}
+	if p.NFA != nil {
+		return p.NFA.ReportIDs()
+	}
+	return nil
+}
+
+// HasEODReports 判断后端是否存在只在数据末尾触发的报告。
+// 这类报告不能在普通偏移直接上报，调用方需要保留末尾求值路径。
+func (p *Program) HasEODReports() bool {
+	if p == nil {
+		return false
+	}
+	if p.DFA != nil {
+		return p.DFA.HasEODReports()
+	}
+	// NFA 通用执行器在断言处判定数据末尾，无需额外的末尾报告标记。
+	return false
+}

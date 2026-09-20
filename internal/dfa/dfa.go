@@ -14,6 +14,7 @@ import (
 	"github.com/smartwalle/scankit/internal/graph"
 	"github.com/smartwalle/scankit/internal/nfa"
 	"github.com/smartwalle/scankit/internal/nfagraph"
+	"github.com/smartwalle/scankit/internal/parser"
 )
 
 const version = 3
@@ -23,9 +24,15 @@ var ErrStateLimit = errors.New("dfa state limit exceeded")
 var ErrMemoryLimit = errors.New("dfa memory limit exceeded")
 
 type State struct {
-	ID          uint32
-	Nodes       []graph.Vertex
-	Accept      bool
+	ID     uint32
+	Nodes  []graph.Vertex
+	Accept bool
+	// Reports 保存本状态在任意位置即可触发的报告编号，按升序去重。
+	// 与底层图上的报告节点一一对应，供确定化后在当前偏移直接上报。
+	Reports []uint32 `json:"reports,omitempty"`
+	// ReportsEOD 保存本状态只在数据末尾（EOD）触发的报告编号，按升序去重。
+	// 这些编号来自必须经过末尾断言才能到达的报告节点。
+	ReportsEOD  []uint32 `json:"reports_eod,omitempty"`
 	Transitions map[byte]uint32
 }
 
@@ -83,6 +90,37 @@ func (p *Program) Validate() error {
 		}
 		if accept != state.Accept {
 			return fmt.Errorf("dfa state acceptance mismatch")
+		}
+		if err := validateReportSet("reports", state.Reports, false); err != nil {
+			return err
+		}
+		if err := validateReportSet("reports_eod", state.ReportsEOD, false); err != nil {
+			return err
+		}
+		for _, id := range state.ReportsEOD {
+			if index := sort.Search(len(state.Reports), func(i int) bool { return state.Reports[i] >= id }); index < len(state.Reports) && state.Reports[index] == id {
+				return fmt.Errorf("dfa state reports overlap for id %d", id)
+			}
+		}
+		// 报告编号必须能追溯到本状态节点集合中的报告节点，
+		// 避免篡改后的状态表携带无法解释的报告。
+		if len(state.Reports) != 0 || len(state.ReportsEOD) != 0 {
+			available := make(map[uint32]struct{}, len(state.Nodes))
+			for _, nodeID := range state.Nodes {
+				if node := p.Graph.Nodes[nodeID]; node != nil && node.ReportID != 0 {
+					available[node.ReportID] = struct{}{}
+				}
+			}
+			for _, id := range state.Reports {
+				if _, ok := available[id]; !ok {
+					return fmt.Errorf("dfa state reports untraceable report id %d", id)
+				}
+			}
+			for _, id := range state.ReportsEOD {
+				if _, ok := available[id]; !ok {
+					return fmt.Errorf("dfa state eod reports untraceable report id %d", id)
+				}
+			}
 		}
 		if len(state.Nodes) == 0 {
 			if state.Accept {
@@ -154,6 +192,80 @@ func sameVertices(a, b []graph.Vertex) bool {
 		}
 	}
 	return true
+}
+
+// validateReportSet 校验报告编号列表按升序严格去重且不含零值占位。
+func validateReportSet(field string, ids []uint32, allowZero bool) error {
+	for i, id := range ids {
+		if id == 0 && !allowZero {
+			return fmt.Errorf("dfa state %s contains zero report id", field)
+		}
+		if i > 0 && ids[i-1] >= id {
+			return fmt.Errorf("dfa state %s is not sorted or unique", field)
+		}
+	}
+	return nil
+}
+
+// reportIDsOf 收集节点集合中可直接触发的报告编号，并区分末尾断言之后才可见的部分。
+// 只有接受状态的节点集合会携带报告：报告节点必须与接受节点同处一个闭包，
+// 才会在某个偏移真正触发，这一点与源码级确定化的接受状态报告语义一致。
+// 返回值保证升序去重，且两个集合互不重叠。
+func reportIDsOf(g *nfagraph.Graph, nodes []graph.Vertex, eodGuarded map[graph.Vertex]bool) (reports, reportsEOD []uint32) {
+	if g == nil {
+		return nil, nil
+	}
+	for _, id := range nodes {
+		node := g.Nodes[id]
+		if node == nil || node.ReportID == 0 {
+			continue
+		}
+		if eodGuarded[id] {
+			reportsEOD = append(reportsEOD, node.ReportID)
+			continue
+		}
+		reports = append(reports, node.ReportID)
+	}
+	reports = compactReports(reports)
+	reportsEOD = compactReports(reportsEOD)
+	reportsEOD = subtractReports(reportsEOD, reports)
+	return reports, reportsEOD
+}
+
+// compactReports 就地排序去重报告编号，保持升序不变式。
+func compactReports(ids []uint32) []uint32 {
+	if len(ids) < 2 {
+		return ids
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	write := 1
+	for _, id := range ids[1:] {
+		if id == ids[write-1] {
+			continue
+		}
+		ids[write] = id
+		write++
+	}
+	return ids[:write]
+}
+
+// subtractReports 从有序集合中移除另一个有序集合包含的编号。
+func subtractReports(ids, remove []uint32) []uint32 {
+	if len(ids) == 0 || len(remove) == 0 {
+		return ids
+	}
+	out := ids[:0]
+	index := 0
+	for _, id := range ids {
+		for index < len(remove) && remove[index] < id {
+			index++
+		}
+		if index < len(remove) && remove[index] == id {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
 }
 
 // Dump 序列化确定性程序及其图。
@@ -276,6 +388,11 @@ func (p *Program) MemoryBytes() uint64 {
 			return ^uint64(0)
 		}
 		total += nodes * 8
+		reports := uint64(len(state.Reports) + len(state.ReportsEOD))
+		if reports > (^uint64(0)-total)/4 {
+			return ^uint64(0)
+		}
+		total += reports * 4
 	}
 	if len(p.dense) == 0 {
 		return total
@@ -303,9 +420,9 @@ func (p *Program) AcceptStates() []uint32 {
 // AcceptCount 返回接受状态数量。
 func (p *Program) AcceptCount() int { return len(p.AcceptStates()) }
 
-// AcceptReportIDs 收集所有接受状态关联的 ReportID 列表（去重）。
-// 与 DFA Report/SOM/EOD 传播配套使用：底图 nfagraph.Node 携带 ReportID，
-// DFA 接受态接受对应 NFA 节点集合，此处把它们汇集为编译期可追溯的稳定列表。
+// AcceptReportIDs 收集所有接受状态关联的报告编号，升序去重。
+// 报告编号在确定化阶段就已按底层图节点传播到各状态，
+// 这里只做跨状态汇总，保证编译期可追溯的报告集合稳定有序。
 func (p *Program) AcceptReportIDs() []uint32 {
 	if p == nil {
 		return nil
@@ -316,32 +433,61 @@ func (p *Program) AcceptReportIDs() []uint32 {
 		if !state.Accept {
 			continue
 		}
-		for _, nfaID := range state.Nodes {
-			if state.Nodes == nil {
-				break
-			}
-			n := p.Graph.Nodes[nfaID]
-			if n == nil || n.ReportID == 0 {
+		for _, id := range state.Reports {
+			if _, ok := seen[id]; ok {
 				continue
 			}
-			if _, ok := seen[n.ReportID]; ok {
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+		for _, id := range state.ReportsEOD {
+			if _, ok := seen[id]; ok {
 				continue
 			}
-			seen[n.ReportID] = struct{}{}
-			out = append(out, n.ReportID)
+			seen[id] = struct{}{}
+			out = append(out, id)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
 }
 
-// HasReports 报告 DFA 程序是否在图节点上携带非零 ReportID，
-// 用于编译期确定是否启用 ReportManager 路径。
+// ReportsFor 返回指定状态在当前偏移可触发的报告编号快照。
+func (p *Program) ReportsFor(state uint32) []uint32 {
+	if p == nil || int(state) >= len(p.States) {
+		return nil
+	}
+	return append([]uint32(nil), p.States[state].Reports...)
+}
+
+// EODReportsFor 返回指定状态仅在数据末尾可触发的报告编号快照。
+func (p *Program) EODReportsFor(state uint32) []uint32 {
+	if p == nil || int(state) >= len(p.States) {
+		return nil
+	}
+	return append([]uint32(nil), p.States[state].ReportsEOD...)
+}
+
+// HasReports 报告 DFA 程序是否存在任意位置可触发的报告。
 func (p *Program) HasReports() bool {
-	if p == nil || p.Graph == nil {
+	if p == nil {
 		return false
 	}
-	for _, n := range p.Graph.Nodes {
-		if n != nil && n.ReportID != 0 {
+	for i := range p.States {
+		if len(p.States[i].Reports) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// HasEODReports 报告 DFA 程序是否存在仅在数据末尾触发的报告。
+func (p *Program) HasEODReports() bool {
+	if p == nil {
+		return false
+	}
+	for i := range p.States {
+		if len(p.States[i].ReportsEOD) != 0 {
 			return true
 		}
 	}
@@ -718,7 +864,14 @@ func (p *Program) Clone() *Program {
 func cloneStates(states []State) []State {
 	out := make([]State, len(states))
 	for i, s := range states {
-		out[i] = State{ID: s.ID, Nodes: append([]graph.Vertex(nil), s.Nodes...), Accept: s.Accept, Transitions: make(map[byte]uint32, len(s.Transitions))}
+		out[i] = State{
+			ID:          s.ID,
+			Nodes:       append([]graph.Vertex(nil), s.Nodes...),
+			Accept:      s.Accept,
+			Reports:     append([]uint32(nil), s.Reports...),
+			ReportsEOD:  append([]uint32(nil), s.ReportsEOD...),
+			Transitions: make(map[byte]uint32, len(s.Transitions)),
+		}
 		for b, to := range s.Transitions {
 			out[i].Transitions[b] = to
 		}
@@ -829,6 +982,7 @@ func DeterminizeWithOptions(g *nfagraph.Graph, options CompileOptions) ([]State,
 	states := []State{}
 	index := map[string]uint32{}
 	byteTable := options.Dense || byteTableCompatible(g)
+	eodGuarded := eodGuardedNodes(g)
 	add := func(nodes []graph.Vertex) (uint32, bool, error) {
 		key := stateKey(nodes)
 		if id, ok := index[key]; ok {
@@ -854,6 +1008,9 @@ func DeterminizeWithOptions(g *nfagraph.Graph, options CompileOptions) ([]State,
 				state.Accept = true
 				break
 			}
+		}
+		if state.Accept {
+			state.Reports, state.ReportsEOD = reportIDsOf(g, nodes, eodGuarded)
 		}
 		states = append(states, state)
 		index[key] = id
@@ -941,6 +1098,80 @@ func move(g *nfagraph.Graph, nodes []graph.Vertex, b byte) []graph.Vertex {
 func consuming(n *nfagraph.Node) bool {
 	return n.Kind == nfagraph.KindLiteral || n.Kind == nfagraph.KindClass
 }
+
+// isEODAssertion 判断断言是否只在数据末尾成立。
+func isEODAssertion(kind parser.AssertionKind) bool {
+	switch kind {
+	case parser.End, parser.EndAbsolute, parser.EndBeforeFinalNewline:
+		return true
+	default:
+		return false
+	}
+}
+
+// eodGuardedNodes 返回只能经过末尾断言到达的节点集合。
+// 该集合用于把报告划分到“任意位置触发”和“仅在数据末尾触发”两类，
+// 与底层图上的末尾断言保持一致。
+func eodGuardedNodes(g *nfagraph.Graph) map[graph.Vertex]bool {
+	if g == nil || g.Flow == nil {
+		return nil
+	}
+	// 绝大多数图不含末尾断言，这里先做一次廉价扫描，避免为普通图分配可达集合。
+	hasEOD := false
+	hasReports := false
+	for _, node := range g.Nodes {
+		if node == nil {
+			continue
+		}
+		if node.ReportID != 0 {
+			hasReports = true
+		}
+		if node.Kind == nfagraph.KindAssertion && isEODAssertion(node.Assertion) {
+			hasEOD = true
+		}
+	}
+	if !hasEOD || !hasReports {
+		return nil
+	}
+	reachable := map[graph.Vertex]bool{g.Start: true}
+	queue := []graph.Vertex{g.Start}
+	for len(queue) > 0 {
+		vertex := queue[0]
+		queue = queue[1:]
+		for _, next := range g.Flow.Successors(vertex) {
+			if reachable[next] {
+				continue
+			}
+			reachable[next] = true
+			queue = append(queue, next)
+		}
+	}
+	// 不经过末尾断言可达的节点集合，从全量可达集合中排除后即为末尾受控节点。
+	plain := map[graph.Vertex]bool{g.Start: true}
+	queue = append(queue[:0], g.Start)
+	for len(queue) > 0 {
+		vertex := queue[0]
+		queue = queue[1:]
+		for _, next := range g.Flow.Successors(vertex) {
+			if plain[next] {
+				continue
+			}
+			if node := g.Nodes[next]; node != nil && node.Kind == nfagraph.KindAssertion && isEODAssertion(node.Assertion) {
+				continue
+			}
+			plain[next] = true
+			queue = append(queue, next)
+		}
+	}
+	out := make(map[graph.Vertex]bool)
+	for vertex := range reachable {
+		if !plain[vertex] {
+			out[vertex] = true
+		}
+	}
+	return out
+}
+
 func matchesByte(n *nfagraph.Node, b byte) bool {
 	switch n.Kind {
 	case nfagraph.KindLiteral:
@@ -1057,11 +1288,19 @@ func Minimize(g *nfagraph.Graph) (*Program, error) {
 	if err != nil || !p.ByteTable || len(p.States) < 2 {
 		return p, err
 	}
+	// 初始划分必须区分报告行为：报告集合不同的接受状态不能合并，
+	// 否则最小化会丢失某个状态本应触发的报告。
 	part := make([]int, len(p.States))
+	initial := map[string]int{}
 	for i, state := range p.States {
-		if state.Accept {
-			part[i] = 1
+		key := reportPartitionKey(state)
+		if id, ok := initial[key]; ok {
+			part[i] = id
+			continue
 		}
+		id := len(initial)
+		initial[key] = id
+		part[i] = id
 	}
 	for {
 		groups := map[string]int{}
@@ -1107,6 +1346,8 @@ func Minimize(g *nfagraph.Graph) (*Program, error) {
 	for old, group := range part {
 		states[group].ID = uint32(group)
 		states[group].Accept = states[group].Accept || p.States[old].Accept
+		states[group].Reports = mergeReports(states[group].Reports, p.States[old].Reports)
+		states[group].ReportsEOD = mergeReports(states[group].ReportsEOD, p.States[old].ReportsEOD)
 		states[group].Nodes = append(states[group].Nodes, p.States[old].Nodes...)
 		for b, to := range p.States[old].Transitions {
 			states[group].Transitions = ensureTransitionMap(states[group].Transitions)
@@ -1116,6 +1357,7 @@ func Minimize(g *nfagraph.Graph) (*Program, error) {
 	for i := range states {
 		sort.Slice(states[i].Nodes, func(left, right int) bool { return states[i].Nodes[left] < states[i].Nodes[right] })
 		states[i].Nodes = compactVertices(states[i].Nodes)
+		states[i].ReportsEOD = subtractReports(states[i].ReportsEOD, states[i].Reports)
 	}
 	out := &Program{Program: p.Program, States: states, Start: uint32(part[p.Start]), ByteTable: true, Minimized: true}
 	out.rebuildDense()
@@ -1181,6 +1423,34 @@ func maxPart(values []int) int {
 		}
 	}
 	return max
+}
+
+// reportPartitionKey 生成最小化初始划分键，把接受标记和报告集合一起编码。
+func reportPartitionKey(state State) string {
+	var key strings.Builder
+	if state.Accept {
+		key.WriteByte('A')
+	} else {
+		key.WriteByte('N')
+	}
+	for _, id := range state.Reports {
+		key.WriteByte('|')
+		key.WriteString(strconv.FormatUint(uint64(id), 10))
+	}
+	key.WriteByte(';')
+	for _, id := range state.ReportsEOD {
+		key.WriteByte('|')
+		key.WriteString(strconv.FormatUint(uint64(id), 10))
+	}
+	return key.String()
+}
+
+// mergeReports 合并两个按升序排列的报告集合，返回升序去重结果。
+func mergeReports(current, add []uint32) []uint32 {
+	if len(add) == 0 {
+		return current
+	}
+	return compactReports(append(current, add...))
 }
 
 func ensureTransitionMap(in map[byte]uint32) map[byte]uint32 {

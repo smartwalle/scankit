@@ -1,0 +1,42 @@
+#include "textflag.h"
+
+// NEON 预编译字节集合判定。
+//
+// 输入窗口按高半字节 h 与低半字节 l 拆分，用两次 TBL 分别取出该行的低/高 8 位成员图，
+// 再按 l 的高位选择、用 USHL 生成位选掩码，最后用 CMTST 得到逐字节命中结果。
+TEXT ·nativeByteSetMask(SB), NOSPLIT, $0-18
+	MOVD v+0(FP), R0
+	MOVD tables+8(FP), R1
+	MOVD $0x0f, R2
+	MOVD $0x07, R3
+	MOVD $0x08, R4
+	MOVD $0x01, R5
+	VDUP R2, V11.B16
+	VDUP R3, V12.B16
+	VDUP R4, V13.B16
+	VDUP R5, V14.B16
+	VLD1 (R0), [V2.B16]
+	VLD1 (R1), [V0.B16]
+	ADD $16, R1, R6
+	VLD1 (R6), [V1.B16]
+	VUSHR $4, V2.B16, V3.B16
+	VAND V11.B16, V2.B16, V4.B16
+	VTBL V3.B16, [V0.B16], V5.B16
+	VTBL V3.B16, [V1.B16], V6.B16
+	VCMHS V13.B16, V4.B16, V7.B16
+	VBSL V5.B16, V6.B16, V7.B16
+	VAND V12.B16, V4.B16, V8.B16
+	VUSHL V8.B16, V14.B16, V9.B16
+	VCMTST V9.B16, V7.B16, V10.B16
+	VUSHR $7, V10.B16, V10.B16
+	VMOV V10.D[0], R2
+	VMOV V10.D[1], R3
+	MOVD $0x0102040810204080, R4
+	MUL R4, R2, R2
+	MUL R4, R3, R3
+	LSR $56, R2, R2
+	LSR $56, R3, R3
+	LSL $8, R3, R3
+	ORR R3, R2, R2
+	MOVH R2, ret+16(FP)
+	RET

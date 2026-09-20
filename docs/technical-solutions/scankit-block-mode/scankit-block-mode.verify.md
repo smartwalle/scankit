@@ -5,7 +5,7 @@
 > 对应技术方案：[`scankit-block-mode.md`](./scankit-block-mode.md)  
 > 功能模块：`scankit-block-mode`  
 > 文档状态：草案  
-> 验证环境：Go 1.26 本地/CI 环境；直接运行 Go 测试，不依赖 Oracle、wrapper、Docker 或 CGo  
+> 验证环境：Go 1.27 本地/CI 环境；直接运行 Go 测试，不依赖 Oracle、wrapper、Docker 或 CGo
 > 最后更新：2026-09-01
 
 ## 1. 前置条件与测试数据

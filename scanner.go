@@ -132,6 +132,9 @@ type compiledRule struct {
 	hasBackref bool
 	// hasConditional 缓存 containsConditional 的结果。
 	hasConditional bool
+	// eodReports 缓存后端是否携带只在数据末尾触发的报告，
+	// 避免每个起点重新遍历状态表。
+	eodReports bool
 }
 
 func newScanner(rules []compiledRule) *Scanner {
@@ -144,6 +147,7 @@ func newScanner(rules []compiledRule) *Scanner {
 		copyRules[i].nonGreedy = firstRepeatPreference(copyRules[i].root)
 		copyRules[i].hasBackref = containsBackreference(copyRules[i].root)
 		copyRules[i].hasConditional = containsConditional(copyRules[i].root)
+		copyRules[i].eodReports = copyRules[i].program != nil && copyRules[i].program.HasEODReports()
 	}
 	index := make(map[uint32]int, len(copyRules))
 	order := make(map[uint32]int, len(copyRules))
@@ -344,6 +348,7 @@ func (scanner *Scanner) buildRoseProgram() *rose.Program {
 			roles = append(roles, role)
 		}
 	}
+	roles = dedupeRoseRoles(roles)
 	if len(roles) == 0 {
 		return nil
 	}
@@ -361,6 +366,35 @@ func (scanner *Scanner) buildRoseProgram() *rose.Program {
 		return nil
 	}
 	return program
+}
+
+// dedupeRoseRoles 合并候选扫描完全等价的角色：这些角色在相同输入上产生
+// 完全相同的候选与报告，重复扫描只会浪费确认开销。
+// 等价角色之间按扫描代价挑选代表，代价相同则保留编号更小的角色，
+// 保证程序构建结果稳定。
+func dedupeRoseRoles(roles []rose.Role) []rose.Role {
+	if len(roles) < 2 {
+		return roles
+	}
+	out := make([]rose.Role, 0, len(roles))
+	for _, role := range roles {
+		merged := false
+		for i := range out {
+			if !out[i].ScanEquivalent(role) {
+				continue
+			}
+			weight, existing := role.Weight(), out[i].Weight()
+			if weight < existing || (weight == existing && role.ID < out[i].ID) {
+				out[i] = role
+			}
+			merged = true
+			break
+		}
+		if !merged {
+			out = append(out, role)
+		}
+	}
+	return out
 }
 
 func roseLiteralAlternatives(n parser.Node) ([]parser.Node, bool) {
@@ -491,8 +525,9 @@ func (scanner *Scanner) scanRoseInto(data []byte, dst []Match) []Match {
 		// 否则第一个分支会吞掉后续分支的确认结果。
 		if !ok || !role.MatchAt(data, int(event.From)) {
 			ok = false
-			for _, candidate := range program.RolesCopy() {
-				if candidate.ReportID == event.ID && candidate.MatchAt(data, int(event.From)) {
+			// 同一报告编号可能对应多个角色候选，按扫描代价从低到高选出真正命中的代表。
+			for _, candidate := range program.RolesForReport(event.ID) {
+				if candidate.MatchAt(data, int(event.From)) {
 					role, ok = candidate, true
 					break
 				}
@@ -695,6 +730,11 @@ func (scanner *Scanner) clone() *Scanner {
 // backendEligible 判断规则是否可以直接使用已编译后端完成单次扫描。
 func backendEligible(rule compiledRule) bool {
 	if rule.program == nil || rule.repeat != nil || rule.comb != nil || rule.ext != nil || rule.containsAny || rule.requiresEndOfData || rule.flags&FlagSOMLeftmost != 0 {
+		return false
+	}
+	// 末尾报告只能在数据末尾触发，字节状态表的普通匹配会提前误报，
+	// 因此保留 AST 确认路径。
+	if rule.program.HasEODReports() {
 		return false
 	}
 	if _, _, fixed := parser.FixedWidth(rule.root); !fixed {
@@ -1603,7 +1643,7 @@ func matchRuleInto(rule compiledRule, data []byte, start int, endsBuf []int) []i
 			return dedup(out)
 		}
 	}
-	if rule.program != nil && !rule.info.RequiresStatefulRuntime() && rule.flags&(FlagCaseless|FlagUTF8|FlagUCP|FlagMultiline|FlagDotAll) == 0 && !containsAny(rule.root) {
+	if rule.program != nil && !rule.eodReports && !rule.info.RequiresStatefulRuntime() && rule.flags&(FlagCaseless|FlagUTF8|FlagUCP|FlagMultiline|FlagDotAll) == 0 && !containsAny(rule.root) {
 		return rule.program.MatchAt(data, start)
 	}
 	return matchNode(rule.root, data, start, rule.flags)

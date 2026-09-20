@@ -292,15 +292,37 @@ func DefaultRegistry() *Registry {
 	return r
 }
 
-var defaultBackendRegistry = DefaultRegistry()
+var defaultBackendRegistry = defaultRegistryFromEnv()
 var detectedBackend = struct {
 	sync.Once
 	value simd.Backend
 }{}
 
+// defaultRegistryFromEnv 返回应用环境覆盖后的默认注册表。
+// 环境配置非法时保留完整注册表，继续使用安全回退而不是改变默认行为。
+func defaultRegistryFromEnv() *Registry {
+	r := DefaultRegistry()
+	overrides, err := ParseEnvOverrides(nil)
+	if err != nil {
+		return r
+	}
+	overrides.Apply(r)
+	return r
+}
+
 // DefaultBackend 返回当前主机的稳定后端实例。能力探测只执行一次，避免每次扫描重复读取 CPU 状态。
+// 环境覆盖会同时作用于注册表禁用项和调优族裁剪后的能力集合。
 func DefaultBackend() simd.Backend {
-	detectedBackend.Do(func() { detectedBackend.value = SelectBackend(Detect()) })
+	if backend := BackendOverride(); backend != nil {
+		return backend
+	}
+	detectedBackend.Do(func() {
+		features := Detect()
+		if overrides, err := ParseEnvOverrides(nil); err == nil {
+			features = overrides.ApplyFeatures(features)
+		}
+		detectedBackend.value = SelectBackend(features)
+	})
 	return detectedBackend.value
 }
 

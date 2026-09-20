@@ -161,6 +161,9 @@ func reverseGraph(g *nfagraph.Graph) (*nfagraph.Graph, error) {
 	out := g.Clone()
 	oldStart := g.Start
 	accepts := g.Accepts()
+	// 反向重排会把原图中的报告节点移到起点一侧，语义上不再对应接受位置；
+	// 这里先收集前向接受集合的报告编号，再统一在反向接受节点上重建。
+	reports := reverseAcceptReports(g)
 	out.Flow = g.Flow.Reverse()
 	maxID := graph.Vertex(0)
 	for _, id := range out.NodeIDs() {
@@ -179,6 +182,7 @@ func reverseGraph(g *nfagraph.Graph) (*nfagraph.Graph, error) {
 		}
 	}
 	for _, node := range out.Nodes {
+		node.ReportID = 0
 		if node.Kind != nfagraph.KindLiteral || len(node.Literal) < 2 {
 			continue
 		}
@@ -187,13 +191,43 @@ func reverseGraph(g *nfagraph.Graph) (*nfagraph.Graph, error) {
 		}
 	}
 	out.AddNode(nfagraph.Node{ID: newStart, Kind: nfagraph.KindStart})
-	out.AddNode(nfagraph.Node{ID: newAccept, Kind: nfagraph.KindAccept})
 	out.Start = newStart
 	for _, id := range accepts {
 		out.AddEdge(newStart, id)
 	}
-	out.AddEdge(oldStart, newAccept)
+	if len(reports) == 0 {
+		out.AddNode(nfagraph.Node{ID: newAccept, Kind: nfagraph.KindAccept})
+		out.AddEdge(oldStart, newAccept)
+	} else {
+		// 每个报告编号对应一个反向接受节点，确定化后落在同一接受状态上，
+		// 使反向程序的接受报告集合与前向保持一致。
+		for offset, report := range reports {
+			nodeID := newAccept + graph.Vertex(offset)
+			out.AddNode(nfagraph.Node{ID: nodeID, Kind: nfagraph.KindAccept, ReportID: report})
+			out.AddEdge(oldStart, nodeID)
+		}
+	}
 	return out, out.Validate()
+}
+
+// reverseAcceptReports 复用确定化阶段计算出的接受状态报告集合，
+// 保证反向确认与前向确认使用完全相同的报告编号。
+func reverseAcceptReports(g *nfagraph.Graph) []uint32 {
+	// 与 Compile 保持一致，先展开多字节文字节点再做确定化，
+	// 否则未展开图上的多字节节点不会被消费，报告集合会偏小。
+	states, err := Determinize(nfagraph.ExpandLiterals(g), 0)
+	if err != nil {
+		return nil
+	}
+	ids := make([]uint32, 0, len(states))
+	for i := range states {
+		if !states[i].Accept {
+			continue
+		}
+		ids = append(ids, states[i].Reports...)
+		ids = append(ids, states[i].ReportsEOD...)
+	}
+	return compactReports(ids)
 }
 
 // MatchReverseAt 返回恰好在 end 结束的匹配起点，结果按起点升序排列。

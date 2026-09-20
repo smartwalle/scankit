@@ -4,6 +4,7 @@ package noodle
 import (
 	"encoding/json"
 	"fmt"
+	"math/bits"
 	"sort"
 
 	"github.com/smartwalle/scankit/internal/dispatch"
@@ -22,12 +23,18 @@ type node struct {
 	terminal []hwlm.Literal
 }
 
-// Matcher 使用两棵前缀树分别处理大小写敏感和不敏感文字。
+// Matcher 使用两棵前缀树分别处理大小写敏感和不敏感文字，
+// 并用最多 4 个 lane 的字节掩码先在窗口级别筛选候选起点。
 type Matcher struct {
 	sensitive *node
 	folded    *node
 	literals  []hwlm.Literal
-	firstSet  [4]uint64
+	// laneSets 保存每个 lane 允许的候选字节集合，lane 0 即首字节集合。
+	laneSets [4][4]uint64
+	// tables 是 laneSets 的预编译形式，按 lane 连续存放供窗口热路径一次查表。
+	tables simd.ByteSetTables
+	// lanes 为实际启用的 lane 数，取值 1..4。
+	lanes int
 }
 
 const version = 1
@@ -61,26 +68,57 @@ func Load(data []byte) (*Matcher, error) {
 // New 构建前缀树匹配器。
 func New(literals []hwlm.Literal) *Matcher {
 	m := &Matcher{sensitive: &node{}, folded: &node{}, literals: hwlm.Deduplicate(literals)}
+	shortest := 0
 	for _, literal := range m.literals {
 		if len(literal.Value) == 0 {
 			continue
+		}
+		if shortest == 0 || len(literal.Value) < shortest {
+			shortest = len(literal.Value)
 		}
 		root := m.sensitive
 		if literal.CaseInsensitive {
 			root = m.folded
 		}
-		value := literal.Value[0]
-		m.firstSet[value/64] |= 1 << uint(value%64)
-		if literal.CaseInsensitive {
-			value = foldASCII(value)
-			m.firstSet[value/64] |= 1 << uint(value%64)
-			if swapped := swapASCII(value); swapped != value {
-				m.firstSet[swapped/64] |= 1 << uint(swapped%64)
-			}
-		}
 		insert(root, literal)
 	}
+	m.lanes = shortest
+	if m.lanes <= 0 {
+		m.lanes = 1
+	}
+	if m.lanes > len(m.laneSets) {
+		m.lanes = len(m.laneSets)
+	}
+	for _, literal := range m.literals {
+		for lane := 0; lane < m.lanes && lane < len(literal.Value); lane++ {
+			value := literal.Value[lane]
+			m.laneSets[lane][value/64] |= 1 << uint(value%64)
+			if !literal.CaseInsensitive {
+				continue
+			}
+			if swapped := swapASCII(value); swapped != value {
+				m.laneSets[lane][swapped/64] |= 1 << uint(swapped%64)
+			}
+		}
+	}
+	m.tables = simd.NewByteSetTables(m.laneSets)
 	return m
+}
+
+// Lanes 返回候选掩码实际使用的 lane 数。
+func (m *Matcher) Lanes() int {
+	if m == nil {
+		return 0
+	}
+	return m.lanes
+}
+
+// windowMask 返回窗口内可能成为候选起点的位置掩码。
+// 位置 i 的前 lanes 个字节必须分别命中对应 lane 集合；
+// 窗口尾部没有足够后继字节的位置退回首字节判定，避免漏报。
+// 一次调用覆盖整个超向量窗口，原生与标量实现的组合规则完全一致。
+func windowMask(backend simd.Backend, m *Matcher, data []byte, off int) (uint32, bool) {
+	return backend.WindowMask(data, off, &m.tables, m.lanes)
 }
 
 func insert(root *node, literal hwlm.Literal) {
@@ -116,23 +154,35 @@ func (m *Matcher) FindInto(data []byte, dst []Match) []Match {
 		out = appendMatchesAt(out, m.folded, data, from, true)
 	}
 	backend := dispatch.DefaultBackend()
-	const width = simd.SuperWidth / 2
-	for off := 0; off+width <= len(data); off += width {
-		vec, ok := backend.Load(data, off)
+	// 窗口宽度优先取整个宽窗口，剩余不足一个宽窗口时先用超向量窗口补齐，
+	// 最后再逐字节回退判定，三段区间互不重叠，保证每个偏移只判定一次。
+	off := 0
+	for ; off+simd.WideWidth <= len(data); off += simd.WideWidth {
+		mask, ok := backend.WindowMask64(data, off, &m.tables, m.lanes)
 		if !ok {
 			break
 		}
-		mask := backend.ByteSetMask(vec, m.firstSet)
 		for mask != 0 {
-			bit := trailingZeros16(mask)
+			bit := bits.TrailingZeros64(mask)
 			visit(off + bit)
 			mask &^= 1 << uint(bit)
 		}
 	}
-	for off := len(data) - len(data)%width; off < len(data); off++ {
+	if off+simd.SuperWidth <= len(data) {
+		if mask, ok := windowMask(backend, m, data, off); ok {
+			for mask != 0 {
+				bit := bits.TrailingZeros32(mask)
+				visit(off + bit)
+				mask &^= 1 << uint(bit)
+			}
+			off += simd.SuperWidth
+		}
+	}
+	for ; off < len(data); off++ {
 		value := data[off]
 		folded := foldASCII(value)
-		if m.firstSet[value/64]&(1<<uint(value%64)) != 0 || m.firstSet[folded/64]&(1<<uint(folded%64)) != 0 {
+		first := m.laneSets[0]
+		if first[value/64]&(1<<uint(value%64)) != 0 || first[folded/64]&(1<<uint(folded%64)) != 0 {
 			visit(off)
 		}
 	}
@@ -158,18 +208,6 @@ func (m *Matcher) FindInto(data []byte, dst []Match) []Match {
 		out = out[:write]
 	}
 	return out
-}
-
-func trailingZeros16(v uint16) int {
-	if v == 0 {
-		return 0
-	}
-	n := 0
-	for v&1 == 0 {
-		v >>= 1
-		n++
-	}
-	return n
 }
 
 func appendMatchesAt(out []Match, root *node, data []byte, from int, folded bool) []Match {

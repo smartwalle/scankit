@@ -11,6 +11,11 @@ type SuperVector struct {
 // SuperWidth 返回超向量可容纳的字节数。
 const SuperWidth = generic.Width * 2
 
+// WideWidth 返回宽窗口后端一次判定可容纳的字节数，为超向量窗口的两倍。
+// 256 位后端用它把两个 32 字节窗口合并成一次调用；512 位后端用它驱动
+// 单个 zmm 寄存器完成全部 64 字节判定。
+const WideWidth = SuperWidth * 2
+
 // LoadSuper 从指定位置加载完整超向量；数据不足时返回 false。
 func LoadSuper(data []byte, offset int) (SuperVector, bool) {
 	return LoadSuperWithBackend(GenericBackend{}, data, offset)

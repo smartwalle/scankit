@@ -14,7 +14,8 @@
 | Rose | `.codex/vectorscan/src/rose` | graph、matcher、scheduler、queue、catchup、miracle、infix/outfix、report |
 | SmallWrite | `.codex/vectorscan/src/smallwrite` | eligibility、program、runtime、dump |
 | SOM | `.codex/vectorscan/src/som` | slot、tracking、propagation、report |
-| SIMD / SuperVector | `.codex/vectorscan/src/util/supervector`、`src/*/x86`、`src/*/arm`、`simde` | 向量操作、平台分派、tail 和 fallback |
+| SIMD / SuperVector | `.codex/vectorscan/src/util/supervector`、`src/*/x86`、`src/*/arm`、`simde` | 向量操作、32 字节与 64 字节宽窗口掩码查表（SSSE3 半区拼接 / AVX2 256 位 / AVX512BW 与 VBMI 512 位 / NEON 合并）、512 位内核一次性自检、等值压缩、平台分派、tail 和 fallback |
+| Dispatch / CPU 探测 | `.codex/vectorscan/src/hs_platform.h`、`src/dispatcher.c` | 能力位、tune、运行时禁用与后端优先级 |
 | Public contract | `.codex/vectorscan/src/hs_compile.h`、`src/hs_runtime.h`、`src/database.h`、`src/scratch.h` | flags、错误、数据库、scratch、Block API 语义 |
 
 ## 使用规则

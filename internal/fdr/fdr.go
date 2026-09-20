@@ -49,6 +49,10 @@ type Matcher struct {
 	literals  []hwlm.Literal
 	sensitive automaton
 	folded    automaton
+	// sensitiveSet/foldedSet 是两棵自动机根状态的预编译首字节集合，
+	// 在构建期解析一次，供每次扫描的窗口跳过逻辑直接复用。
+	sensitiveSet simd.ByteSet
+	foldedSet    simd.ByteSet
 }
 
 // Validate 检查文字匹配器的编号和文字内容。
@@ -102,6 +106,8 @@ func New(literals []hwlm.Literal) *Matcher {
 	}
 	out.sensitive = buildAutomaton(out.literals, false)
 	out.folded = buildAutomaton(out.literals, true)
+	out.sensitiveSet = simd.NewByteSet(automatonRootSet(out.sensitive.nodes))
+	out.foldedSet = simd.NewByteSet(automatonRootSet(out.folded.nodes))
 	return out
 }
 func (m *Matcher) Len() int {
@@ -444,7 +450,7 @@ func (m *Matcher) FindInto(data []byte, dst []Match) []Match {
 		return dst[:0]
 	}
 	out := dst[:0]
-	appendMatches := func(nodes []acNode, folded bool) {
+	appendMatches := func(nodes []acNode, rootSet *simd.ByteSet, folded bool) {
 		if len(nodes) == 0 {
 			return
 		}
@@ -454,7 +460,7 @@ func (m *Matcher) FindInto(data []byte, dst []Match) []Match {
 			// 处于根状态时，整块不含首字节的输入不会改变状态，可安全跳过。
 			if state == 0 && offset+simd.SuperWidth/2 <= len(data) {
 				vector, ok := backend.Load(data, offset)
-				if ok && backend.ByteSetMask(vector, automatonRootSet(nodes)) == 0 {
+				if ok && backend.ByteSetMaskPrepared(vector, rootSet) == 0 {
 					offset += simd.SuperWidth/2 - 1
 					continue
 				}
@@ -470,8 +476,8 @@ func (m *Matcher) FindInto(data []byte, dst []Match) []Match {
 			}
 		}
 	}
-	appendMatches(m.sensitive.nodes, false)
-	appendMatches(m.folded.nodes, true)
+	appendMatches(m.sensitive.nodes, &m.sensitiveSet, false)
+	appendMatches(m.folded.nodes, &m.foldedSet, true)
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].From != out[j].From {
 			return out[i].From < out[j].From

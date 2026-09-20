@@ -190,6 +190,7 @@ type nibbleNFAProgram struct {
 	dead         []bool
 	sourceMask   [256][]uint64
 	firstMask    [4]uint64
+	firstTables  simd.ByteSetTables
 	acceptsEmpty bool
 	minBytes     int
 	maxBytes     int
@@ -348,7 +349,8 @@ func compileNibbleNFAWithMode(g *nfagraph.Graph, mode uint8) *nibbleNFAProgram {
 		return nil
 	}
 	start := index[g.Start]
-	p := &nibbleNFAProgram{states: states, start: start, closures: closures, nextClosure: make([][]int, len(states)), masks: make([][16]uint16, len(states)), accept: make([]bool, len(states)), dead: make([]bool, len(states)), firstMask: firstByteMask(g), mode: mode, prefix: requiredLiteralPrefix(g), backend: dispatch.DefaultBackend()}
+	p := &nibbleNFAProgram{states: states, start: start, closures: closures, nextClosure: make([][]int, len(states)), masks: make([][16]uint16, len(states)), accept: make([]bool, len(states)), dead: make([]bool, len(states)), firstMask: firstByteMask(g),
+		firstTables: simd.FirstByteTables(firstByteMask(g)), mode: mode, prefix: requiredLiteralPrefix(g), backend: dispatch.DefaultBackend()}
 	words := (len(states) + 63) / 64
 	for value := range p.sourceMask {
 		p.sourceMask[value] = make([]uint64, words)
@@ -889,7 +891,7 @@ func (p *nibbleNFAProgram) Spans(data []byte, limit int) []Span {
 	}
 	out := make([]Span, 0, initialSpanCapacity(data, limit))
 	endsBuf := make([]int, 0, 8)
-	forEachNFAStart(data, p.prefix, p.firstMask, p.acceptsEmpty, p.backend, func(start int) bool {
+	forEachNFAStart(data, p.prefix, p.firstMask, &p.firstTables, p.acceptsEmpty, p.backend, func(start int) bool {
 		ends, _, _ := p.matchAtBudgetUnchecked(data, start, 0, 0, endsBuf[:0])
 		endsBuf = ends
 		for _, end := range ends {
@@ -916,6 +918,7 @@ type rangeNFAProgram struct {
 	accept            []bool
 	dead              []bool
 	firstMask         [4]uint64
+	firstTables       simd.ByteSetTables
 	acceptsEmpty      bool
 	minBytes          int
 	maxBytes          int
@@ -1164,7 +1167,8 @@ func compileRangeNFA(g *nfagraph.Graph) *rangeNFAProgram {
 		return nil
 	}
 	start := index[g.Start]
-	p := &rangeNFAProgram{states: states, start: start, closures: closures, trans: make([][]rangeTransition, len(states)), transitionClosure: make([][][]int, len(states)), nextClosure: make([][]int, len(states)), masks: make([][4]uint64, len(states)), bucket: make([][256]int16, len(states)), accept: make([]bool, len(states)), dead: make([]bool, len(states)), firstMask: firstByteMask(g), prefix: requiredLiteralPrefix(g), backend: dispatch.DefaultBackend()}
+	p := &rangeNFAProgram{states: states, start: start, closures: closures, trans: make([][]rangeTransition, len(states)), transitionClosure: make([][][]int, len(states)), nextClosure: make([][]int, len(states)), masks: make([][4]uint64, len(states)), bucket: make([][256]int16, len(states)), accept: make([]bool, len(states)), dead: make([]bool, len(states)), firstMask: firstByteMask(g),
+		firstTables: simd.FirstByteTables(firstByteMask(g)), prefix: requiredLiteralPrefix(g), backend: dispatch.DefaultBackend()}
 	p.minBytes, p.maxBytes = graphLengthBounds(g)
 	for i := range p.bucket {
 		for value := range p.bucket[i] {
@@ -1529,7 +1533,7 @@ func (p *rangeNFAProgram) Spans(data []byte, limit int) []Span {
 	}
 	out := make([]Span, 0, initialSpanCapacity(data, limit))
 	endsBuf := make([]int, 0, 8)
-	forEachNFAStart(data, p.prefix, p.firstMask, p.acceptsEmpty, p.backend, func(start int) bool {
+	forEachNFAStart(data, p.prefix, p.firstMask, &p.firstTables, p.acceptsEmpty, p.backend, func(start int) bool {
 		ends, _, _ := p.matchAtBudgetUnchecked(data, start, 0, 0, endsBuf[:0])
 		endsBuf = ends
 		for _, end := range ends {
@@ -1557,6 +1561,7 @@ type sparseNFAProgram struct {
 	sourceMask     [256][]uint64
 	sourceCount    [256]uint16
 	firstMask      [4]uint64
+	firstTables    simd.ByteSetTables
 	acceptsEmpty   bool
 	minBytes       int
 	maxBytes       int
@@ -1815,7 +1820,8 @@ func compileSparseNFA(g *nfagraph.Graph) *sparseNFAProgram {
 	if closureBytes+saturatingMul(uint64(len(states)), 32) > maxLayoutMemory {
 		return nil
 	}
-	p := &sparseNFAProgram{states: states, start: index[g.Start], closures: closures, trans: make([]map[byte][]int, len(states)), accept: make([]bool, len(states)), classMask: make([][4]uint64, len(states)), literalClosure: make([][]int, len(states)), classClosure: make([][]int, len(states)), dead: make([]bool, len(states)), firstMask: firstByteMask(g), backend: dispatch.DefaultBackend()}
+	p := &sparseNFAProgram{states: states, start: index[g.Start], closures: closures, trans: make([]map[byte][]int, len(states)), accept: make([]bool, len(states)), classMask: make([][4]uint64, len(states)), literalClosure: make([][]int, len(states)), classClosure: make([][]int, len(states)), dead: make([]bool, len(states)), firstMask: firstByteMask(g),
+		firstTables: simd.FirstByteTables(firstByteMask(g)), backend: dispatch.DefaultBackend()}
 	words := (len(states) + 63) / 64
 	for value := range p.sourceMask {
 		p.sourceMask[value] = make([]uint64, words)
@@ -2193,7 +2199,7 @@ func (p *sparseNFAProgram) Spans(data []byte, limit int) []Span {
 	}
 	out := make([]Span, 0, initialSpanCapacity(data, limit))
 	endsBuf := make([]int, 0, 8)
-	forEachNFAStart(data, p.prefix, p.firstMask, p.acceptsEmpty, p.backend, func(start int) bool {
+	forEachNFAStart(data, p.prefix, p.firstMask, &p.firstTables, p.acceptsEmpty, p.backend, func(start int) bool {
 		ends, _, _ := p.matchAtBudgetUnchecked(data, start, 0, 0, endsBuf[:0])
 		endsBuf = ends
 		for _, end := range ends {
@@ -2548,6 +2554,7 @@ type lbrProgram struct {
 	queueLimit   int
 	queueBytes   uint64
 	firstMask    [4]uint64
+	firstTables  simd.ByteSetTables
 	acceptsEmpty bool
 	dead         map[graph.Vertex]bool
 	prefix       []byte
@@ -2991,7 +2998,7 @@ func (p *lbrProgram) Spans(data []byte, limit int) []Span {
 		return nil
 	}
 	out := make([]Span, 0, initialSpanCapacity(data, limit))
-	forEachNFAStart(data, p.prefix, p.firstMask, p.acceptsEmpty, dispatch.DefaultBackend(), func(start int) bool {
+	forEachNFAStart(data, p.prefix, p.firstMask, &p.firstTables, p.acceptsEmpty, dispatch.DefaultBackend(), func(start int) bool {
 		ends, _, _ := p.matchAtBudget(data, start, 0, 0)
 		for _, end := range ends {
 			out = append(out, Span{From: start, To: end})
@@ -3016,7 +3023,7 @@ func (p *lbrProgram) SpansInto(data []byte, limit int, dst []Span) []Span {
 		out = make([]Span, 0, initialSpanCapacity(data, limit))
 	}
 	endsBuf := make([]int, 0, 8)
-	forEachNFAStart(data, p.prefix, p.firstMask, p.acceptsEmpty, dispatch.DefaultBackend(), func(start int) bool {
+	forEachNFAStart(data, p.prefix, p.firstMask, &p.firstTables, p.acceptsEmpty, dispatch.DefaultBackend(), func(start int) bool {
 		ends, _, _ := p.matchAtBudgetInto(data, start, 0, 0, endsBuf[:0])
 		endsBuf = ends
 		for _, end := range ends {
@@ -3093,7 +3100,8 @@ func compileLBR(g *nfagraph.Graph) *lbrProgram {
 	if budget := int(maxLayoutMemory / lbrStateBytes); queueLimit > budget {
 		queueLimit = budget
 	}
-	p := &lbrProgram{graph: g, successors: successors, classMask: classMask, vertices: append([]graph.Vertex(nil), ids...), index: make(map[graph.Vertex]int, len(ids)), start: 0, kinds: make([]nfagraph.NodeKind, len(ids)), assertions: make([]parser.AssertionKind, len(ids)), literals: make([]byte, len(ids)), classMasks: make([][4]uint64, len(ids)), next: make([][]int, len(ids)), deadStates: make([]bool, len(ids)), queueLimit: queueLimit, queueBytes: uint64(queueLimit) * lbrStateBytes, prefix: lbrLiteralPrefix(g), firstMask: firstByteMask(g), acceptsEmpty: graphAcceptsEmpty(g), dead: dead, minBytes: minBytes, maxBytes: maxBytes}
+	p := &lbrProgram{graph: g, successors: successors, classMask: classMask, vertices: append([]graph.Vertex(nil), ids...), index: make(map[graph.Vertex]int, len(ids)), start: 0, kinds: make([]nfagraph.NodeKind, len(ids)), assertions: make([]parser.AssertionKind, len(ids)), literals: make([]byte, len(ids)), classMasks: make([][4]uint64, len(ids)), next: make([][]int, len(ids)), deadStates: make([]bool, len(ids)), queueLimit: queueLimit, queueBytes: uint64(queueLimit) * lbrStateBytes, prefix: lbrLiteralPrefix(g), firstMask: firstByteMask(g),
+		firstTables: simd.FirstByteTables(firstByteMask(g)), acceptsEmpty: graphAcceptsEmpty(g), dead: dead, minBytes: minBytes, maxBytes: maxBytes}
 	for i, id := range ids {
 		p.index[id] = i
 	}
@@ -3257,7 +3265,7 @@ func forEachPrefixStart(data, prefix []byte, fn func(int) bool) {
 
 // forEachNFAStart 使用前缀或首字节集合枚举候选起点，避免专用引擎
 // 在大输入上为每个偏移创建完整状态工作区。
-func forEachNFAStart(data, prefix []byte, first [4]uint64, acceptsEmpty bool, backend simd.Backend, fn func(int) bool) {
+func forEachNFAStart(data, prefix []byte, first [4]uint64, firstTables *simd.ByteSetTables, acceptsEmpty bool, backend simd.Backend, fn func(int) bool) {
 	if fn == nil {
 		return
 	}
@@ -3285,6 +3293,44 @@ func forEachNFAStart(data, prefix []byte, first [4]uint64, acceptsEmpty bool, ba
 	}
 	if backend == nil {
 		backend = dispatch.DefaultBackend()
+	}
+	// 首字节集合在整轮枚举中不变，编译期已把它预编译成窗口查找表，
+	// 热路径据此按一个完整宽窗口批量判定候选起点，避免逐字节解析原始位图；
+	// 剩余不足一个宽窗口时先用超向量窗口补齐，最后逐字节回退；没有持有者时
+	// 仍回退到逐 16 字节的原始位图路径。
+	if firstTables != nil {
+		off := 0
+		for ; off+simd.WideWidth <= len(data); off += simd.WideWidth {
+			mask, ok := backend.WindowMask64(data, off, firstTables, 1)
+			if !ok {
+				break
+			}
+			for mask != 0 {
+				bit := bits.TrailingZeros64(mask)
+				if !fn(off + bit) {
+					return
+				}
+				mask &^= 1 << uint(bit)
+			}
+		}
+		if off+simd.SuperWidth <= len(data) {
+			if mask, ok := backend.WindowMask(data, off, firstTables, 1); ok {
+				for mask != 0 {
+					bit := bits.TrailingZeros32(mask)
+					if !fn(off + bit) {
+						return
+					}
+					mask &^= 1 << uint(bit)
+				}
+				off += simd.SuperWidth
+			}
+		}
+		for ; off < len(data); off++ {
+			if first[data[off]/64]&(1<<uint(data[off]%64)) != 0 && !fn(off) {
+				return
+			}
+		}
+		return
 	}
 	const width = 16
 	for off := 0; off+width <= len(data); off += width {
@@ -3437,6 +3483,7 @@ type tableNFAProgram struct {
 	accept       []bool
 	dead         []bool
 	firstMask    [4]uint64
+	firstTables  simd.ByteSetTables
 	acceptsEmpty bool
 	start        int
 	sourceMask   [256][]uint64
@@ -3551,6 +3598,7 @@ type bitNFAProgram struct {
 	dead         []uint64
 	deadHash     uint64
 	firstMask    [4]uint64
+	firstTables  simd.ByteSetTables
 	acceptsEmpty bool
 	minBytes     int
 	maxBytes     int
@@ -3795,7 +3843,8 @@ func compileBitNFA(g *nfagraph.Graph) *bitNFAProgram {
 	if uint64(len(ids))*256*uint64(words)*8 > maxLayoutMemory {
 		return nil
 	}
-	p := &bitNFAProgram{words: words, start: idx[g.Start], accept: make([]uint64, words), closure: make([][]uint64, len(ids)), trans: make([][][]uint64, len(ids)), prefix: requiredLiteralPrefix(g), consumable: make([]uint64, words), exceptional: make([]uint64, words), epsilonOnly: make([]uint64, words), dead: make([]uint64, words), firstMask: firstByteMask(g), backend: dispatch.DefaultBackend()}
+	p := &bitNFAProgram{words: words, start: idx[g.Start], accept: make([]uint64, words), closure: make([][]uint64, len(ids)), trans: make([][][]uint64, len(ids)), prefix: requiredLiteralPrefix(g), consumable: make([]uint64, words), exceptional: make([]uint64, words), epsilonOnly: make([]uint64, words), dead: make([]uint64, words), firstMask: firstByteMask(g),
+		firstTables: simd.FirstByteTables(firstByteMask(g)), backend: dispatch.DefaultBackend()}
 	p.minBytes, p.maxBytes = graphLengthBounds(g)
 	transitionStorage := make([]uint64, len(ids)*256*words)
 	for b := range p.sourceMask {
@@ -4202,7 +4251,7 @@ func (p *bitNFAProgram) Spans(data []byte, limit int) []Span {
 	}
 	out := make([]Span, 0, initialSpanCapacity(data, limit))
 	endsBuf := make([]int, 0, 8)
-	forEachNFAStart(data, p.prefix, p.firstMask, p.acceptsEmpty, p.backend, func(start int) bool {
+	forEachNFAStart(data, p.prefix, p.firstMask, &p.firstTables, p.acceptsEmpty, p.backend, func(start int) bool {
 		ends, _, _ := p.matchAtBudgetUnchecked(data, start, 0, 0, endsBuf[:0])
 		endsBuf = ends
 		for _, end := range ends {
@@ -4263,7 +4312,8 @@ func compileTableNFA(g *nfagraph.Graph) *tableNFAProgram {
 	for i, id := range ids {
 		index[id] = i
 	}
-	p := &tableNFAProgram{closure: make([][]int, len(ids)), trans: make([][][]int, len(ids)), transClosure: make([][][]int, len(ids)), accept: make([]bool, len(ids)), dead: make([]bool, len(ids)), firstMask: firstByteMask(g), start: index[g.Start], prefix: requiredLiteralPrefix(g)}
+	p := &tableNFAProgram{closure: make([][]int, len(ids)), trans: make([][][]int, len(ids)), transClosure: make([][][]int, len(ids)), accept: make([]bool, len(ids)), dead: make([]bool, len(ids)), firstMask: firstByteMask(g),
+		firstTables: simd.FirstByteTables(firstByteMask(g)), start: index[g.Start], prefix: requiredLiteralPrefix(g)}
 	p.minBytes, p.maxBytes = graphLengthBounds(g)
 	words := (len(ids) + 63) / 64
 	for b := range p.sourceMask {
@@ -4633,7 +4683,7 @@ func (p *tableNFAProgram) Spans(data []byte, limit int) []Span {
 	}
 	out := make([]Span, 0, initialSpanCapacity(data, limit))
 	endsBuf := make([]int, 0, 8)
-	forEachNFAStart(data, p.prefix, p.firstMask, p.acceptsEmpty, nil, func(start int) bool {
+	forEachNFAStart(data, p.prefix, p.firstMask, &p.firstTables, p.acceptsEmpty, nil, func(start int) bool {
 		ends, _, _ := p.matchAtBudgetUnchecked(data, start, 0, 0, endsBuf[:0])
 		endsBuf = ends
 		for _, end := range ends {
@@ -4670,6 +4720,7 @@ type byteNFAProgram struct {
 	classMask    [][4]uint64
 	dead         []bool
 	firstMask    [4]uint64
+	firstTables  simd.ByteSetTables
 	acceptsEmpty bool
 	prefix       []byte
 	minBytes     int
@@ -4689,7 +4740,8 @@ func compileByteNFA(g *nfagraph.Graph) *byteNFAProgram {
 	if states == nil {
 		return nil
 	}
-	p := &byteNFAProgram{states: states, start: start, closures: closures, prefix: requiredLiteralPrefix(g), dead: computeByteDead(states), firstMask: firstByteMask(g), classMask: make([][4]uint64, len(states))}
+	p := &byteNFAProgram{states: states, start: start, closures: closures, prefix: requiredLiteralPrefix(g), dead: computeByteDead(states), firstMask: firstByteMask(g),
+		firstTables: simd.FirstByteTables(firstByteMask(g)), classMask: make([][4]uint64, len(states))}
 	p.minBytes, p.maxBytes = graphLengthBounds(g)
 	if len(p.states) <= 512 {
 		p.trans = make([][][]int, len(p.states))
@@ -5206,7 +5258,7 @@ func (p *byteNFAProgram) Spans(data []byte, limit int) []Span {
 	out := make([]Span, 0, initialSpanCapacity(data, limit))
 	// 布局在进入整块扫描前已校验，后续起点直接复用确认路径，
 	// 避免每个起点重复遍历整张转移表。
-	forEachNFAStart(data, p.prefix, p.firstMask, p.acceptsEmpty, dispatch.DefaultBackend(), func(start int) bool {
+	forEachNFAStart(data, p.prefix, p.firstMask, &p.firstTables, p.acceptsEmpty, dispatch.DefaultBackend(), func(start int) bool {
 		for _, end := range p.matchAtUnchecked(data, start) {
 			out = append(out, Span{From: start, To: end})
 			if limit > 0 && len(out) >= limit {
@@ -5467,6 +5519,7 @@ type goughProgram struct {
 	// 避免每次反向确认都按位重新展开。
 	initialMask  []uint64
 	firstMask    [4]uint64
+	firstTables  simd.ByteSetTables
 	acceptsEmpty bool
 	minBytes     int
 	maxBytes     int
@@ -5529,6 +5582,7 @@ func newGoughProgram(g *nfagraph.Graph) *goughProgram {
 		predecessors: make(map[graph.Vertex][]graph.Vertex, len(g.Nodes)),
 		prefix:       requiredLiteralPrefix(g),
 		firstMask:    firstByteMask(g),
+		firstTables:  simd.FirstByteTables(firstByteMask(g)),
 		acceptsEmpty: graphAcceptsEmpty(g),
 		minBytes:     minBytes,
 		maxBytes:     maxBytes,
@@ -5839,7 +5893,7 @@ func (p *goughProgram) Spans(data []byte, limit int) []Span {
 	}
 	out := make([]Span, 0, initialSpanCapacity(data, limit))
 	endsBuf := make([]int, 0, 2)
-	forEachNFAStart(data, p.prefix, p.firstMask, p.acceptsEmpty, nil, func(start int) bool {
+	forEachNFAStart(data, p.prefix, p.firstMask, &p.firstTables, p.acceptsEmpty, nil, func(start int) bool {
 		ends, _, _ := p.matchAtBudgetUncheckedInto(data, start, 0, 0, endsBuf[:0])
 		endsBuf = ends
 		for _, end := range ends {
@@ -8258,10 +8312,10 @@ func (e *Engine) SpansLimit(data []byte, limit int) []Span {
 	}
 	if e.Independent() && (e.Kind == EngineLimEx || e.Kind == EngineSheng || e.Kind == EngineMcSheng || e.Kind == EngineTamarama || e.Kind == EngineVermicelli || e.Kind == EngineShufti || e.Kind == EngineTruffle) {
 		out := make([]Span, 0, initialSpanCapacity(data, limit))
-		prefix, candidateMask, acceptsEmpty, backend := e.executionCandidates()
+		prefix, candidateMask, candidateTables, acceptsEmpty, backend := e.executionCandidates()
 		// 复用确认路径的结束偏移缓冲，避免每个起点分配临时切片。
 		endsBuf := make([]int, 0, 8)
-		forEachNFAStart(data, prefix, candidateMask, acceptsEmpty, backend, func(start int) bool {
+		forEachNFAStart(data, prefix, candidateMask, candidateTables, acceptsEmpty, backend, func(start int) bool {
 			bounded := e.boundedInput(data, start)
 			ends, _, _, ok := e.preferredMatchAtInto(bounded, start, 0, 0, endsBuf[:0])
 			if !ok {
@@ -8325,26 +8379,26 @@ func (e *Engine) SpansLimit(data []byte, limit int) []Span {
 
 // executionCandidates 返回当前专用布局的起点过滤元数据。过滤仅用于减少
 // 不可能的起点；缺少可证明元数据时返回空掩码，枚举器会保守地逐点确认。
-func (e *Engine) executionCandidates() ([]byte, [4]uint64, bool, simd.Backend) {
+func (e *Engine) executionCandidates() ([]byte, [4]uint64, *simd.ByteSetTables, bool, simd.Backend) {
 	if e == nil {
-		return nil, [4]uint64{}, false, nil
+		return nil, [4]uint64{}, nil, false, nil
 	}
 	if e.bitNFA != nil && bitRuntimeShapeOK(e.bitNFA) {
-		return e.bitNFA.prefix, e.bitNFA.firstMask, e.bitNFA.acceptsEmpty, e.bitNFA.backend
+		return e.bitNFA.prefix, e.bitNFA.firstMask, &e.bitNFA.firstTables, e.bitNFA.acceptsEmpty, e.bitNFA.backend
 	}
 	if e.tableNFA != nil && tableRuntimeShapeOK(e.tableNFA) {
-		return e.tableNFA.prefix, e.tableNFA.firstMask, e.tableNFA.acceptsEmpty, nil
+		return e.tableNFA.prefix, e.tableNFA.firstMask, &e.tableNFA.firstTables, e.tableNFA.acceptsEmpty, nil
 	}
 	if e.sparseNFA != nil && sparseRuntimeShapeOK(e.sparseNFA) {
-		return e.sparseNFA.prefix, e.sparseNFA.firstMask, e.sparseNFA.acceptsEmpty, e.sparseNFA.backend
+		return e.sparseNFA.prefix, e.sparseNFA.firstMask, &e.sparseNFA.firstTables, e.sparseNFA.acceptsEmpty, e.sparseNFA.backend
 	}
 	if e.rangeNFA != nil && rangeRuntimeShapeOK(e.rangeNFA) {
-		return e.rangeNFA.prefix, e.rangeNFA.firstMask, e.rangeNFA.acceptsEmpty, e.rangeNFA.backend
+		return e.rangeNFA.prefix, e.rangeNFA.firstMask, &e.rangeNFA.firstTables, e.rangeNFA.acceptsEmpty, e.rangeNFA.backend
 	}
 	if e.nibbleNFA != nil && nibbleRuntimeShapeOK(e.nibbleNFA) {
-		return e.nibbleNFA.prefix, e.nibbleNFA.firstMask, e.nibbleNFA.acceptsEmpty, e.nibbleNFA.backend
+		return e.nibbleNFA.prefix, e.nibbleNFA.firstMask, &e.nibbleNFA.firstTables, e.nibbleNFA.acceptsEmpty, e.nibbleNFA.backend
 	}
-	return e.executionPrefix(), [4]uint64{}, false, nil
+	return e.executionPrefix(), [4]uint64{}, nil, false, nil
 }
 
 func (e *Engine) executionPrefix() []byte {

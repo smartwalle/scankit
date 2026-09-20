@@ -4,6 +4,7 @@ package teddy
 import (
 	"encoding/json"
 	"fmt"
+	"math/bits"
 	"sort"
 
 	"github.com/smartwalle/scankit/internal/dispatch"
@@ -18,10 +19,16 @@ type Match struct {
 }
 
 // Matcher 使用首字节桶降低每个输入偏移的候选比较数量。
+// 掩码按最短文字长度扩展为最多 4 个 lane，用连续字节共同筛选候选起点。
 type Matcher struct {
 	literals []hwlm.Literal
 	buckets  [256][]hwlm.Literal
-	firstSet [4]uint64
+	// laneSets 保存每个 lane 的候选字节集合，lane 0 即首字节集合。
+	laneSets [4][4]uint64
+	// tables 是 laneSets 的预编译形式，按 lane 连续存放供窗口热路径一次查表。
+	tables simd.ByteSetTables
+	// lanes 为实际启用的 lane 数，取值 1..4。
+	lanes int
 }
 
 const version = 1
@@ -55,21 +62,60 @@ func Load(data []byte) (*Matcher, error) {
 // New 构建独立的候选分桶表。
 func New(literals []hwlm.Literal) *Matcher {
 	m := &Matcher{literals: hwlm.Deduplicate(literals)}
+	shortest := 0
 	for _, literal := range m.literals {
 		if len(literal.Value) == 0 {
 			continue
 		}
+		if shortest == 0 || len(literal.Value) < shortest {
+			shortest = len(literal.Value)
+		}
 		m.buckets[literal.Value[0]] = append(m.buckets[literal.Value[0]], literal)
-		m.firstSet[literal.Value[0]/64] |= 1 << uint(literal.Value[0]%64)
 		if literal.CaseInsensitive {
 			other := swapASCII(literal.Value[0])
 			if other != literal.Value[0] {
 				m.buckets[other] = append(m.buckets[other], literal)
-				m.firstSet[other/64] |= 1 << uint(other%64)
 			}
 		}
 	}
+	m.lanes = shortest
+	if m.lanes <= 0 {
+		m.lanes = 1
+	}
+	if m.lanes > len(m.laneSets) {
+		m.lanes = len(m.laneSets)
+	}
+	for _, literal := range m.literals {
+		for lane := 0; lane < m.lanes && lane < len(literal.Value); lane++ {
+			value := literal.Value[lane]
+			m.laneSets[lane][value/64] |= 1 << uint(value%64)
+			if !literal.CaseInsensitive {
+				continue
+			}
+			other := swapASCII(value)
+			if other != value {
+				m.laneSets[lane][other/64] |= 1 << uint(other%64)
+			}
+		}
+	}
+	m.tables = simd.NewByteSetTables(m.laneSets)
 	return m
+}
+
+// Lanes 返回候选掩码实际使用的 lane 数。
+func (m *Matcher) Lanes() int {
+	if m == nil {
+		return 0
+	}
+	return m.lanes
+}
+
+// windowMask 返回窗口内可能成为候选起点的位置掩码。
+// 位置 i 的前 lanes 个字节必须分别命中对应 lane 集合；
+// 窗口尾部没有足够后继字节的位置退回首字节判定，避免漏报。
+// 一次调用覆盖整个超向量窗口，原生与标量实现的组合规则完全一致。
+func windowMask(backend simd.Backend, m *Matcher, data []byte, off int) (uint32, bool) {
+	return backend.WindowMask(data, off, &m.tables, m.lanes)
 }
 
 // Find 返回按起点、编号和终点稳定排序的全部候选命中。
@@ -106,21 +152,32 @@ func (m *Matcher) FindInto(data []byte, dst []Match) []Match {
 		}
 	}
 	// 先用向量掩码筛选可能的首字节，再进入分桶确认，减少稀疏输入上的哈希查找。
-	const width = simd.SuperWidth / 2
-	for off := 0; off+width <= len(data); off += width {
-		vec, ok := backend.Load(data, off)
+	// 窗口宽度优先取整个宽窗口，掩码位 i 对应窗口内偏移 i；剩余不足一个宽窗口时
+	// 先用超向量窗口补齐，最后再逐字节回退判定，三段区间互不重叠。
+	off := 0
+	for ; off+simd.WideWidth <= len(data); off += simd.WideWidth {
+		mask, ok := backend.WindowMask64(data, off, &m.tables, m.lanes)
 		if !ok {
 			break
 		}
-		mask := backend.ByteSetMask(vec, m.firstSet)
 		for mask != 0 {
-			bit := trailingZeros16(mask)
+			bit := bits.TrailingZeros64(mask)
 			visit(off + bit)
 			mask &^= 1 << uint(bit)
 		}
 	}
-	for off := len(data) - len(data)%width; off < len(data); off++ {
-		if m.firstSet[data[off]/64]&(1<<uint(data[off]%64)) != 0 {
+	if off+simd.SuperWidth <= len(data) {
+		if mask, ok := windowMask(backend, m, data, off); ok {
+			for mask != 0 {
+				bit := bits.TrailingZeros32(mask)
+				visit(off + bit)
+				mask &^= 1 << uint(bit)
+			}
+			off += simd.SuperWidth
+		}
+	}
+	for ; off < len(data); off++ {
+		if m.laneSets[0][data[off]/64]&(1<<uint(data[off]%64)) != 0 {
 			visit(off)
 		}
 	}
@@ -134,18 +191,6 @@ func (m *Matcher) FindInto(data []byte, dst []Match) []Match {
 		return out[i].To < out[j].To
 	})
 	return out
-}
-
-func trailingZeros16(v uint16) int {
-	if v == 0 {
-		return 0
-	}
-	n := 0
-	for v&1 == 0 {
-		v >>= 1
-		n++
-	}
-	return n
 }
 
 // FindRange 返回完全位于指定半开区间内的候选命中。

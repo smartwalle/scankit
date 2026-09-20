@@ -13,6 +13,15 @@ type Backend interface {
 	EqualByteMask(Vector, byte) uint16
 	EqualByteMaskFold(Vector, byte) uint16
 	ByteSetMask(Vector, [4]uint64) uint16
+	// ByteSetMaskPrepared 使用配置期构建的预编译集合生成掩码，供热路径复用查找表。
+	ByteSetMaskPrepared(Vector, *ByteSet) uint16
+	// WindowMask 使用配置期构建的预编译集合按超向量窗口生成候选起点掩码，
+	// 一次调用完成全部 lane 判定，数据不足一个窗口时返回 false。
+	WindowMask([]byte, int, *ByteSetTables, int) (uint32, bool)
+	// WindowMask64 使用同一组预编译集合按 64 字节宽窗口生成候选起点掩码，
+	// 数据不足一个宽窗口时返回 false；缺少原生 64 字节内核的后端由
+	// GenericBackend 的标量参考实现兜底。
+	WindowMask64([]byte, int, *ByteSetTables, int) (uint64, bool)
 	InRangeMask(Vector, byte, byte) uint16
 	GreaterMask(Vector, Vector) uint16
 	LessMask(Vector, Vector) uint16
