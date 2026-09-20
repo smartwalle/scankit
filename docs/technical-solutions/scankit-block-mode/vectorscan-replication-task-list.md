@@ -215,7 +215,7 @@ K-17 本轮证据：`internal/dfa/rdfa.go` 将反向宽度改为按起点到接�
 
 K-19 本轮证据：`internal/rose/rose.go` 为 Miracle 多角色候选增加首字节掩码和向量分块筛选，并提供角色状态切片复用入口；`scanner.go` 在编译期缓存不可变 Rose 角色图，并通过并发安全的状态缓冲池复用命中切片，避免每个 Block 重建角色、指令和自动机；新增 `roseSinglePool` 复用 SingleMatch 规则的去重表，避免每次 Block 扫描都分配 `map[uint32]struct{}`；无确认纯文字角色在整块扫描时直接消费已排序角色命中，跳过调度队列和重复确认，SingleMatch/Quiet 仍按规则标志处理。`matchRuleInto` 和 `Engine.MatchAtInto` 在主选择路径复用结束偏移缓冲；`compiledRule` 预先计算 `containsAny`、`requiresEndOfData`、`backendEligible` 和 `nonGreedy`，避免每个起点重复遍历 AST。`fastLiteral` 路径使用栈上候选缓冲复用 `literalFindInto` 的结果。验证命令：`go test ./internal/rose ./...`、`go test -run '^$' -bench 'ScanRuleScales' -benchtime=3x .`。
 
-K-18 本轮证据：`internal/hwlm/noodle/noodle.go` 的前缀树候选路径及 `internal/hwlm/teddy/teddy.go` 均支持向调用方结果切片写入，消除候选起点的临时结果切片；尾部扫描同时覆盖原始与 ASCII 折叠首字节，FDR/Teddy/Noodle 统一保持候选确认、重叠和去重语义。验证命令：`go test ./internal/hwlm/noodle ./internal/hwlm ./internal/hwlm/teddy ./internal/fdr ./internal/simd ./...`。
+K-18 本轮证据：`internal/hwlm/noodle/noodle.go` 的前缀树候选路径及 `internal/hwlm/teddy/teddy.go` 均支持向调用方结果切片写入，消除候选起点的临时结果切片；尾部扫描同时覆盖原始与 ASCII 折叠首字节，FDR/Teddy/Noodle 统一保持候选确认、重叠和去重语义。Teddy 增加 `needsDedup` 与 `dedupBuf` 字段，仅在存在跨桶字面量时启用去重并复用键集合；`scanner.go` 为三种匹配器各自的 `Match` 缓冲建立 `sync.Pool`，`fastLiteral` 路径的 `candBuf` 容量从 16 提升到 64 元素，并在已知候选数后预分配 `matches` 切片。验证命令：`go test ./internal/hwlm/noodle ./internal/hwlm ./internal/hwlm/teddy ./internal/fdr ./internal/simd ./...`、`go test -run '^$' -bench 'ScanRuleScales' -benchtime=3x .`。
 
 K-21 本轮证据：`scanner.go` 在构造阶段缓存不可变扫描计划校验结果，Block `ScanInto` 进入执行前使用该错误结论，损坏规则索引或后端布局安全返回且不重复遍历整张图；后端直扫结果现在直接写入调用方结果切片，移除中间结果复制和区间转换临时切片；上下文 scratch/report 仍按既有生命周期复用。验证命令：`go test ./...`。
 
