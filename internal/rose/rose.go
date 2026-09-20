@@ -195,6 +195,10 @@ func (p *Program) FindMatchesInto(data []byte, dst []State) []State {
 		// 复用 matcher 自身的匹配结果缓冲，避免每次扫描都重新分配。
 		matches := matcher.FindInto(data, p.matchBuf[:0])
 		p.matchBuf = matches
+		// 超出阈值时丢弃缓冲，避免池/字段持有的缓冲无限增长。
+		if cap(p.matchBuf) > 1<<20 {
+			p.matchBuf = nil
+		}
 		out := dst[:0]
 		if cap(out) < len(matches) {
 			out = make([]State, 0, len(matches))
