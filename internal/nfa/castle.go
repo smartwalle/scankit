@@ -38,6 +38,10 @@ type castleProgram struct {
 	firstMask           [4]uint64
 	acceptsEmpty        bool
 	prefix              []byte
+	// shapeOnce/shapeOK 缓存布局结构校验结果：布局在编译后不可变，
+	// 而在每个起点的确认路径上重复遍历整张索引表远贵于匹配本身。
+	shapeOnce sync.Once
+	shapeOK   bool
 }
 
 const castleQueueLimit = 1 << 20
@@ -452,7 +456,7 @@ func newCastleProgram(g *nfagraph.Graph) *castleProgram {
 
 // MatchAtInto 在调用方提供结束偏移缓冲时复用，避免每个起点分配临时切片。
 func (p *castleProgram) MatchAtInto(data []byte, start int, dst []int) []int {
-	if p == nil || p.graph == nil || start < 0 || start > len(data) || !castleRuntimeShapeOK(p) {
+	if p == nil || p.graph == nil || start < 0 || start > len(data) || !castleRuntimeShapeCached(p) {
 		return dst[:0]
 	}
 	ends, _, _ := p.matchAtBudgetUncheckedInto(data, start, 0, 0, dst)
@@ -460,7 +464,7 @@ func (p *castleProgram) MatchAtInto(data []byte, start int, dst []int) []int {
 }
 
 func (p *castleProgram) MatchAt(data []byte, start int) []int {
-	if p == nil || p.graph == nil || start < 0 || start > len(data) || !castleRuntimeShapeOK(p) {
+	if p == nil || p.graph == nil || start < 0 || start > len(data) || !castleRuntimeShapeCached(p) {
 		return nil
 	}
 	if startIndex, ok := p.index[p.graph.Start]; !ok || startIndex < 0 || startIndex >= len(p.closureIndex) {
@@ -581,7 +585,7 @@ func (p *castleProgram) reverseAccepts(data []byte, start, end int) bool {
 }
 
 func (p *castleProgram) MatchAtBudget(data []byte, start, maxSteps, maxResults int) ([]int, int, bool) {
-	if p == nil || p.graph == nil || start < 0 || start > len(data) || maxSteps < 0 || maxResults < 0 || !castleRuntimeShapeOK(p) {
+	if p == nil || p.graph == nil || start < 0 || start > len(data) || maxSteps < 0 || maxResults < 0 || !castleRuntimeShapeCached(p) {
 		return nil, 0, false
 	}
 	return p.matchAtBudgetUnchecked(data, start, maxSteps, maxResults)
@@ -710,88 +714,110 @@ func equalVertices(a, b []graph.Vertex) bool {
 	return true
 }
 
+// castleRuntimeShapeCached 是扫描热路径上的布局门禁：每次调用只做 O(1) 规模
+// 检查，O(|V|+|E|) 的结构校验在首次确认后缓存。
+// 把结构校验放进每个起点的确认路径会让调度成本远高于匹配本身。
+func castleRuntimeShapeCached(p *castleProgram) bool {
+	if !castleRuntimeShapeGate(p) {
+		return false
+	}
+	p.shapeOnce.Do(func() { p.shapeOK = castleRuntimeShapeOK(p) })
+	return p.shapeOK
+}
+
+func castleRuntimeShapeGate(p *castleProgram) bool {
+	if p == nil || p.graph == nil || p.graph.Flow == nil || p.queueLimit <= 0 {
+		return false
+	}
+	nodes := len(p.graph.Nodes)
+	return nodes > 0 && len(p.index) == nodes && len(p.dead) == nodes && len(p.transitions) == nodes &&
+		len(p.closureTable) == nodes && len(p.kinds) == nodes && len(p.literals) == nodes &&
+		len(p.classMasks) == nodes && len(p.acceptByIndex) == nodes && len(p.deadByIndex) == nodes &&
+		len(p.closureByIndex) == nodes && len(p.transitionByIndex) == nodes && len(p.closureIndex) == nodes &&
+		len(p.transitionIndex) == nodes && len(p.reverseClosureIndex) == nodes && len(p.predecessorIndex) == nodes
+}
+
+// castleRuntimeShapeOK 完整校验布局结构，供编译、选择与显式校验使用。
+// 数组规模、下标边界与有序性，全程不分配也不重新推导图数据。
+// 起点掩码、前缀、长度界、死状态集合、闭包内容等派生数据由 validate 在显式
+// 校验时重新推导比对；把它们放进每个起点的确认路径会让调度成本远高于匹配本身。
 func castleRuntimeShapeOK(p *castleProgram) bool {
-	if p == nil || p.graph == nil || p.graph.Flow == nil || p.queueLimit <= 0 || len(p.index) != len(p.graph.Nodes) || len(p.transitions) != len(p.graph.Nodes) || len(p.closureTable) != len(p.graph.Nodes) || len(p.closureByIndex) != len(p.graph.Nodes) || len(p.transitionByIndex) != len(p.graph.Nodes) || len(p.closureIndex) != len(p.graph.Nodes) || len(p.transitionIndex) != len(p.graph.Nodes) || len(p.kinds) != len(p.graph.Nodes) || len(p.literals) != len(p.graph.Nodes) || len(p.classMasks) != len(p.graph.Nodes) || len(p.acceptByIndex) != len(p.graph.Nodes) || len(p.accept) != len(p.graph.Accepts()) {
+	if p == nil || p.graph == nil || p.graph.Flow == nil || p.queueLimit <= 0 {
 		return false
 	}
-	if len(p.dead) != len(p.graph.Nodes) || len(p.deadByIndex) != len(p.graph.Nodes) {
+	nodes := len(p.graph.Nodes)
+	if nodes == 0 || len(p.index) != nodes || len(p.dead) != nodes || len(p.transitions) != nodes || len(p.closureTable) != nodes ||
+		len(p.kinds) != nodes || len(p.literals) != nodes || len(p.classMasks) != nodes || len(p.acceptByIndex) != nodes ||
+		len(p.deadByIndex) != nodes || len(p.closureByIndex) != nodes || len(p.transitionByIndex) != nodes ||
+		len(p.closureIndex) != nodes || len(p.transitionIndex) != nodes || len(p.reverseClosureIndex) != nodes ||
+		len(p.predecessorIndex) != nodes {
 		return false
 	}
-	minBytes, maxBytes := graphLengthBounds(p.graph)
-	if p.minBytes != minBytes || p.maxBytes != maxBytes {
+	startIndex, ok := p.index[p.graph.Start]
+	if !ok || startIndex < 0 || startIndex >= nodes {
 		return false
 	}
-	for _, id := range p.graph.NodeIDs() {
-		index, ok := p.index[id]
-		if !ok || index < 0 || index >= len(p.closureIndex) {
+	if _, ok := p.closureTable[p.graph.Start]; !ok {
+		return false
+	}
+	for id, index := range p.index {
+		if id < 0 || int(id) >= nodes || index < 0 || index >= nodes || p.graph.Nodes[id] == nil {
 			return false
 		}
-		if p.deadByIndex[index] != p.dead[id] {
+		if p.deadByIndex[index] != p.dead[id] || p.acceptByIndex[index] != p.graph.IsAccept(id) {
 			return false
 		}
-		if p.acceptByIndex[index] != p.graph.IsAccept(id) {
-			return false
-		}
-		if !equalVertices(p.closureByIndex[index], p.closureTable[id]) || !equalVertices(p.transitionByIndex[index], p.transitions[id]) || len(p.closureIndex[index]) != len(p.closureByIndex[index]) || len(p.transitionIndex[index]) != len(p.transitionByIndex[index]) {
+		closure, ok := p.closureTable[id]
+		if !ok || len(closure) == 0 || len(closure) != len(p.closureByIndex[index]) || len(closure) != len(p.closureIndex[index]) {
 			return false
 		}
 		for i, target := range p.closureIndex[index] {
-			if target < 0 || target >= len(p.index) || p.index[p.closureByIndex[index][i]] != target {
+			if target < 0 || target >= nodes || p.closureByIndex[index][i] != closure[i] {
 				return false
 			}
+			if i > 0 && p.closureIndex[index][i-1] >= target {
+				return false
+			}
+		}
+		if !containsInt(p.closureIndex[index], index) {
+			return false
+		}
+		transitions, ok := p.transitions[id]
+		if !ok || len(transitions) != len(p.transitionByIndex[index]) || len(transitions) != len(p.transitionIndex[index]) {
+			return false
 		}
 		for i, target := range p.transitionIndex[index] {
-			if target < 0 || target >= len(p.index) || p.index[p.transitionByIndex[index][i]] != target {
+			if target < 0 || target >= nodes || p.transitionByIndex[index][i] != transitions[i] {
 				return false
 			}
-		}
-		closure, ok := p.closureTable[id]
-		if !ok || len(closure) == 0 {
-			return false
-		}
-		found := false
-		for i, target := range closure {
-			if target == id {
-				found = true
-			}
-			if i > 0 && closure[i-1] >= target {
-				return false
-			}
-			if p.graph.Nodes[target] == nil {
-				return false
-			}
-		}
-		if !found {
-			return false
-		}
-		for i, target := range p.transitions[id] {
-			if p.graph.Nodes[target] == nil {
-				return false
-			}
-			if i > 0 && p.transitions[id][i-1] >= target {
+			if i > 0 && p.transitionIndex[index][i-1] >= target {
 				return false
 			}
 		}
 	}
-	for id := range p.accept {
-		if p.graph.Nodes[id] == nil || !p.graph.IsAccept(id) {
+	for i, row := range p.reverseClosureIndex {
+		if len(row) == 0 {
 			return false
 		}
-	}
-	for id, index := range p.index {
-		if p.acceptByIndex[index] != p.graph.IsAccept(id) {
+		for j, target := range row {
+			if target < 0 || target >= nodes || j > 0 && row[j-1] >= target {
+				return false
+			}
+		}
+		if !containsInt(row, i) {
 			return false
 		}
+		for _, target := range p.predecessorIndex[i] {
+			if target < 0 || target >= nodes {
+				return false
+			}
+		}
 	}
-	_, ok := p.closureTable[p.graph.Start]
-	if !ok {
-		return false
-	}
-	return p.firstMask == firstByteMask(p.graph) && p.acceptsEmpty == graphAcceptsEmpty(p.graph)
+	return true
 }
 
 func (p *castleProgram) Spans(data []byte, limit int) []Span {
-	if p == nil || limit < 0 || !castleRuntimeShapeOK(p) {
+	if p == nil || limit < 0 || !castleRuntimeShapeCached(p) {
 		return nil
 	}
 	out := make([]Span, 0, initialSpanCapacity(data, limit))

@@ -3594,9 +3594,13 @@ type bitNFAProgram struct {
 	// exceptional 标记没有可消费转移的节点，热路径可直接跳过。
 	exceptional []uint64
 	// epsilonOnly 标记仅参与闭包传播且不直接消费字节的中间节点。
-	epsilonOnly  []uint64
-	dead         []uint64
-	deadHash     uint64
+	epsilonOnly []uint64
+	dead        []uint64
+	deadHash    uint64
+	// shapeOnce/shapeOK 缓存布局内容校验结果：布局在编译后不可变，
+	// 而在每个起点的确认路径上重复扫描 state×256 转移表的成本远高于匹配本身。
+	shapeOnce    sync.Once
+	shapeOK      bool
 	firstMask    [4]uint64
 	firstTables  simd.ByteSetTables
 	acceptsEmpty bool
@@ -4076,7 +4080,7 @@ func (p *bitNFAProgram) MatchAtBudget(data []byte, start, maxSteps, maxResults i
 }
 
 func (p *bitNFAProgram) MatchAtBudgetInto(data []byte, start, maxSteps, maxResults int, dst []int) ([]int, int, bool) {
-	if p == nil || start < 0 || start > len(data) || maxSteps < 0 || maxResults < 0 || !bitRuntimeShapeOK(p) {
+	if p == nil || start < 0 || start > len(data) || maxSteps < 0 || maxResults < 0 || !bitRuntimeShapeCached(p) {
 		return dst[:0], 0, false
 	}
 	return p.matchAtBudgetUnchecked(data, start, maxSteps, maxResults, dst)
@@ -4155,13 +4159,37 @@ func (p *bitNFAProgram) matchAtBudgetUnchecked(data []byte, start, maxSteps, max
 	return out, steps, false
 }
 
+// bitRuntimeShapeOK 完整校验位布局，供编译、选择与显式校验使用。
 func bitRuntimeShapeOK(p *bitNFAProgram) bool {
+	return bitRuntimeShapeGate(p) && bitLayoutShapeOK(p)
+}
+
+// bitRuntimeShapeCached 是扫描热路径上的门禁：每次调用只做 O(1) 规模检查和
+// 死状态指纹比对，O(state×256) 的内容校验在首次确认后缓存。
+// 把内容校验放进每个起点的确认路径会让调度成本远高于匹配本身。
+func bitRuntimeShapeCached(p *bitNFAProgram) bool {
+	if !bitRuntimeShapeGate(p) {
+		return false
+	}
+	p.shapeOnce.Do(func() { p.shapeOK = bitLayoutShapeOK(p) })
+	return p.shapeOK
+}
+
+func bitRuntimeShapeGate(p *bitNFAProgram) bool {
 	if p == nil || p.words <= 0 || p.words > limExStateLimit/64 || p.start < 0 || p.start >= len(p.trans) || len(p.closure) != len(p.trans) || len(p.accept) != p.words || len(p.consumable) != p.words || len(p.exceptional) != p.words || len(p.epsilonOnly) != p.words || len(p.dead) != p.words {
 		return false
 	}
 	if p.minBytes < 0 || p.maxBytes < -1 || p.maxBytes >= 0 && p.maxBytes < p.minBytes {
 		return false
 	}
+	// 死状态位图带廉价指纹，热路径据此发现布局损坏。
+	return p.deadHash == hashUint64s(p.dead)
+}
+
+// bitLayoutShapeOK 校验位布局的内容一致性：转移表宽度、源掩码、死状态指纹、
+// 尾部位、首字节掩码与空匹配元数据。该结果只依赖编译产物，由 bitRuntimeShapeOK
+// 在首次确认时缓存，避免每个起点重复付出 O(state×256) 的扫描成本。
+func bitLayoutShapeOK(p *bitNFAProgram) bool {
 	for i := range p.trans {
 		if len(p.trans[i]) != 256 || len(p.closure[i]) != p.words {
 			return false
@@ -4205,9 +4233,6 @@ func bitRuntimeShapeOK(p *bitNFAProgram) bool {
 			}
 		}
 	}
-	if p.deadHash != hashUint64s(p.dead) {
-		return false
-	}
 	if rem := len(p.trans) % 64; rem != 0 {
 		mask := ^uint64(0) >> uint(64-rem)
 		last := len(p.exceptional) - 1
@@ -4246,7 +4271,7 @@ func bitsetAny(bits []uint64) bool {
 }
 
 func (p *bitNFAProgram) Spans(data []byte, limit int) []Span {
-	if p == nil || limit < 0 || !bitRuntimeShapeOK(p) {
+	if p == nil || limit < 0 || !bitRuntimeShapeCached(p) {
 		return nil
 	}
 	out := make([]Span, 0, initialSpanCapacity(data, limit))
@@ -7939,7 +7964,7 @@ func (e *Engine) Capabilities() map[string]bool {
 	if e == nil {
 		return nil
 	}
-	vectorized := e.bitNFA != nil && bitRuntimeShapeOK(e.bitNFA) || e.rangeNFA != nil && rangeRuntimeShapeOK(e.rangeNFA) || e.nibbleNFA != nil && nibbleRuntimeShapeOK(e.nibbleNFA)
+	vectorized := e.bitNFA != nil && bitRuntimeShapeCached(e.bitNFA) || e.rangeNFA != nil && rangeRuntimeShapeOK(e.rangeNFA) || e.nibbleNFA != nil && nibbleRuntimeShapeOK(e.nibbleNFA)
 	return map[string]bool{
 		"stateful":    e.Kind == EngineLimEx || e.Kind == EngineCastle || e.Kind == EngineGough || e.Kind == EngineLBR,
 		"simd":        vectorized,
@@ -8041,7 +8066,7 @@ func (e *Engine) preferredMatchAtInto(data []byte, start, maxSteps, maxResults i
 	}
 	switch e.Kind {
 	case EngineCastle:
-		if e.castle != nil && castleRuntimeShapeOK(e.castle) {
+		if e.castle != nil && castleRuntimeShapeCached(e.castle) {
 			v, n, stop := e.castle.matchAtBudgetUncheckedInto(data, start, maxSteps, maxResults, dst)
 			return v, n, stop, true
 		}
@@ -8056,7 +8081,7 @@ func (e *Engine) preferredMatchAtInto(data []byte, start, maxSteps, maxResults i
 			return v, n, stop, true
 		}
 	case EngineLimEx:
-		if e.bitNFA != nil && bitRuntimeShapeOK(e.bitNFA) {
+		if e.bitNFA != nil && bitRuntimeShapeCached(e.bitNFA) {
 			v, n, stop := e.bitNFA.MatchAtBudgetInto(data, start, maxSteps, maxResults, dst)
 			return v, n, stop, true
 		}
@@ -8111,7 +8136,7 @@ func (e *Engine) MatchAt(data []byte, start int) []int {
 	if ends, _, _, ok := e.preferredMatchAt(data, start, 0, 0); ok {
 		return ends
 	}
-	if e.castle != nil && castleRuntimeShapeOK(e.castle) {
+	if e.castle != nil && castleRuntimeShapeCached(e.castle) {
 		return e.castle.MatchAt(data, start)
 	}
 	if e.gough != nil && goughRuntimeShapeOK(e.gough) {
@@ -8126,7 +8151,7 @@ func (e *Engine) MatchAt(data []byte, start int) []int {
 	if e.byteNFA != nil && byteRuntimeShapeOK(e.byteNFA) {
 		return e.byteNFA.MatchAt(data, start)
 	}
-	if e.bitNFA != nil && bitRuntimeShapeOK(e.bitNFA) {
+	if e.bitNFA != nil && bitRuntimeShapeCached(e.bitNFA) {
 		return e.bitNFA.MatchAt(data, start)
 	}
 	if e.sparseNFA != nil && sparseRuntimeShapeOK(e.sparseNFA) {
@@ -8163,7 +8188,7 @@ func (e *Engine) MatchAtInto(data []byte, start int, dst []int) []int {
 	if ends, _, _, ok := e.preferredMatchAtInto(data, start, 0, 0, dst); ok {
 		return ends
 	}
-	if e.castle != nil && castleRuntimeShapeOK(e.castle) {
+	if e.castle != nil && castleRuntimeShapeCached(e.castle) {
 		return e.castle.MatchAtInto(data, start, dst)
 	}
 	if e.gough != nil && goughRuntimeShapeOK(e.gough) {
@@ -8178,7 +8203,7 @@ func (e *Engine) MatchAtInto(data []byte, start int, dst []int) []int {
 	if e.byteNFA != nil && byteRuntimeShapeOK(e.byteNFA) {
 		return e.byteNFA.MatchAtInto(data, start, dst)
 	}
-	if e.bitNFA != nil && bitRuntimeShapeOK(e.bitNFA) {
+	if e.bitNFA != nil && bitRuntimeShapeCached(e.bitNFA) {
 		ends, _, _ := e.bitNFA.MatchAtBudgetInto(data, start, 0, 0, dst)
 		return ends
 	}
@@ -8222,7 +8247,7 @@ func (e *Engine) MatchAtLimit(data []byte, start, limit int) []int {
 		}
 		return ends
 	}
-	if e.castle != nil && castleRuntimeShapeOK(e.castle) {
+	if e.castle != nil && castleRuntimeShapeCached(e.castle) {
 		ends, _, _ := e.castle.MatchAtBudget(data, start, 0, limit)
 		return ends
 	}
@@ -8254,7 +8279,7 @@ func (e *Engine) MatchAtLimit(data []byte, start, limit int) []int {
 		}
 		return ends
 	}
-	if e.bitNFA != nil && bitRuntimeShapeOK(e.bitNFA) {
+	if e.bitNFA != nil && bitRuntimeShapeCached(e.bitNFA) {
 		ends := e.bitNFA.MatchAt(data, start)
 		if limit > 0 && len(ends) > limit {
 			ends = ends[:limit]
@@ -8344,7 +8369,7 @@ func (e *Engine) SpansLimit(data []byte, limit int) []Span {
 	if e.byteNFA != nil {
 		return e.byteNFA.Spans(data, limit)
 	}
-	if e.bitNFA != nil && bitRuntimeShapeOK(e.bitNFA) {
+	if e.bitNFA != nil && bitRuntimeShapeCached(e.bitNFA) {
 		return e.bitNFA.Spans(data, limit)
 	}
 	if e.sparseNFA != nil && sparseRuntimeShapeOK(e.sparseNFA) {
@@ -8368,7 +8393,7 @@ func (e *Engine) SpansLimit(data []byte, limit int) []Span {
 	if e.lbr != nil && lbrRuntimeShapeOK(e.lbr) {
 		return e.lbr.Spans(data, limit)
 	}
-	if e.castle != nil && castleRuntimeShapeOK(e.castle) {
+	if e.castle != nil && castleRuntimeShapeCached(e.castle) {
 		return e.castle.Spans(data, limit)
 	}
 	if e.gough != nil && goughRuntimeShapeOK(e.gough) {
@@ -8383,7 +8408,7 @@ func (e *Engine) executionCandidates() ([]byte, [4]uint64, *simd.ByteSetTables, 
 	if e == nil {
 		return nil, [4]uint64{}, nil, false, nil
 	}
-	if e.bitNFA != nil && bitRuntimeShapeOK(e.bitNFA) {
+	if e.bitNFA != nil && bitRuntimeShapeCached(e.bitNFA) {
 		return e.bitNFA.prefix, e.bitNFA.firstMask, &e.bitNFA.firstTables, e.bitNFA.acceptsEmpty, e.bitNFA.backend
 	}
 	if e.tableNFA != nil && tableRuntimeShapeOK(e.tableNFA) {
@@ -8405,7 +8430,7 @@ func (e *Engine) executionPrefix() []byte {
 	if e == nil {
 		return nil
 	}
-	if e.bitNFA != nil && bitRuntimeShapeOK(e.bitNFA) {
+	if e.bitNFA != nil && bitRuntimeShapeCached(e.bitNFA) {
 		return e.bitNFA.prefix
 	}
 	if e.tableNFA != nil && tableRuntimeShapeOK(e.tableNFA) {
@@ -8619,7 +8644,7 @@ func (e *Engine) SpansBudget(data []byte, maxSteps, maxResults int) ([]Span, int
 		}
 		return out, steps, false
 	}
-	if e.castle != nil && castleRuntimeShapeOK(e.castle) || e.gough != nil && goughRuntimeShapeOK(e.gough) || e.lbr != nil && lbrRuntimeShapeOK(e.lbr) {
+	if e.castle != nil && castleRuntimeShapeCached(e.castle) || e.gough != nil && goughRuntimeShapeOK(e.gough) || e.lbr != nil && lbrRuntimeShapeOK(e.lbr) {
 		out := make([]Span, 0)
 		endsBuf := make([]int, 0, 4)
 		steps := 0
@@ -8645,7 +8670,7 @@ func (e *Engine) SpansBudget(data []byte, maxSteps, maxResults int) ([]Span, int
 			var used int
 			var stopped bool
 			switch {
-			case e.castle != nil && castleRuntimeShapeOK(e.castle):
+			case e.castle != nil && castleRuntimeShapeCached(e.castle):
 				ends, used, stopped = e.castle.matchAtBudgetUncheckedInto(data, start, remaining, resultLimit, endsBuf[:0])
 				endsBuf = ends
 			case e.gough != nil && goughRuntimeShapeOK(e.gough):
@@ -8799,7 +8824,7 @@ func (e *Engine) MatchAtWithContext(data []byte, start int, ctx *Context) []int 
 		}
 		return ends
 	}
-	if e.castle != nil && castleRuntimeShapeOK(e.castle) {
+	if e.castle != nil && castleRuntimeShapeCached(e.castle) {
 		ends, steps, stopped := e.castle.MatchAtBudget(data, start, ctx.MaxSteps, ctx.MaxResults)
 		ctx.Steps, ctx.Results, ctx.Stopped = steps, len(ends), stopped
 		if stopped && ends == nil {
@@ -8837,7 +8862,7 @@ func (e *Engine) MatchAtWithContext(data []byte, start int, ctx *Context) []int 
 		}
 		return ends
 	}
-	if e.bitNFA != nil && bitRuntimeShapeOK(e.bitNFA) {
+	if e.bitNFA != nil && bitRuntimeShapeCached(e.bitNFA) {
 		ends, steps, stopped := e.bitNFA.MatchAtBudgetInto(data, start, ctx.MaxSteps, ctx.MaxResults, ctx.ends[:0])
 		ctx.ends = ends
 		ctx.Steps, ctx.Results, ctx.Stopped = steps, len(ends), stopped
@@ -8966,6 +8991,13 @@ func (e *Engine) boundedInput(data []byte, start int) []byte {
 		return data
 	}
 	return data[:end]
+}
+
+// CandidateStartAllowed 判断指定起点是否可能是匹配起点。匹配器在执行前会用
+// 同一判据做首字节与确定性前缀过滤，调用方提前判断可避免对不可能命中的起点
+// 发起完整确认；元数据不可推导时保守返回 true。
+func (e *Engine) CandidateStartAllowed(data []byte, start int) bool {
+	return e.candidateStartAllowed(data, start)
 }
 
 func (e *Engine) candidateStartAllowed(data []byte, start int) bool {

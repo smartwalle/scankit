@@ -1561,6 +1561,11 @@ func matchRuleInto(rule compiledRule, data []byte, start int, endsBuf []int) []i
 			return rule.repeat.MatchAtInto(data, start, endsBuf[:0])
 		}
 		if rule.nfaEngine != nil {
+			// 首字节/前缀不可能命中的起点直接跳过，避免为每个起点付出
+			// 一次完整的后端确认调用；判据与后端内部过滤完全一致。
+			if !rule.nfaEngine.CandidateStartAllowed(data, start) {
+				return nil
+			}
 			return rule.nfaEngine.MatchAtInto(data, start, endsBuf[:0])
 		}
 	}

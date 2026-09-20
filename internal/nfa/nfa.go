@@ -704,7 +704,7 @@ func (p *Program) MatchAtWithOptions(data []byte, start int, multiline, caseless
 
 // MatchAtLimit 在运行状态预算内执行匹配，超过预算时返回当前已收集结果。
 func (p *Program) MatchAtLimit(data []byte, start int, limit int) []int {
-	if p != nil && p.castle != nil && castleRuntimeShapeOK(p.castle) {
+	if p != nil && p.castle != nil && castleRuntimeShapeCached(p.castle) {
 		if limit == 0 {
 			return p.castle.MatchAt(data, start)
 		}
