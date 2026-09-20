@@ -135,6 +135,12 @@ func (p *truffleProgram) validate() bool {
 }
 
 func (p *truffleProgram) MatchAtBudget(data []byte, start, maxSteps, maxResults int) ([]int, int, bool) {
+	return p.MatchAtBudgetInto(data, start, maxSteps, maxResults, nil)
+}
+
+// MatchAtBudgetInto 复用调用方提供的结束偏移缓冲；其他逻辑与 MatchAtBudget 相同。
+// Truffle 路径通常只产生少量结束偏移，复用缓冲可避免每个起点分配临时切片。
+func (p *truffleProgram) MatchAtBudgetInto(data []byte, start, maxSteps, maxResults int, dst []int) ([]int, int, bool) {
 	if !p.validate() || start < 0 || start > len(data) {
 		return nil, 0, false
 	}
@@ -144,7 +150,7 @@ func (p *truffleProgram) MatchAtBudget(data []byte, start, maxSteps, maxResults 
 	if start < len(data) && !p.core.acceptsEmpty && !bitIntersects(p.startMask, p.highSource[data[start]>>4]) {
 		return nil, 0, false
 	}
-	return p.core.MatchAtBudget(data, start, maxSteps, maxResults)
+	return p.core.MatchAtBudgetInto(data, start, maxSteps, maxResults, dst)
 }
 
 func (p *vermicelliProgram) validate() bool {
@@ -152,10 +158,15 @@ func (p *vermicelliProgram) validate() bool {
 }
 
 func (p *vermicelliProgram) MatchAtBudget(data []byte, start, maxSteps, maxResults int) ([]int, int, bool) {
+	return p.MatchAtBudgetInto(data, start, maxSteps, maxResults, nil)
+}
+
+// MatchAtBudgetInto 在调用方提供结束偏移缓冲时复用，避免多起点扫描分配临时切片。
+func (p *vermicelliProgram) MatchAtBudgetInto(data []byte, start, maxSteps, maxResults int, dst []int) ([]int, int, bool) {
 	if !p.validate() || start < 0 || start > len(data) || !prefixMatchesAt(data, start, p.prefix) {
 		return nil, 0, false
 	}
-	return p.core.MatchAtBudget(data, start, maxSteps, maxResults)
+	return p.core.MatchAtBudgetInto(data, start, maxSteps, maxResults, dst)
 }
 
 func (p *vermicelliProgram) MatchAt(data []byte, start int) []int {
@@ -2924,6 +2935,15 @@ func lbrRuntimeShapeOK(p *lbrProgram) bool {
 	return p.firstMask == firstByteMask(p.graph) && p.acceptsEmpty == graphAcceptsEmpty(p.graph)
 }
 
+// MatchAtInto 在调用方提供结束偏移缓冲时复用。
+func (p *lbrProgram) MatchAtInto(data []byte, start int, dst []int) []int {
+	if p == nil || p.graph == nil || start < 0 || start > len(data) || !lbrRuntimeShapeOK(p) {
+		return dst[:0]
+	}
+	ends, _, _ := p.matchAtBudgetInto(data, start, 0, 0, dst)
+	return ends
+}
+
 func (p *lbrProgram) MatchAt(data []byte, start int) []int {
 	ends, _, _ := p.MatchAtBudget(data, start, 0, 0)
 	return ends
@@ -4834,6 +4854,15 @@ func (p *byteNFAProgram) closureSetWithWork(seed []int, marks []uint32, generati
 	return out
 }
 
+// MatchAtInto 在调用方提供结束偏移缓冲时复用。
+func (p *byteNFAProgram) MatchAtInto(data []byte, start int, dst []int) []int {
+	if p == nil || start < 0 || start > len(data) || !byteRuntimeShapeOK(p) {
+		return dst[:0]
+	}
+	ends, _, _ := p.matchAtBudgetUnchecked(data, start, 0, 0, dst)
+	return ends
+}
+
 func (p *byteNFAProgram) MatchAt(data []byte, start int) []int {
 	if p == nil || start < 0 || start > len(data) || !byteRuntimeShapeOK(p) {
 		return nil
@@ -5371,6 +5400,9 @@ type goughProgram struct {
 	reverseMask  [][]uint64
 	predMask     [][]uint64
 	consumeMask  [256][]uint64
+	// initialMask 缓存 acceptMask 通过 reverseMask 展开并剔除 deadMask 后的初始活动集，
+	// 避免每次反向确认都按位重新展开。
+	initialMask  []uint64
 	firstMask    [4]uint64
 	acceptsEmpty bool
 	minBytes     int
@@ -5458,11 +5490,20 @@ func newGoughProgram(g *nfagraph.Graph) *goughProgram {
 	p.words = (len(p.index) + 63) / 64
 	p.acceptMask = make([]uint64, p.words)
 	p.deadMask = make([]uint64, p.words)
+	p.initialMask = make([]uint64, p.words)
 	dead := computeGraphDead(g)
 	p.reverseMask = make([][]uint64, len(p.index))
 	p.predMask = make([][]uint64, len(p.index))
 	for value := range p.consumeMask {
 		p.consumeMask[value] = make([]uint64, p.words)
+	}
+	for id, index := range p.index {
+		if g.IsAccept(id) {
+			p.acceptMask[index/64] |= 1 << uint(index%64)
+		}
+		if dead[id] {
+			p.deadMask[index/64] |= 1 << uint(index%64)
+		}
 	}
 	for id, index := range p.index {
 		if g.IsAccept(id) {
@@ -5491,6 +5532,25 @@ func newGoughProgram(g *nfagraph.Graph) *goughProgram {
 				}
 			}
 		}
+	}
+	// 计算 acceptMask 经 reverseMask 展开后的初始活动集，
+	// 反向确认时直接拷贝，避免每次按位重新展开。
+	for wi, word := range p.acceptMask {
+		for word != 0 {
+			bit := bits.TrailingZeros64(word)
+			index := wi*64 + bit
+			if index < len(p.reverseMask) {
+				for j, m := range p.reverseMask[index] {
+					if j < len(p.initialMask) {
+						p.initialMask[j] |= m
+					}
+				}
+			}
+			word &= word - 1
+		}
+	}
+	for i := range p.initialMask {
+		p.initialMask[i] &^= p.deadMask[i]
 	}
 	return p
 }
@@ -5527,6 +5587,15 @@ func (p *goughProgram) MatchAt(data []byte, start int) []int {
 		}
 	}
 	return out
+}
+
+// MatchAtInto 在调用方提供结束偏移缓冲时复用，避免每个起点分配临时切片。
+func (p *goughProgram) MatchAtInto(data []byte, start int, dst []int) []int {
+	if p == nil || p.graph == nil || start < 0 || start > len(data) || !goughRuntimeShapeOK(p) {
+		return dst[:0]
+	}
+	ends, _, _ := p.matchAtBudgetUncheckedInto(data, start, 0, 0, dst)
+	return ends
 }
 
 // MatchAtBudget 在步骤和结果预算内执行反向确认。
@@ -5591,7 +5660,7 @@ func (p *goughProgram) matchAtBudgetUncheckedInto(data []byte, start, maxSteps, 
 }
 
 func goughRuntimeShapeOK(p *goughProgram) bool {
-	if p == nil || p.graph == nil || p.graph.Flow == nil || len(p.index) != len(p.graph.Nodes) || len(p.vertices) != len(p.index) || len(p.reverseTable) != len(p.index) || len(p.predecessors) != len(p.index) || p.words <= 0 || len(p.acceptMask) != p.words || len(p.deadMask) != p.words || len(p.reverseMask) != len(p.index) || len(p.predMask) != len(p.index) {
+	if p == nil || p.graph == nil || p.graph.Flow == nil || len(p.index) != len(p.graph.Nodes) || len(p.vertices) != len(p.index) || len(p.reverseTable) != len(p.index) || len(p.predecessors) != len(p.index) || p.words <= 0 || len(p.acceptMask) != p.words || len(p.deadMask) != p.words || len(p.initialMask) != p.words || len(p.reverseMask) != len(p.index) || len(p.predMask) != len(p.index) {
 		return false
 	}
 	for value := range p.consumeMask {
@@ -5674,6 +5743,30 @@ func goughRuntimeShapeOK(p *goughProgram) bool {
 			return false
 		}
 	}
+	// 验证缓存的初始活动集与当前 acceptMask/reverseMask/deadMask 一致。
+	want := make([]uint64, p.words)
+	for wi, word := range p.acceptMask {
+		for word != 0 {
+			bit := bits.TrailingZeros64(word)
+			index := wi*64 + bit
+			if index < len(p.reverseMask) {
+				for j, m := range p.reverseMask[index] {
+					if j < len(want) {
+						want[j] |= m
+					}
+				}
+			}
+			word &= word - 1
+		}
+	}
+	for i := range want {
+		want[i] &^= p.deadMask[i]
+	}
+	for i := range want {
+		if want[i] != p.initialMask[i] {
+			return false
+		}
+	}
 	return true
 }
 
@@ -5737,19 +5830,7 @@ func (p *goughProgram) acceptsBit(data []byte, start, end int) bool {
 	work := acquireGoughWork(p.words)
 	defer releaseGoughWork(work)
 	active, next := work.active, work.next
-	for wi, word := range p.acceptMask {
-		for word != 0 {
-			bit := bits.TrailingZeros64(word)
-			index := wi*64 + bit
-			if index < len(p.reverseMask) {
-				bitOr(active, p.reverseMask[index])
-			}
-			word &= word - 1
-		}
-	}
-	for i := range active {
-		active[i] &^= p.deadMask[i]
-	}
+	copy(active, p.initialMask)
 	for pos := end; pos > start; pos-- {
 		clear(next)
 		consume := p.consumeMask[data[pos-1]]
@@ -7825,17 +7906,17 @@ func (e *Engine) preferredMatchAtInto(data []byte, start, maxSteps, maxResults i
 	switch e.Kind {
 	case EngineCastle:
 		if e.castle != nil && castleRuntimeShapeOK(e.castle) {
-			v, n, stop := e.castle.MatchAtBudget(data, start, maxSteps, maxResults)
+			v, n, stop := e.castle.matchAtBudgetUncheckedInto(data, start, maxSteps, maxResults, dst)
 			return v, n, stop, true
 		}
 	case EngineGough:
 		if e.gough != nil && goughRuntimeShapeOK(e.gough) {
-			v, n, stop := e.gough.MatchAtBudget(data, start, maxSteps, maxResults)
+			v, n, stop := e.gough.matchAtBudgetUncheckedInto(data, start, maxSteps, maxResults, dst)
 			return v, n, stop, true
 		}
 	case EngineLBR:
 		if e.lbr != nil && lbrRuntimeShapeOK(e.lbr) {
-			v, n, stop := e.lbr.MatchAtBudget(data, start, maxSteps, maxResults)
+			v, n, stop := e.lbr.matchAtBudgetInto(data, start, maxSteps, maxResults, dst)
 			return v, n, stop, true
 		}
 	case EngineLimEx:
@@ -7855,7 +7936,7 @@ func (e *Engine) preferredMatchAtInto(data []byte, start, maxSteps, maxResults i
 		}
 	case EngineShufti, EngineTruffle:
 		if e.Kind == EngineTruffle && e.truffle != nil && e.truffle.validate() {
-			v, n, stop := e.truffle.MatchAtBudget(data, start, maxSteps, maxResults)
+			v, n, stop := e.truffle.MatchAtBudgetInto(data, start, maxSteps, maxResults, dst)
 			return v, n, stop, true
 		}
 		if e.nibbleNFA != nil && nibbleRuntimeShapeOK(e.nibbleNFA) {
@@ -7864,7 +7945,7 @@ func (e *Engine) preferredMatchAtInto(data []byte, start, maxSteps, maxResults i
 		}
 	case EngineSheng, EngineVermicelli:
 		if e.Kind == EngineVermicelli && e.vermicelli != nil && e.vermicelli.validate() {
-			v, n, stop := e.vermicelli.MatchAtBudget(data, start, maxSteps, maxResults)
+			v, n, stop := e.vermicelli.MatchAtBudgetInto(data, start, maxSteps, maxResults, dst)
 			return v, n, stop, true
 		}
 		if e.Kind == EngineVermicelli && e.sparseNFA != nil && sparseRuntimeShapeOK(e.sparseNFA) {
@@ -7933,6 +8014,64 @@ func (e *Engine) MatchAt(data []byte, start int) []int {
 }
 
 // MatchAtLimit 在执行状态预算内返回指定起点的结束偏移。
+// MatchAtInto 在调用方提供结束偏移缓冲时复用，避免每个起点分配临时切片。
+// 返回值是 dst[:k]，其中 k 是结束偏移数。
+func (e *Engine) MatchAtInto(data []byte, start int, dst []int) []int {
+	if e == nil || e.Program == nil {
+		return dst[:0]
+	}
+	if !e.withinLengthBounds(data, start) {
+		return dst[:0]
+	}
+	data = e.boundedInput(data, start)
+	if ends, _, _, ok := e.preferredMatchAtInto(data, start, 0, 0, dst); ok {
+		return ends
+	}
+	if e.castle != nil && castleRuntimeShapeOK(e.castle) {
+		return e.castle.MatchAtInto(data, start, dst)
+	}
+	if e.gough != nil && goughRuntimeShapeOK(e.gough) {
+		return e.gough.MatchAtInto(data, start, dst)
+	}
+	if repeatUsable(e) {
+		return e.repeat.MatchAtInto(data, start, dst)
+	}
+	if e.mpv != nil && e.mpv.validate() == nil {
+		return e.mpv.MatchAtInto(data, start, dst)
+	}
+	if e.byteNFA != nil && byteRuntimeShapeOK(e.byteNFA) {
+		return e.byteNFA.MatchAtInto(data, start, dst)
+	}
+	if e.bitNFA != nil && bitRuntimeShapeOK(e.bitNFA) {
+		ends, _, _ := e.bitNFA.MatchAtBudgetInto(data, start, 0, 0, dst)
+		return ends
+	}
+	if e.sparseNFA != nil && sparseRuntimeShapeOK(e.sparseNFA) {
+		ends, _, _ := e.sparseNFA.MatchAtBudgetInto(data, start, 0, 0, dst)
+		return ends
+	}
+	if e.nibbleNFA != nil && nibbleRuntimeShapeOK(e.nibbleNFA) {
+		ends, _, _ := e.nibbleNFA.MatchAtBudgetInto(data, start, 0, 0, dst)
+		return ends
+	}
+	if e.rangeNFA != nil && rangeRuntimeShapeOK(e.rangeNFA) {
+		ends, _, _ := e.rangeNFA.MatchAtBudgetInto(data, start, 0, 0, dst)
+		return ends
+	}
+	if e.tableNFA != nil && tableRuntimeShapeOK(e.tableNFA) {
+		ends, _, _ := e.tableNFA.MatchAtBudgetInto(data, start, 0, 0, dst)
+		return ends
+	}
+	if e.lbr != nil && lbrRuntimeShapeOK(e.lbr) {
+		return e.lbr.MatchAtInto(data, start, dst)
+	}
+	out := dst[:0]
+	for _, end := range e.Program.matchAtLimit(data, start, 0, false, false) {
+		out = append(out, end)
+	}
+	return out
+}
+
 func (e *Engine) MatchAtLimit(data []byte, start, limit int) []int {
 	if e == nil || e.Program == nil || limit < 0 {
 		return nil
@@ -8038,13 +8177,17 @@ func (e *Engine) SpansLimit(data []byte, limit int) []Span {
 	if e.Independent() && (e.Kind == EngineLimEx || e.Kind == EngineSheng || e.Kind == EngineMcSheng || e.Kind == EngineTamarama || e.Kind == EngineVermicelli || e.Kind == EngineShufti || e.Kind == EngineTruffle) {
 		out := make([]Span, 0, initialSpanCapacity(data, limit))
 		prefix, candidateMask, acceptsEmpty, backend := e.executionCandidates()
+		// 复用确认路径的结束偏移缓冲，避免每个起点分配临时切片。
+		endsBuf := make([]int, 0, 8)
 		forEachNFAStart(data, prefix, candidateMask, acceptsEmpty, backend, func(start int) bool {
 			bounded := e.boundedInput(data, start)
-			ends, _, _, ok := e.preferredMatchAt(bounded, start, 0, 0)
+			ends, _, _, ok := e.preferredMatchAtInto(bounded, start, 0, 0, endsBuf[:0])
 			if !ok {
 				// 预过滤只能缩小候选集合，专用布局失效时必须对当前
 				// 候选执行完整确认，不能把候选误当成最终结果。
 				ends = e.Program.MatchAt(bounded, start)
+			} else {
+				endsBuf = ends
 			}
 			if !ok && len(ends) == 0 {
 				// 当前起点确认失败后继续检查后续候选，不能提前结束全局扫描。

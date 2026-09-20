@@ -450,6 +450,15 @@ func newCastleProgram(g *nfagraph.Graph) *castleProgram {
 	return p
 }
 
+// MatchAtInto 在调用方提供结束偏移缓冲时复用，避免每个起点分配临时切片。
+func (p *castleProgram) MatchAtInto(data []byte, start int, dst []int) []int {
+	if p == nil || p.graph == nil || start < 0 || start > len(data) || !castleRuntimeShapeOK(p) {
+		return dst[:0]
+	}
+	ends, _, _ := p.matchAtBudgetUncheckedInto(data, start, 0, 0, dst)
+	return ends
+}
+
 func (p *castleProgram) MatchAt(data []byte, start int) []int {
 	if p == nil || p.graph == nil || start < 0 || start > len(data) || !castleRuntimeShapeOK(p) {
 		return nil

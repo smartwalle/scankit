@@ -207,13 +207,13 @@
 
 K-14 本轮证据：`internal/repeat/repeat.go` 新增可复用结束偏移缓冲，并将区间、终点区间、全局预算和最大命中数路径统一到低分配的重复执行；全局预算扫描直接枚举文字候选起点，保留步骤超限和结果超限的原有语义。`internal/nfa/engines.go` 进一步收紧纯文字重复图识别：统一周期、前缀和分支边界经过编译期等价检查后才启用 Repeat；MPV 文字分支按编译期长度顺序直接输出，MatchAt、区间、Spans、预算及上下文路径均支持结束偏移缓冲复用；MPV 运行时校验改为无临时 map/string 分配的前缀与重复分支检查。验证命令：`go test ./internal/repeat ./internal/nfa`。
 
-K-15 本轮证据：`internal/nfa/engines.go` 的 LBR 整块扫描在布局校验后复用紧凑状态队列和结束偏移缓冲执行，边界断言、结果去重、步骤/结果/队列预算与不支持查找断言的通用确认回退保持一致。验证命令：`go test ./internal/nfa`。
+K-15 本轮证据：`internal/nfa/engines.go` 的 LBR 整块扫描在布局校验后复用紧凑状态队列和结束偏移缓冲执行，边界断言、结果去重、步骤/结果/队列预算与不支持查找断言的通用确认回退保持一致。Gough 反向确认缓存 `acceptMask` 经 `reverseMask` 展开并剔除 `deadMask` 后的 `initialMask`，避免每次 `MatchAt` 重复按位重新展开；`goughRuntimeShapeOK` 在末尾验证缓存与实时位掩码一致。LBR、Gough、Castle、字节 NFA、Sheng、McSheng、Tamarama、Vermicelli、Shufti、Truffle 等布局均新增 `MatchAtInto` 入口并在主选择路径统一复用结束偏移缓冲。`internal/nfa/engines.go` 的 `Engine.SpansLimit` 改用 `preferredMatchAtInto` 复用确认结果缓冲。验证命令：`go test ./internal/nfa`、`go test ./...`。
 
 K-16 本轮证据：`EngineSelection` 增加稳定的相对代价和 bailout 原因，`estimateEngineCost` 综合状态、边、分支、字符类、断言、重复及布局内存压力；诊断现在保留实际编译错误并区分资源预算拒绝与专用布局不可用，选择诊断不改变执行路径。验证命令：`go test ./internal/nfa`。
 
 K-17 本轮证据：`internal/dfa/rdfa.go` 将反向宽度改为按起点到接受节点的路径 DFS 计算，正确处理分支、汇合和回边；无界消费循环安全拒绝反向表，避免节点宽度简单求和造成错误边界；反向确认新增起点缓冲复用，整块反向区间扫描不再为每个结束偏移创建临时切片。验证命令：`go test ./internal/dfa`。
 
-K-19 本轮证据：`internal/rose/rose.go` 为 Miracle 多角色候选增加首字节掩码和向量分块筛选，并提供角色状态切片复用入口；`scanner.go` 在编译期缓存不可变 Rose 角色图，并通过并发安全的状态缓冲池复用命中切片，避免每个 Block 重建角色、指令和自动机；无确认纯文字角色在整块扫描时直接消费已排序角色命中，跳过调度队列和重复确认，SingleMatch/Quiet 仍按规则标志处理。候选命中仍执行完整角色边界/偏移确认，排序、去重和调度结果保持原有语义。验证命令：`go test ./internal/rose ./...`。
+K-19 本轮证据：`internal/rose/rose.go` 为 Miracle 多角色候选增加首字节掩码和向量分块筛选，并提供角色状态切片复用入口；`scanner.go` 在编译期缓存不可变 Rose 角色图，并通过并发安全的状态缓冲池复用命中切片，避免每个 Block 重建角色、指令和自动机；新增 `roseSinglePool` 复用 SingleMatch 规则的去重表，避免每次 Block 扫描都分配 `map[uint32]struct{}`；无确认纯文字角色在整块扫描时直接消费已排序角色命中，跳过调度队列和重复确认，SingleMatch/Quiet 仍按规则标志处理。`matchRuleInto` 和 `Engine.MatchAtInto` 在主选择路径复用结束偏移缓冲；`compiledRule` 预先计算 `containsAny`、`requiresEndOfData`、`backendEligible` 和 `nonGreedy`，避免每个起点重复遍历 AST。`fastLiteral` 路径使用栈上候选缓冲复用 `literalFindInto` 的结果。验证命令：`go test ./internal/rose ./...`、`go test -run '^$' -bench 'ScanRuleScales' -benchtime=3x .`。
 
 K-18 本轮证据：`internal/hwlm/noodle/noodle.go` 的前缀树候选路径及 `internal/hwlm/teddy/teddy.go` 均支持向调用方结果切片写入，消除候选起点的临时结果切片；尾部扫描同时覆盖原始与 ASCII 折叠首字节，FDR/Teddy/Noodle 统一保持候选确认、重叠和去重语义。验证命令：`go test ./internal/hwlm/noodle ./internal/hwlm ./internal/hwlm/teddy ./internal/fdr ./internal/simd ./...`。
 

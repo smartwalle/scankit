@@ -64,6 +64,7 @@ func normalizeScannerUnicodeProperty(name string) string {
 type Scanner struct {
 	contextPool     *sync.Pool
 	roseStatePool   *sync.Pool
+	roseSinglePool  *sync.Pool
 	rules           []compiledRule
 	ruleIndex       map[uint32]int
 	ruleOrder       map[uint32]int
@@ -87,6 +88,9 @@ type scanContext struct {
 	literalEnds       map[int]map[uint32]int
 	prefilterStarts   map[uint32]map[int]struct{}
 	literalCandidates []literalCandidate
+	// ruleMatchBuf 复用规则 NFA/Repeat 路径的结束偏移缓冲，
+	// 避免每个起点都重新分配临时切片。
+	ruleMatchBuf []int
 }
 
 type literalCandidate struct {
@@ -107,10 +111,26 @@ type compiledRule struct {
 	smallWrite *smallwrite.Program
 	repeat     *repeat.Program
 	nfaEngine  *nfalib.Engine
+	// backendEligible 缓存 backendEligible 函数的结果，
+	// 避免每个起点重复遍历 AST。
+	backendEligible bool
+	// requiresEndOfData 缓存 requiresEndOfData 的结果。
+	requiresEndOfData bool
+	// containsAny 缓存 containsAny 的结果。
+	containsAny bool
+	// nonGreedy 缓存 firstRepeatPreference 的结果，表示规则是否偏好非贪婪。
+	nonGreedy bool
 }
 
 func newScanner(rules []compiledRule) *Scanner {
 	copyRules := append([]compiledRule(nil), rules...)
+	// 预先计算每条规则的 AST 派生属性，避免扫描时重复遍历规则树。
+	for i := range copyRules {
+		copyRules[i].containsAny = containsAny(copyRules[i].root)
+		copyRules[i].requiresEndOfData = requiresEndOfData(copyRules[i].root)
+		copyRules[i].backendEligible = backendEligible(copyRules[i])
+		copyRules[i].nonGreedy = firstRepeatPreference(copyRules[i].root)
+	}
 	index := make(map[uint32]int, len(copyRules))
 	order := make(map[uint32]int, len(copyRules))
 	candidateIDs := make(map[uint32]struct{})
@@ -141,7 +161,7 @@ func newScanner(rules []compiledRule) *Scanner {
 			}
 		}
 	}
-	scanner := &Scanner{rules: copyRules, ruleIndex: index, ruleOrder: order, hasCombo: hasCombo, candidateIDs: candidateIDs, literalIDs: literalIDs, contextPool: &sync.Pool{New: func() any { return &scanContext{Scratch: scratch.New(), Reports: report.New()} }}, roseStatePool: &sync.Pool{New: func() any { return new([]rose.State) }}}
+	scanner := &Scanner{rules: copyRules, ruleIndex: index, ruleOrder: order, hasCombo: hasCombo, candidateIDs: candidateIDs, literalIDs: literalIDs, contextPool: &sync.Pool{New: func() any { return &scanContext{Scratch: scratch.New(), Reports: report.New()} }}, roseStatePool: &sync.Pool{New: func() any { return new([]rose.State) }}, roseSinglePool: &sync.Pool{New: func() any { return new(map[uint32]struct{}) }}}
 	if len(literals) > 1 {
 		scanner.literalKind, scanner.literalFind, scanner.literalFindInto = newLiteralCandidateFinder(literals)
 	}
@@ -637,7 +657,7 @@ func (scanner *Scanner) clone() *Scanner {
 
 // backendEligible 判断规则是否可以直接使用已编译后端完成单次扫描。
 func backendEligible(rule compiledRule) bool {
-	if rule.program == nil || rule.repeat != nil || rule.comb != nil || rule.ext != nil || containsAny(rule.root) || requiresEndOfData(rule.root) || rule.flags&FlagSOMLeftmost != 0 {
+	if rule.program == nil || rule.repeat != nil || rule.comb != nil || rule.ext != nil || rule.containsAny || rule.requiresEndOfData || rule.flags&FlagSOMLeftmost != 0 {
 		return false
 	}
 	if _, _, fixed := parser.FixedWidth(rule.root); !fixed {
@@ -791,7 +811,7 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 	backendRuleCount := 0
 	if backendOnly {
 		for _, rule := range scanner.rules {
-			if !backendEligible(rule) {
+			if !rule.backendEligible {
 				continue
 			}
 			backendRuleCount++
@@ -810,7 +830,14 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 		return matches, nil
 	}
 	if fastLiteral && scanner.literalFind != nil {
-		candidates := scanner.literalFind(data)
+		// 复用栈上缓冲，避免每次扫描都重新分配候选切片。
+		var candBuf [16]literalCandidate
+		var candidates []literalCandidate
+		if scanner.literalFindInto != nil {
+			candidates = scanner.literalFindInto(data, candBuf[:0])
+		} else {
+			candidates = scanner.literalFind(data)
+		}
 		if cap(matches)-len(matches) < len(candidates) {
 			grown := make([]Match, len(matches), len(matches)+len(candidates))
 			copy(grown, matches)
@@ -845,18 +872,15 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 		ctx.fired = ctx.fired[:0]
 		ctx.comboTriggers = ctx.comboTriggers[:0]
 		ctx.literalCandidates = ctx.literalCandidates[:0]
+		ctx.ruleMatchBuf = ctx.ruleMatchBuf[:0]
 		for id, starts := range ctx.prefilterStarts {
 			if len(starts) > 1<<20 {
 				delete(ctx.prefilterStarts, id)
 				continue
 			}
-			for start := range starts {
-				delete(starts, start)
-			}
+			clear(starts)
 		}
-		for key := range ctx.literalEnds {
-			delete(ctx.literalEnds, key)
-		}
+		clear(ctx.literalEnds)
 		pool.Put(ctx)
 	}()
 	// 每个起点都必须独立求值，块模式允许同一规则产生重叠命中。
@@ -892,9 +916,7 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 				literalEnds = make(map[int]map[uint32]int)
 				ctx.literalEnds = literalEnds
 			}
-			for key := range literalEnds {
-				delete(literalEnds, key)
-			}
+			clear(literalEnds)
 			for _, candidate := range literalCandidates {
 				if literalEnds[candidate.From] == nil {
 					literalEnds[candidate.From] = make(map[uint32]int)
@@ -907,9 +929,7 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 			literalEnds = make(map[int]map[uint32]int)
 			ctx.literalEnds = literalEnds
 		}
-		for key := range literalEnds {
-			delete(literalEnds, key)
-		}
+		clear(literalEnds)
 		scanner.fillSingleLiteralEnds(data, literalEnds)
 	}
 	for _, rule := range scanner.rules {
@@ -970,7 +990,7 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 	}
 	for start := 0; start <= len(data); start++ {
 		for ri, rule := range scanner.rules {
-			if backendOnly && backendEligible(rule) {
+			if backendOnly && rule.backendEligible {
 				continue
 			}
 			if ctx.Reports.Stopped() {
@@ -1003,17 +1023,21 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 				if _, exact := scanner.literalIDs[rule.id]; exact {
 					ends = []int{end}
 				} else {
-					ends = matchRule(rule, data, start)
+					ends = matchRuleInto(rule, data, start, ctx.ruleMatchBuf[:0])
+					ctx.ruleMatchBuf = ends
 				}
 			} else {
-				ends = matchRule(rule, data, start)
+				ends = matchRuleInto(rule, data, start, ctx.ruleMatchBuf[:0])
+				ctx.ruleMatchBuf = ends
 			}
 			end := -1
-			nonGreedy := firstRepeatPreference(rule.root)
-			for _, candidate := range ends {
-				if end < 0 || (!nonGreedy && candidate > end) || (nonGreedy && candidate < end) {
-					end = candidate
+			// 结束偏移已按升序排序，直接取边界值即可获得贪婪/非贪婪的首选结束。
+			if rule.nonGreedy {
+				if len(ends) > 0 {
+					end = ends[0]
 				}
+			} else if len(ends) > 0 {
+				end = ends[len(ends)-1]
 			}
 			if end < 0 || end > len(data) {
 				continue
@@ -1137,7 +1161,16 @@ func (scanner *Scanner) scanRoseDirectInto(data []byte, dst []Match) []Match {
 		pool.Put(stateBuffer)
 	}()
 	out := dst[:0]
-	var single map[uint32]struct{}
+	// 复用 SingleMatch 规则的去重表，避免每次扫描都分配 map。
+	singlePtr, _ := scanner.roseSinglePool.Get().(*map[uint32]struct{})
+	if singlePtr == nil {
+		singlePtr = new(map[uint32]struct{})
+	}
+	single := *singlePtr
+	defer func() {
+		clear(single)
+		scanner.roseSinglePool.Put(singlePtr)
+	}()
 	for _, state := range states {
 		role, ok := program.FindRole(state.RoleID)
 		if !ok {
@@ -1152,9 +1185,6 @@ func (scanner *Scanner) scanRoseDirectInto(data []byte, dst []Match) []Match {
 			continue
 		}
 		if rule.flags&FlagSingleMatch != 0 {
-			if single == nil {
-				single = make(map[uint32]struct{})
-			}
 			if _, exists := single[rule.id]; exists {
 				continue
 			}
@@ -1356,6 +1386,12 @@ func firstRepeatPreference(n parser.Node) bool {
 }
 
 func matchRule(rule compiledRule, data []byte, start int) []int {
+	return matchRuleInto(rule, data, start, nil)
+}
+
+// matchRuleInto 在已确认快路径规则上复用调用方提供的结束偏移缓冲，
+// 避免每次起点重新分配结果切片。Fuzzy、Backreference、Conditional 仍返回新切片。
+func matchRuleInto(rule compiledRule, data []byte, start int, endsBuf []int) []int {
 	if containsBackreference(rule.root) || containsConditional(rule.root) {
 		states := matchCaptured(rule.root, data, start, rule.flags, make(map[int][]byte))
 		out := make([]int, 0, len(states))
@@ -1372,10 +1408,10 @@ func matchRule(rule compiledRule, data []byte, start int) []int {
 			return []int{start + rule.smallBlock.Size()}
 		}
 		if rule.repeat != nil {
-			return rule.repeat.MatchAt(data, start)
+			return rule.repeat.MatchAtInto(data, start, endsBuf[:0])
 		}
 		if rule.nfaEngine != nil {
-			return rule.nfaEngine.MatchAt(data, start)
+			return rule.nfaEngine.MatchAtInto(data, start, endsBuf[:0])
 		}
 	}
 	if rule.ext != nil && rule.ext.Flags&(ExtFlagEditDistance|ExtFlagHammingDistance) != 0 {
