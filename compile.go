@@ -1,6 +1,120 @@
 package scankit
 
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/smartwalle/scankit/internal/combination"
+	"github.com/smartwalle/scankit/internal/compiler"
+	"github.com/smartwalle/scankit/internal/dfa"
+	"github.com/smartwalle/scankit/internal/engine"
+	nfalib "github.com/smartwalle/scankit/internal/nfa"
+	"github.com/smartwalle/scankit/internal/nfagraph"
+	"github.com/smartwalle/scankit/internal/parser"
+	"github.com/smartwalle/scankit/internal/prefilter"
+	"github.com/smartwalle/scankit/internal/repeat"
+	"github.com/smartwalle/scankit/internal/smallengine"
+)
+
 type CompileFlag uint32
+
+// String 返回组合标志名称，未知位以十六进制保留。
+func (f CompileFlag) String() string {
+	if f == 0 {
+		return "0"
+	}
+	names := []struct {
+		flag CompileFlag
+		name string
+	}{{FlagCaseless, "caseless"}, {FlagDotAll, "dotall"}, {FlagMultiline, "multiline"}, {FlagSingleMatch, "singlematch"}, {FlagAllowEmpty, "allowempty"}, {FlagUTF8, "utf8"}, {FlagUCP, "ucp"}, {FlagPrefilter, "prefilter"}, {FlagSOMLeftmost, "som-leftmost"}, {FlagCombination, "combination"}, {FlagQuiet, "quiet"}}
+	out := ""
+	for _, item := range names {
+		if f&item.flag != 0 {
+			if out != "" {
+				out += "|"
+			}
+			out += item.name
+		}
+	}
+	if unknown := uint32(f &^ (FlagCaseless | FlagDotAll | FlagMultiline | FlagSingleMatch | FlagAllowEmpty | FlagUTF8 | FlagUCP | FlagPrefilter | FlagSOMLeftmost | FlagCombination | FlagQuiet)); unknown != 0 {
+		if out != "" {
+			out += "|"
+		}
+		out += "0x" + strconv.FormatUint(uint64(unknown), 16)
+	}
+	return out
+}
+
+func (f CompileFlag) Valid() bool {
+	known := FlagCaseless | FlagDotAll | FlagMultiline | FlagSingleMatch | FlagAllowEmpty | FlagUTF8 | FlagUCP | FlagPrefilter | FlagSOMLeftmost | FlagCombination | FlagQuiet
+	return f&^known == 0
+}
+func (f CompileFlag) Has(flag CompileFlag) bool { return f&flag != 0 }
+
+func validateCompileFlags(flags CompileFlag) error {
+	if !flags.Valid() {
+		return fmt.Errorf("invalid compile flag")
+	}
+	switch {
+	case flags&FlagSingleMatch != 0 && flags&FlagSOMLeftmost != 0:
+		return fmt.Errorf("singlematch is not supported with som-leftmost")
+	case flags&FlagQuiet != 0 && flags&FlagSOMLeftmost != 0:
+		return fmt.Errorf("quiet is not supported with som-leftmost")
+	case flags&FlagPrefilter != 0 && flags&FlagSOMLeftmost != 0:
+		return fmt.Errorf("prefilter is not supported with som-leftmost")
+	case flags&FlagCombination != 0 && flags&^(FlagCombination|FlagQuiet|FlagSingleMatch) != 0:
+		return fmt.Errorf("only quiet and singlematch are supported with combination")
+	}
+	return nil
+}
+
+// ParseCompileFlag 解析以 | 分隔的公开标志名称。
+func ParseCompileFlag(value string) (CompileFlag, error) {
+	if strings.TrimSpace(value) == "" || strings.TrimSpace(value) == "0" {
+		return 0, nil
+	}
+	var out CompileFlag
+	for _, part := range strings.Split(value, "|") {
+		part = strings.TrimSpace(strings.ToLower(part))
+		found := false
+		for _, item := range []struct {
+			name string
+			flag CompileFlag
+		}{{"caseless", FlagCaseless}, {"dotall", FlagDotAll}, {"multiline", FlagMultiline}, {"singlematch", FlagSingleMatch}, {"allowempty", FlagAllowEmpty}, {"utf8", FlagUTF8}, {"ucp", FlagUCP}, {"prefilter", FlagPrefilter}, {"som-leftmost", FlagSOMLeftmost}, {"combination", FlagCombination}, {"quiet", FlagQuiet}} {
+			if part == item.name {
+				out |= item.flag
+				found = true
+				break
+			}
+		}
+		if !found {
+			return 0, fmt.Errorf("unknown compile flag %q", part)
+		}
+	}
+	if !out.Valid() {
+		return 0, fmt.Errorf("invalid compile flag combination")
+	}
+	return out, nil
+}
+
+// CompileFlag 定义表达式编译选项的位标志。
+const (
+	FlagCaseless    CompileFlag = 1
+	FlagDotAll      CompileFlag = 2
+	FlagMultiline   CompileFlag = 4
+	FlagSingleMatch CompileFlag = 8
+	FlagAllowEmpty  CompileFlag = 16
+	FlagUTF8        CompileFlag = 32
+	FlagUCP         CompileFlag = 64
+	FlagPrefilter   CompileFlag = 128
+	FlagSOMLeftmost CompileFlag = 256
+	FlagCombination CompileFlag = 512
+	FlagQuiet       CompileFlag = 1024
+)
 
 type Expression struct {
 	Id      uint32
@@ -9,7 +123,75 @@ type Expression struct {
 	Ext     *ExpressionExt
 }
 
+// Validate 检查单条表达式的标志和扩展参数，不执行图构造。
+func (e Expression) Validate() error {
+	if err := validateCompileFlags(e.Flags); err != nil {
+		return err
+	}
+	return e.Ext.Validate()
+}
+
 type ExpressionExtFlag uint64
+
+func (f ExpressionExtFlag) String() string {
+	if f == 0 {
+		return "0"
+	}
+	parts := ""
+	for _, item := range []struct {
+		flag ExpressionExtFlag
+		name string
+	}{{ExtFlagMinOffset, "min-offset"}, {ExtFlagMaxOffset, "max-offset"}, {ExtFlagMinLength, "min-length"}, {ExtFlagEditDistance, "edit-distance"}, {ExtFlagHammingDistance, "hamming-distance"}} {
+		if f&item.flag != 0 {
+			if parts != "" {
+				parts += "|"
+			}
+			parts += item.name
+		}
+	}
+	if unknown := uint64(f &^ (ExtFlagMinOffset | ExtFlagMaxOffset | ExtFlagMinLength | ExtFlagEditDistance | ExtFlagHammingDistance)); unknown != 0 {
+		if parts != "" {
+			parts += "|"
+		}
+		parts += "0x" + strconv.FormatUint(unknown, 16)
+	}
+	return parts
+}
+
+// ParseExpressionExtFlag 解析扩展参数标志名称。
+func ParseExpressionExtFlag(value string) (ExpressionExtFlag, error) {
+	if strings.TrimSpace(value) == "" || strings.TrimSpace(value) == "0" {
+		return 0, nil
+	}
+	var out ExpressionExtFlag
+	for _, part := range strings.Split(value, "|") {
+		part = strings.TrimSpace(strings.ToLower(part))
+		found := false
+		for _, item := range []struct {
+			name string
+			flag ExpressionExtFlag
+		}{{"min-offset", ExtFlagMinOffset}, {"max-offset", ExtFlagMaxOffset}, {"min-length", ExtFlagMinLength}, {"edit-distance", ExtFlagEditDistance}, {"hamming-distance", ExtFlagHammingDistance}} {
+			if part == item.name {
+				out |= item.flag
+				found = true
+				break
+			}
+		}
+		if !found {
+			return 0, fmt.Errorf("unknown extension flag %q", part)
+		}
+	}
+	return out, nil
+}
+
+// ExpressionExtFlag 定义表达式扩展选项的位标志。
+const (
+	ExtFlagMinOffset       ExpressionExtFlag = 1
+	ExtFlagMaxOffset       ExpressionExtFlag = 2
+	ExtFlagMinLength       ExpressionExtFlag = 4
+	ExtFlagEditDistance    ExpressionExtFlag = 8
+	ExtFlagHammingDistance ExpressionExtFlag = 16
+)
 
 type ExpressionExt struct {
 	Flags           ExpressionExtFlag
@@ -20,7 +202,591 @@ type ExpressionExt struct {
 	HammingDistance uint32
 }
 
+func (e *ExpressionExt) Clone() *ExpressionExt {
+	if e == nil {
+		return nil
+	}
+	c := *e
+	return &c
+}
+
+// Enabled 判断扩展标志是否已启用。
+func (e *ExpressionExt) Enabled(flag ExpressionExtFlag) bool {
+	return e != nil && e.Flags&flag != 0
+}
+
+// OffsetAllowed 判断指定匹配结束偏移是否满足扩展偏移范围。
+func (e *ExpressionExt) OffsetAllowed(offset uint64) bool {
+	if e == nil {
+		return true
+	}
+	if e.Flags&ExtFlagMinOffset != 0 && offset < e.MinOffset {
+		return false
+	}
+	return e.Flags&ExtFlagMaxOffset == 0 || offset <= e.MaxOffset
+}
+
+// EndOffsetAllowed 是 OffsetAllowed 的兼容别名。
+func (e *ExpressionExt) EndOffsetAllowed(offset uint64) bool { return e.OffsetAllowed(offset) }
+
+// OffsetRange 返回启用的结束偏移范围；未设置边界时返回无界标记。
+func (e *ExpressionExt) OffsetRange() (min, max uint64, bounded bool) {
+	if e == nil {
+		return 0, 0, false
+	}
+	if e.Flags&ExtFlagMinOffset != 0 {
+		min = e.MinOffset
+	}
+	if e.Flags&ExtFlagMaxOffset != 0 {
+		max, bounded = e.MaxOffset, true
+	}
+	return min, max, bounded
+}
+
+// LengthAllowed 判断指定长度是否满足扩展最小长度约束。
+func (e *ExpressionExt) LengthAllowed(length uint64) bool {
+	return e == nil || e.Flags&ExtFlagMinLength == 0 || length >= e.MinLength
+}
+func (e *ExpressionExt) Validate() error {
+	if e == nil {
+		return nil
+	}
+	known := ExtFlagMinOffset | ExtFlagMaxOffset | ExtFlagMinLength | ExtFlagEditDistance | ExtFlagHammingDistance
+	if e.Flags&^known != 0 {
+		return fmt.Errorf("unknown extension flag")
+	}
+	if e.Flags&ExtFlagEditDistance != 0 && e.Flags&ExtFlagHammingDistance != 0 {
+		return fmt.Errorf("edit and hamming distance are mutually exclusive")
+	}
+	if e.Flags&ExtFlagMinOffset != 0 && e.Flags&ExtFlagMaxOffset != 0 && e.MaxOffset < e.MinOffset {
+		return fmt.Errorf("maximum offset below minimum offset")
+	}
+	if e.Flags&ExtFlagMinLength != 0 && e.Flags&ExtFlagMaxOffset != 0 && e.MinLength > e.MaxOffset {
+		return fmt.Errorf("minimum length exceeds maximum offset")
+	}
+	return nil
+}
+
 // Compile 编译全部表达式并返回不可变 Scanner。
 func Compile(expressions []Expression) (*Scanner, error) {
-	return nil, nil
+	return compileWithContext(context.Background(), expressions, compiler.CompileLimits{})
+}
+
+func compileWithContext(ctx context.Context, expressions []Expression, limits compiler.CompileLimits) (*Scanner, error) {
+	if len(expressions) == 0 {
+		return nil, fmt.Errorf("no expressions")
+	}
+	rules := make([]compiledRule, 0, len(expressions))
+	seen := make(map[uint32]struct{}, len(expressions))
+	var totalUsage compiler.Usage
+	for i, expression := range expressions {
+		if err := ctx.Err(); err != nil {
+			return nil, &compiler.CompileError{Kind: compiler.ErrorCancelled, Expression: i, Message: "compile cancelled"}
+		}
+		if _, ok := seen[expression.Id]; ok {
+			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Position: 0, Message: "duplicate expression id"}
+		}
+		seen[expression.Id] = struct{}{}
+		if err := expression.Validate(); err != nil {
+			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Position: 0, Message: err.Error()}
+		}
+		flags := expression.Flags
+		pattern, flags, extended, err := consumeLeadingInlineFlags(expression.Pattern, flags)
+		if err != nil {
+			return nil, &compiler.CompileError{Kind: compiler.ErrorSyntax, Expression: i, Position: 0, Message: err.Error()}
+		}
+		if flags&FlagUTF8 != 0 && !utf8.ValidString(pattern) {
+			return nil, &compiler.CompileError{Kind: compiler.ErrorSyntax, Expression: i, Position: 0, Message: "pattern is not valid UTF-8"}
+		}
+		if err := validateCompileFlags(flags); err != nil {
+			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}
+		}
+		if flags&FlagCombination != 0 && expression.Ext != nil && expression.Ext.Flags&^(ExtFlagMinOffset|ExtFlagMaxOffset) != 0 {
+			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: "only offset extensions are supported with combination"}
+		}
+		var root parser.Node
+		var combNode parser.Node
+		if flags&FlagCombination != 0 {
+			combNode, err = parser.ParseCombination(pattern)
+			if err == nil {
+				combNode = combination.Normalize(combNode)
+				root = combNode
+			}
+		} else {
+			root, err = parser.ParseWithExtended(pattern, extended)
+		}
+		if err != nil {
+			position := 0
+			if parseErr, ok := err.(*parser.ParseError); ok {
+				position = parseErr.Position
+			}
+			return nil, &compiler.CompileError{Kind: compiler.ErrorSyntax, Expression: i, Position: position, Message: err.Error()}
+		}
+		root = parser.Normalize(root)
+		if flags&FlagCombination != 0 {
+			if err := parser.Validate(root); err != nil {
+				return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}
+			}
+			if err := expression.Ext.Validate(); err != nil {
+				return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}
+			}
+			var extCopy *ExpressionExt
+			var extFlags ExpressionExtFlag
+			if expression.Ext != nil {
+				copyValue := *expression.Ext
+				extCopy = &copyValue
+				extFlags = expression.Ext.Flags
+			}
+			comboBytes := uint64(len(expression.Pattern))
+			totalUsage.Add(compiler.Usage{ProgramBytes: comboBytes, MemoryBytes: comboBytes})
+			if err := limits.Check(totalUsage); err != nil {
+				return nil, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Message: err.Error()}
+			}
+			info := compiler.DeriveExpressionInfo(expression.Id, uint32(flags), uint64(extFlags), root, nil)
+			applyExpressionAttributes(&info, flags, extCopy)
+			rules = append(rules, compiledRule{id: expression.Id, root: root, comb: combNode, flags: flags, ext: extCopy, info: info})
+			continue
+		}
+		if parser.Nullable(root) && flags&FlagAllowEmpty == 0 {
+			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: "empty match requires allow-empty flag"}
+		}
+		if err := parser.Validate(root); err != nil {
+			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Position: 0, Message: err.Error()}
+		}
+		if err := expression.Ext.Validate(); err != nil {
+			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}
+		}
+		ng, err := nfagraph.NewBuilder().Build(root)
+		if err != nil {
+			// 图构造失败时继续保留 AST；运行期会走完整语义匹配器。
+			var extCopy *ExpressionExt
+			var extFlags ExpressionExtFlag
+			if expression.Ext != nil {
+				copyValue := *expression.Ext
+				extCopy = &copyValue
+				extFlags = copyValue.Flags
+			}
+			usage := compiler.Usage{ProgramBytes: uint64(len(pattern)), MemoryBytes: uint64(len(pattern))}
+			totalUsage.Add(usage)
+			if err := limits.Check(totalUsage); err != nil {
+				return nil, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Position: 0, Message: err.Error()}
+			}
+			info := compiler.DeriveExpressionInfo(expression.Id, uint32(flags), uint64(extFlags), root, nil)
+			applyExpressionAttributes(&info, flags, extCopy)
+			info.GraphFallback = true
+			info.SetBailout("graph-build")
+			rules = append(rules, compiledRule{id: expression.Id, root: root, flags: flags, ext: extCopy, info: info})
+			continue
+		}
+		optimized := true
+		if _, err := nfagraph.Optimize(ng); err != nil {
+			// 优化不收敛不应使合法表达式编译失败；Optimize 已恢复原图，
+			// 后续继续使用未优化图并记录降级原因。
+			optimized = false
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, &compiler.CompileError{Kind: compiler.ErrorCancelled, Expression: i, Message: "compile cancelled"}
+		}
+		graphEdges := uint64(ng.EdgeCount())
+		graphUsage := compiler.Usage{GraphVertices: uint64(ng.NodeCount()), GraphEdges: graphEdges}
+		if err := limits.Check(totalUsage.Merge(graphUsage)); err != nil {
+			return nil, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Position: 0, Message: err.Error()}
+		}
+		dfaLimit := 0
+		if limits.DFAStates > 0 && limits.DFAStates <= uint64(^uint(0)>>1) {
+			dfaLimit = int(limits.DFAStates)
+		}
+		// 依赖断言、回溯或 Unicode 语义的规则保留 AST 确认路径，
+		// 图仅作为元数据，不构造可能产生误报的字节后端。
+		features := engine.SelectionFeatures{
+			Stateful:   parser.RequiresStatefulRuntime(root),
+			Assertions: parser.HasAssertion(root) || containsAny(root),
+			UTF8:       flags&FlagUTF8 != 0,
+			UCP:        flags&(FlagUCP|FlagCaseless|FlagMultiline|FlagDotAll) != 0,
+		}
+		var autoProgram *engine.Program
+		if !features.Stateful && !features.Assertions && !features.UTF8 && !features.UCP {
+			autoProgram, err = engine.CompileAutoWithFeatures(ng, features, dfaLimit, limits.MemoryBytes)
+			if err != nil {
+				kind := compiler.ErrorUnsupported
+				if errors.Is(err, nfalib.ErrStateLimit) || errors.Is(err, nfalib.ErrEdgeLimit) || errors.Is(err, nfalib.ErrMemoryLimit) || errors.Is(err, dfa.ErrStateLimit) || errors.Is(err, dfa.ErrMemoryLimit) {
+					kind = compiler.ErrorResourceLimit
+				}
+				return nil, &compiler.CompileError{Kind: kind, Expression: i, Position: 0, Message: err.Error()}
+			}
+		}
+		edges := uint64(0)
+		roles := uint64(0)
+		for _, id := range ng.Flow.Vertices() {
+			if err := ctx.Err(); err != nil {
+				return nil, &compiler.CompileError{Kind: compiler.ErrorCancelled, Expression: i, Message: "compile cancelled"}
+			}
+			edges += uint64(len(ng.Flow.Successors(id)))
+			if node := ng.Nodes[id]; node != nil && node.Kind == nfagraph.KindLiteral && len(node.Literal) > 0 {
+				roles++
+			}
+		}
+		programBytes := satAdd64(uint64(len(pattern)), satAdd64(satMul64(uint64(len(ng.Nodes)), 32), satMul64(edges, 8)))
+		usage := compiler.Usage{GraphVertices: uint64(len(ng.Nodes)), GraphEdges: edges, RoseRoles: roles, ProgramBytes: programBytes, MemoryBytes: programBytes}
+		if autoProgram != nil && autoProgram.Kind == engine.KindDFA {
+			usage.DFAStates = uint64(engineStateCount(autoProgram))
+			if autoProgram.DFA != nil {
+				usage.MemoryBytes = satAdd64(usage.MemoryBytes, autoProgram.DFA.MemoryBytes())
+			}
+		}
+		totalUsage.Add(usage)
+		if err := limits.Check(totalUsage); err != nil {
+			return nil, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Position: 0, Message: err.Error()}
+		}
+		extFlags := ExpressionExtFlag(0)
+		var extCopy *ExpressionExt
+		if expression.Ext != nil {
+			extFlags = expression.Ext.Flags
+			copyValue := *expression.Ext
+			extCopy = &copyValue
+			if flags&FlagPrefilter != 0 {
+				extCopy.Flags &^= ExtFlagMinLength
+				extCopy.MinLength = 0
+				extFlags = extCopy.Flags
+			}
+		}
+		var candidate []byte
+		if lit, ok := literalPrefix(root); ok && !parser.HasScopedFlags(root) {
+			candidate = lit
+		}
+		if len(candidate) == 0 && !parser.HasScopedFlags(root) {
+			if filter, ok := prefilter.FromGraph(ng); ok {
+				candidate = append([]byte(nil), filter.Literal...)
+			}
+		}
+		// ASCII 大小写折叠无法覆盖多字节字符；此时不建立可能漏报的候选过滤。
+		if flags&FlagCaseless != 0 && !asciiBytes(candidate) {
+			candidate = nil
+		}
+		info := compiler.DeriveExpressionInfo(expression.Id, uint32(flags), uint64(extFlags), root, ng)
+		applyExpressionAttributes(&info, flags, extCopy)
+		if autoProgram == nil && (features.Stateful || features.Assertions || features.UTF8 || features.UCP) {
+			info.SetBailout("feature-gate")
+		}
+		if !optimized {
+			info.SetBailout("optimization-fallback")
+		}
+		rule := compiledRule{id: expression.Id, root: root, flags: flags, ext: extCopy, info: info, prefilter: candidate, program: autoProgram}
+		if extCopy == nil && !parser.HasScopedFlags(root) && flags&(FlagCaseless|FlagUTF8|FlagUCP|FlagMultiline|FlagDotAll) == 0 {
+			if literal, ok := literalPattern(root); ok && len(literal) > 0 {
+				if small, smallErr := smallengine.CompileWithOptions(literal, smallengine.CompileOptions{SmallWriteSize: 8}); smallErr == nil {
+					switch small.Kind {
+					case smallengine.KindSmallWrite:
+						rule.smallWrite = small.Write
+					case smallengine.KindSmallBlock:
+						rule.smallBlock = small.Block
+					}
+				}
+			}
+			if unit, min, max, greedy, ok := repeatedLiteralPattern(root); ok {
+				rule.repeat, err = repeat.New(unit, min, max, greedy)
+				if err != nil {
+					return nil, &compiler.CompileError{Kind: compiler.ErrorUnsupported, Expression: i, Position: 0, Message: err.Error()}
+				}
+			}
+		}
+		if rule.ext == nil && flags&(FlagCaseless|FlagUTF8|FlagUCP|FlagMultiline|FlagDotAll) == 0 && !rule.info.Stateful && !rule.info.LBR {
+			if specialized, compileErr := nfalib.CompileAuto(ng); compileErr == nil && specialized.SupportsGraph(ng) {
+				backendBytes := specialized.MemoryBytes()
+				if limits.MemoryBytes == 0 || totalUsage.MemoryBytes <= limits.MemoryBytes && backendBytes <= limits.MemoryBytes-totalUsage.MemoryBytes {
+					rule.nfaEngine = specialized
+					totalUsage.MemoryBytes = satAdd64(totalUsage.MemoryBytes, backendBytes)
+				} else {
+					info.SetBailout("nfa-memory")
+				}
+			} else if compileErr != nil {
+				info.SetBailout("nfa-compile")
+			} else {
+				info.SetBailout("nfa-unsupported")
+			}
+		}
+		// 后端选择可能在资源或布局校验后补充 bailout；将最终元数据
+		// 写回规则，保证调用方观察到的选择原因与实际执行一致。
+		rule.info = info
+		rules = append(rules, rule)
+	}
+	knownIDs := make(map[uint32]struct{}, len(rules))
+	ruleByID := make(map[uint32]compiledRule, len(rules))
+	dependencies := make(map[uint32][]uint32)
+	for _, rule := range rules {
+		knownIDs[rule.id] = struct{}{}
+		ruleByID[rule.id] = rule
+		if rule.comb != nil {
+			dependencies[rule.id] = combination.Dependencies(rule.comb)
+		}
+	}
+	for i, rule := range rules {
+		if rule.comb == nil {
+			continue
+		}
+		for _, id := range combination.IDs(rule.comb) {
+			if _, ok := knownIDs[id]; !ok {
+				return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidReference, Expression: i, Message: fmt.Sprintf("combination references unknown expression %d", id)}
+			}
+			target := ruleByID[id]
+			if target.comb != nil {
+				return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidReference, Expression: i, Message: fmt.Sprintf("combination references another combination %d", id)}
+			}
+			if target.flags&(FlagSOMLeftmost|FlagPrefilter) != 0 {
+				return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidReference, Expression: i, Message: fmt.Sprintf("combination operand %d uses unsupported flags", id)}
+			}
+		}
+	}
+	if err := combination.ValidateDependencies(dependencies); err != nil {
+		return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidReference, Expression: -1, Message: err.Error()}
+	}
+	scanner := newScanner(rules)
+	scanner.usage = totalUsage
+	return scanner, nil
+}
+
+func asciiBytes(data []byte) bool {
+	for _, b := range data {
+		if b >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+func applyExpressionAttributes(info *compiler.ExpressionInfo, flags CompileFlag, ext *ExpressionExt) {
+	if info == nil {
+		return
+	}
+	var extFlags uint64
+	var minOffset, maxOffset, minLength uint64
+	var editDistance, hammingDistance uint32
+	if ext != nil {
+		extFlags = uint64(ext.Flags)
+		minOffset, maxOffset, minLength = ext.MinOffset, ext.MaxOffset, ext.MinLength
+		editDistance, hammingDistance = ext.EditDistance, ext.HammingDistance
+	}
+	info.ApplyCompileAttributes(uint32(flags), extFlags, minOffset, maxOffset, minLength, editDistance, hammingDistance)
+}
+
+// consumeLeadingInlineFlags 处理表达式开头的全局模式修饰符。
+func consumeLeadingInlineFlags(pattern string, flags CompileFlag) (string, CompileFlag, bool, error) {
+	extended := false
+	for strings.HasPrefix(pattern, "(?") {
+		close := strings.IndexByte(pattern, ')')
+		if close < 0 {
+			break
+		}
+		body := pattern[2:close]
+		if body == "" || strings.ContainsAny(body, ":<>=!'(") {
+			break
+		}
+		enable := true
+		valid := true
+		changed := false
+		for _, value := range body {
+			switch value {
+			case '-':
+				enable = false
+			case 'i', 's', 'm':
+				changed = true
+				var flag CompileFlag
+				switch value {
+				case 'i':
+					flag = FlagCaseless
+				case 's':
+					flag = FlagDotAll
+				case 'm':
+					flag = FlagMultiline
+				}
+				if enable {
+					flags |= flag
+				} else {
+					flags &^= flag
+				}
+			case 'x':
+				changed = true
+				extended = enable
+			default:
+				valid = false
+			}
+		}
+		if !changed {
+			break
+		}
+		if !valid {
+			return "", flags, extended, fmt.Errorf("unsupported inline flag")
+		}
+		pattern = pattern[close+1:]
+	}
+	return pattern, flags, extended, nil
+}
+
+func satAdd64(a, b uint64) uint64 {
+	if ^uint64(0)-a < b {
+		return ^uint64(0)
+	}
+	return a + b
+}
+
+func satMul64(a, b uint64) uint64 {
+	if a == 0 || b == 0 {
+		return 0
+	}
+	if a > ^uint64(0)/b {
+		return ^uint64(0)
+	}
+	return a * b
+}
+
+func engineStateCount(p *engine.Program) int {
+	if p == nil {
+		return 0
+	}
+	if p.NFA != nil {
+		return len(p.NFA.Graph.Nodes)
+	}
+	if p.DFA != nil {
+		return p.DFA.StateCount()
+	}
+	return 0
+}
+
+func literalPrefix(n parser.Node) ([]byte, bool) {
+	switch v := n.(type) {
+	case parser.Literal:
+		return append([]byte(nil), v.Value...), len(v.Value) > 0
+	case parser.Group:
+		return literalPrefix(v.Child)
+	case parser.Sequence:
+		prefix := make([]byte, 0)
+		for _, element := range v.Elements {
+			if whole, ok := literalWhole(element); ok {
+				prefix = append(prefix, whole...)
+				continue
+			}
+			part, ok := literalPrefix(element)
+			if ok {
+				prefix = append(prefix, part...)
+			}
+			break
+		}
+		return prefix, len(prefix) > 0
+	case parser.Alternation:
+		if len(v.Options) == 0 {
+			return nil, false
+		}
+		first, ok := literalPrefix(v.Options[0])
+		if !ok || len(first) == 0 {
+			return nil, false
+		}
+		width := len(first)
+		for _, option := range v.Options[1:] {
+			part, partOK := literalPrefix(option)
+			if !partOK {
+				return nil, false
+			}
+			if len(part) < width {
+				width = len(part)
+			}
+			for i := 0; i < width; i++ {
+				if first[i] != part[i] {
+					width = i
+					break
+				}
+			}
+			if width == 0 {
+				return nil, false
+			}
+		}
+		return append([]byte(nil), first[:width]...), true
+	case parser.Repeat:
+		if v.Min > 0 {
+			return literalPrefix(v.Child)
+		}
+	}
+	return nil, false
+}
+
+// literalWhole 仅在节点必然消费同一串字节时返回完整文字。
+func literalWhole(n parser.Node) ([]byte, bool) {
+	switch v := n.(type) {
+	case parser.Literal:
+		return append([]byte(nil), v.Value...), len(v.Value) > 0
+	case parser.Group:
+		if v.HasScopedFlags() || v.Atomic {
+			return nil, false
+		}
+		return literalWhole(v.Child)
+	case parser.Sequence:
+		out := make([]byte, 0)
+		for _, child := range v.Elements {
+			part, ok := literalWhole(child)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, part...)
+		}
+		return out, len(out) > 0
+	case parser.Repeat:
+		if v.Max < 0 || v.Min != v.Max || v.Min == 0 {
+			return nil, false
+		}
+		part, ok := literalWhole(v.Child)
+		if !ok {
+			return nil, false
+		}
+		out := make([]byte, 0, len(part)*v.Min)
+		for i := 0; i < v.Min; i++ {
+			out = append(out, part...)
+		}
+		return out, true
+	}
+	return nil, false
+}
+
+func repeatedLiteralPattern(n parser.Node) ([]byte, int, int, bool, bool) {
+	switch value := n.(type) {
+	case parser.Group:
+		return repeatedLiteralPattern(value.Child)
+	case parser.Repeat:
+		unit, ok := literalPattern(value.Child)
+		return unit, value.Min, value.Max, value.Greedy, ok && len(unit) > 0
+	default:
+		return nil, 0, 0, false, false
+	}
+}
+
+func literalAlternation(n parser.Node) ([][]byte, bool) {
+	switch v := n.(type) {
+	case parser.Group:
+		return literalAlternation(v.Child)
+	case parser.Alternation:
+		if len(v.Options) < 2 {
+			return nil, false
+		}
+		out := make([][]byte, 0, len(v.Options))
+		for _, option := range v.Options {
+			lit, ok := literalPattern(option)
+			if !ok || len(lit) == 0 {
+				return nil, false
+			}
+			out = append(out, lit)
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func fixedLiteralAlternation(alts [][]byte) bool {
+	if len(alts) < 2 || len(alts[0]) == 0 {
+		return false
+	}
+	for _, alt := range alts[1:] {
+		if len(alt) != len(alts[0]) {
+			return false
+		}
+	}
+	return true
 }

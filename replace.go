@@ -17,7 +17,10 @@ type MaskFunc func(match Match, value []byte)
 // Replace 会原地重排 matches，并返回不与 data 共享底层数组的新切片。
 func Replace(data []byte, matches []Match, fn ReplaceFunc) []byte {
 	if len(matches) == 0 {
-		return data
+		return append([]byte(nil), data...)
+	}
+	if fn == nil {
+		return append([]byte(nil), data...)
 	}
 	matches = resolveOverlappingMatches(matches)
 
@@ -25,6 +28,9 @@ func Replace(data []byte, matches []Match, fn ReplaceFunc) []byte {
 	var buf = bytes.NewBuffer(make([]byte, 0, len(data)))
 	var cursor = 0
 	for _, m := range matches {
+		if m.From > m.To || m.To > uint64(len(data)) || m.From < uint64(cursor) {
+			continue
+		}
 		buf.Write(data[cursor:m.From])
 		fn(buf, m, data[m.From:m.To])
 		cursor = int(m.To)
@@ -41,8 +47,14 @@ func Mask(data []byte, matches []Match, fn MaskFunc) []byte {
 	if len(matches) == 0 {
 		return data
 	}
+	if fn == nil {
+		return data
+	}
 	matches = resolveOverlappingMatches(matches)
 	for _, match := range matches {
+		if match.From > match.To || match.To > uint64(len(data)) {
+			continue
+		}
 		fn(match, data[match.From:match.To])
 	}
 	return data
@@ -50,11 +62,21 @@ func Mask(data []byte, matches []Match, fn MaskFunc) []byte {
 
 // resolveOverlappingMatches 原地排序 matches，并保留优先级最高的不重叠片段。
 func resolveOverlappingMatches(matches []Match) []Match {
+	valid := matches[:0]
+	for _, m := range matches {
+		if m.From <= m.To {
+			valid = append(valid, m)
+		}
+	}
+	matches = valid
 	sort.Slice(matches, func(i, j int) bool {
 		if matches[i].From != matches[j].From {
 			return matches[i].From < matches[j].From
 		}
-		return matches[i].To > matches[j].To
+		if matches[i].To != matches[j].To {
+			return matches[i].To > matches[j].To
+		}
+		return matches[i].Id < matches[j].Id
 	})
 
 	resolvedMatches := matches[:0]

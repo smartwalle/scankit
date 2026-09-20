@@ -1,0 +1,51 @@
+#include "textflag.h"
+
+// SSE2 字节比较掩码实现。
+TEXT ·nativeEqualByteMask(SB), NOSPLIT, $0-18
+	MOVQ v+0(FP), AX
+	MOVBQZX value+8(FP), CX
+	MOVD CX, X1
+	PUNPCKLBW X1, X1
+	PUNPCKLWL X1, X1
+	PSHUFD $0, X1, X1
+	MOVOU (AX), X0
+	PCMPEQB X1, X0
+	PMOVMSKB X0, DX
+	MOVW DX, ret+16(FP)
+	RET
+
+// SSE2 双向量比较掩码实现。
+TEXT ·nativeEqualMask(SB), NOSPLIT, $0-24
+	MOVQ a+0(FP), AX
+	MOVQ b+8(FP), CX
+	MOVOU (AX), X0
+	MOVOU (CX), X1
+	PCMPEQB X1, X0
+	PMOVMSKB X0, DX
+	MOVW DX, ret+16(FP)
+	RET
+
+// AVX2 双向量比较掩码实现。
+TEXT ·nativeEqualMaskAVX2(SB), NOSPLIT, $0-24
+	MOVQ a+0(FP), AX
+	MOVQ b+8(FP), CX
+	VMOVDQU (AX), X0
+	VMOVDQU (CX), X1
+	VPCMPEQB X1, X0, X0
+	VPMOVMSKB X0, DX
+	MOVW DX, ret+16(FP)
+	VZEROUPPER
+	RET
+
+// AVX2 字节比较掩码实现。
+TEXT ·nativeEqualByteMaskAVX2(SB), NOSPLIT, $0-18
+	MOVQ v+0(FP), AX
+	MOVBQZX value+8(FP), CX
+	VMOVD CX, X1
+	VPBROADCASTB X1, X1
+	VMOVDQU (AX), X0
+	VPCMPEQB X1, X0, X0
+	VPMOVMSKB X0, DX
+	MOVW DX, ret+16(FP)
+	VZEROUPPER
+	RET

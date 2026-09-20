@@ -1,6 +1,7 @@
 package scankit_test
 
 import (
+	"fmt"
 	"regexp"
 	"testing"
 
@@ -9,12 +10,10 @@ import (
 
 const phonePattern = `1[3-9][0-9]{9}`
 
-// emailTLDPattern accepts common single-level TLDs for the PII examples.
+// emailTLDPattern 匹配示例中的常见单级顶级域名。
 const emailTLDPattern = `(com|net|org|cn|io|dev|app|edu|gov|info|biz|me|xyz|online|site|tech|store|cloud|ai|pro|mobi|name|tv|cc|hk|jp|uk|de|fr|au|ca|us)`
 
-// emailPattern intentionally bounds local-part and domain lengths. It
-// supports common single-level TLDs such as .com, .cn, .net and .org; the
-// mandatory "@" anchor remains usable by the compiled scanner.
+// emailPattern 限制本地部分和域名长度，支持 .com、.cn、.net、.org 等常见域名后缀。
 const emailPattern = `[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}\.` + emailTLDPattern
 
 func TestPhonePatternMatchesGoRegexp(t *testing.T) {
@@ -24,6 +23,30 @@ func TestPhonePatternMatchesGoRegexp(t *testing.T) {
 	got := scanPhoneWithScankit(t, data)
 	want := findAllOverlapping(regexp.MustCompile(phonePattern), data)
 	assertRangesEqual(t, got, want)
+}
+
+func TestScannerConcurrentScan(t *testing.T) {
+	s, err := scankit.Compile([]scankit.Expression{{Id: 1, Pattern: `1[0-9]{2}`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("x123 y1456")
+	const workers = 8
+	done := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			got, e := s.Scan(data)
+			if e == nil && len(got) != 2 {
+				e = fmt.Errorf("matches=%d", len(got))
+			}
+			done <- e
+		}()
+	}
+	for i := 0; i < workers; i++ {
+		if e := <-done; e != nil {
+			t.Fatal(e)
+		}
+	}
 }
 
 func TestPhoneAndEmailPatternsMatchGoRegexp(t *testing.T) {

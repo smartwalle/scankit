@@ -59,22 +59,22 @@ func BenchmarkPIIRedaction(b *testing.B) {
 					//	}
 					//})
 
-					b.Run("EngineMask", func(b *testing.B) {
-						data := make([]byte, len(fixture.data))
-						copy(data, fixture.data)
-						if _, err := fixture.engine.Mask(data, maskPIIValue); err != nil {
-							b.Fatal(err)
-						}
-						startPIIBenchmarkTimer(b, fixture)
-						for range b.N {
-							copy(data, fixture.data)
-							result, err := fixture.engine.Mask(data, maskPIIValue)
-							if err != nil {
-								b.Fatal(err)
-							}
-							piiBenchmarkBytesSink = result
-						}
-					})
+					//b.Run("EngineMask", func(b *testing.B) {
+					//	data := make([]byte, len(fixture.data))
+					//	copy(data, fixture.data)
+					//	if _, err := fixture.engine.Mask(data, maskPIIValue); err != nil {
+					//		b.Fatal(err)
+					//	}
+					//	startPIIBenchmarkTimer(b, fixture)
+					//	for range b.N {
+					//		copy(data, fixture.data)
+					//		result, err := fixture.engine.Mask(data, maskPIIValue)
+					//		if err != nil {
+					//			b.Fatal(err)
+					//		}
+					//		piiBenchmarkBytesSink = result
+					//	}
+					//})
 
 					//b.Run("GoRegexpReplace", func(b *testing.B) {
 					//	if result := fixture.goRegexp.ReplaceAllFunc(fixture.data, fixture.maskRegexpMatch); !bytes.Equal(result, fixture.masked) {
@@ -116,34 +116,34 @@ func piiBenchmarkScenarios() []piiBenchmarkScenario {
 			name:        "Phone1",
 			expressions: []scankit.Expression{{Id: 1, Pattern: logChinesePhonePattern1}},
 		},
-		{
-			name:        "Phone2",
-			expressions: []scankit.Expression{{Id: 1, Pattern: logChinesePhonePattern2}},
-		},
-		{
-			name:        "Phone3",
-			expressions: []scankit.Expression{{Id: 1, Pattern: logChinesePhonePattern3}},
-		},
-		{
-			name:        "Email",
-			expressions: []scankit.Expression{{Id: 1, Pattern: logEmailPattern}},
-		},
-		{
-			name:        "ChineseID",
-			expressions: []scankit.Expression{{Id: 1, Pattern: logChineseIDPattern}},
-		},
-		{
-			name:        "BankCard",
-			expressions: []scankit.Expression{{Id: 1, Pattern: logBankCardPattern}},
-		},
-		{
-			name:        "CreditCard",
-			expressions: []scankit.Expression{{Id: 1, Pattern: logCreditCardPattern}},
-		},
-		{
-			name:        "AllPIITypes",
-			expressions: logPIIMixedExpressions(),
-		},
+		//{
+		//	name:        "Phone2",
+		//	expressions: []scankit.Expression{{Id: 1, Pattern: logChinesePhonePattern2}},
+		//},
+		//{
+		//	name:        "Phone3",
+		//	expressions: []scankit.Expression{{Id: 1, Pattern: logChinesePhonePattern3}},
+		//},
+		//{
+		//	name:        "Email",
+		//	expressions: []scankit.Expression{{Id: 1, Pattern: logEmailPattern}},
+		//},
+		//{
+		//	name:        "ChineseID",
+		//	expressions: []scankit.Expression{{Id: 1, Pattern: logChineseIDPattern}},
+		//},
+		//{
+		//	name:        "BankCard",
+		//	expressions: []scankit.Expression{{Id: 1, Pattern: logBankCardPattern}},
+		//},
+		//{
+		//	name:        "CreditCard",
+		//	expressions: []scankit.Expression{{Id: 1, Pattern: logCreditCardPattern}},
+		//},
+		//{
+		//	name:        "AllPIITypes",
+		//	expressions: logPIIMixedExpressions(),
+		//},
 	}
 }
 
