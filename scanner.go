@@ -120,6 +120,10 @@ type compiledRule struct {
 	containsAny bool
 	// nonGreedy 缓存 firstRepeatPreference 的结果，表示规则是否偏好非贪婪。
 	nonGreedy bool
+	// hasBackref 缓存 containsBackreference 的结果。
+	hasBackref bool
+	// hasConditional 缓存 containsConditional 的结果。
+	hasConditional bool
 }
 
 func newScanner(rules []compiledRule) *Scanner {
@@ -130,6 +134,8 @@ func newScanner(rules []compiledRule) *Scanner {
 		copyRules[i].requiresEndOfData = requiresEndOfData(copyRules[i].root)
 		copyRules[i].backendEligible = backendEligible(copyRules[i])
 		copyRules[i].nonGreedy = firstRepeatPreference(copyRules[i].root)
+		copyRules[i].hasBackref = containsBackreference(copyRules[i].root)
+		copyRules[i].hasConditional = containsConditional(copyRules[i].root)
 	}
 	index := make(map[uint32]int, len(copyRules))
 	order := make(map[uint32]int, len(copyRules))
@@ -1392,7 +1398,7 @@ func matchRule(rule compiledRule, data []byte, start int) []int {
 // matchRuleInto 在已确认快路径规则上复用调用方提供的结束偏移缓冲，
 // 避免每次起点重新分配结果切片。Fuzzy、Backreference、Conditional 仍返回新切片。
 func matchRuleInto(rule compiledRule, data []byte, start int, endsBuf []int) []int {
-	if containsBackreference(rule.root) || containsConditional(rule.root) {
+	if rule.hasBackref || rule.hasConditional {
 		states := matchCaptured(rule.root, data, start, rule.flags, make(map[int][]byte))
 		out := make([]int, 0, len(states))
 		for _, state := range states {

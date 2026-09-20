@@ -95,11 +95,13 @@ func (m *Matcher) FindInto(data []byte, dst []Match) []Match {
 				continue
 			}
 			match := Match{ID: literal.ID, From: from, To: from + len(literal.Value)}
-			key := [3]int{int(match.ID), match.From, match.To}
-			if _, ok := seen[key]; ok {
-				continue
+			if seen != nil {
+				key := [3]int{int(match.ID), match.From, match.To}
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
 			}
-			seen[key] = struct{}{}
 			out = append(out, match)
 		}
 	}
