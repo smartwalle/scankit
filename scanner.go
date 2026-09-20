@@ -183,8 +183,12 @@ func newLiteralCandidateFinder(literals []hwlm.Literal) (string, func([]byte) []
 	switch hwlm.Select(literals) {
 	case "teddy":
 		matcher := teddy.New(literals)
+		// 复用 teddy.Match 缓冲，避免每次扫描都重新分配。
+		matchPool := &sync.Pool{New: func() any { s := make([]teddy.Match, 0, 64); return &s }}
 		convert := func(data []byte, dst []literalCandidate) []literalCandidate {
-			matches := matcher.FindInto(data, nil)
+			mp := matchPool.Get().(*[]teddy.Match)
+			matches := matcher.FindInto(data, (*mp)[:0])
+			*mp = matches
 			out := dst[:0]
 			if cap(out) < len(matches) {
 				out = make([]literalCandidate, 0, len(matches))
@@ -192,13 +196,20 @@ func newLiteralCandidateFinder(literals []hwlm.Literal) (string, func([]byte) []
 			for _, match := range matches {
 				out = append(out, literalCandidate{ID: match.ID, From: match.From, To: match.To})
 			}
+			if cap(matches) > 1<<20 {
+				*mp = nil
+			}
+			matchPool.Put(mp)
 			return out
 		}
 		return "teddy", func(data []byte) []literalCandidate { return convert(data, nil) }, convert
 	case "noodle":
 		matcher := noodle.New(literals)
+		matchPool := &sync.Pool{New: func() any { s := make([]noodle.Match, 0, 64); return &s }}
 		convert := func(data []byte, dst []literalCandidate) []literalCandidate {
-			matches := matcher.FindInto(data, nil)
+			mp := matchPool.Get().(*[]noodle.Match)
+			matches := matcher.FindInto(data, (*mp)[:0])
+			*mp = matches
 			out := dst[:0]
 			if cap(out) < len(matches) {
 				out = make([]literalCandidate, 0, len(matches))
@@ -206,13 +217,20 @@ func newLiteralCandidateFinder(literals []hwlm.Literal) (string, func([]byte) []
 			for _, match := range matches {
 				out = append(out, literalCandidate{ID: match.ID, From: match.From, To: match.To})
 			}
+			if cap(matches) > 1<<20 {
+				*mp = nil
+			}
+			matchPool.Put(mp)
 			return out
 		}
 		return "noodle", func(data []byte) []literalCandidate { return convert(data, nil) }, convert
 	default:
 		matcher := fdr.New(literals)
+		matchPool := &sync.Pool{New: func() any { s := make([]fdr.Match, 0, 64); return &s }}
 		convert := func(data []byte, dst []literalCandidate) []literalCandidate {
-			matches := matcher.FindInto(data, nil)
+			mp := matchPool.Get().(*[]fdr.Match)
+			matches := matcher.FindInto(data, (*mp)[:0])
+			*mp = matches
 			out := dst[:0]
 			if cap(out) < len(matches) {
 				out = make([]literalCandidate, 0, len(matches))
@@ -220,6 +238,10 @@ func newLiteralCandidateFinder(literals []hwlm.Literal) (string, func([]byte) []
 			for _, match := range matches {
 				out = append(out, literalCandidate{ID: match.ID, From: match.From, To: match.To})
 			}
+			if cap(matches) > 1<<20 {
+				*mp = nil
+			}
+			matchPool.Put(mp)
 			return out
 		}
 		return "fdr", func(data []byte) []literalCandidate { return convert(data, nil) }, convert
@@ -837,17 +859,18 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 	}
 	if fastLiteral && scanner.literalFind != nil {
 		// 复用栈上缓冲，避免每次扫描都重新分配候选切片。
-		var candBuf [16]literalCandidate
+		var candBuf [64]literalCandidate
 		var candidates []literalCandidate
 		if scanner.literalFindInto != nil {
 			candidates = scanner.literalFindInto(data, candBuf[:0])
 		} else {
 			candidates = scanner.literalFind(data)
 		}
-		if cap(matches)-len(matches) < len(candidates) {
-			grown := make([]Match, len(matches), len(matches)+len(candidates))
-			copy(grown, matches)
-			matches = grown
+		// fastLiteral 路径下每个候选对应唯一规则，候选数与最终匹配数相等；
+		// 预分配匹配切片避免多次扩容。
+		expected := len(matches) + len(candidates)
+		if cap(matches) < expected {
+			matches = append(make([]Match, 0, expected+len(candidates)), matches...)
 		}
 		for _, candidate := range candidates {
 			matches = append(matches, Match{Id: candidate.ID, From: uint64(candidate.From), To: uint64(candidate.To)})
