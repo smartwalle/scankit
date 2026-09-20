@@ -67,19 +67,8 @@ func (r Role) MatchAt(data []byte, off int) bool {
 		// 大小写不敏感且全 ASCII 走 bytes.Equal。
 		return bytes.Equal(data[off:off+len(r.Literal)], r.Literal)
 	}
-	for i, c := range r.Literal {
-		got := data[off+i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		if got >= 'A' && got <= 'Z' {
-			got += 'a' - 'A'
-		}
-		if got != c {
-			return false
-		}
-	}
-	return true
+	// 大小写不敏感且全 ASCII 走 bytes.EqualFold。
+	return bytes.EqualFold(r.Literal, data[off:off+len(r.Literal)])
 }
 
 func isASCII(data []byte) bool {
