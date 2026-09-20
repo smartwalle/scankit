@@ -43,6 +43,23 @@ func Normalize(g *Graph) error {
 
 // NormalizeWithStats 执行规范化并返回各阶段统计信息。
 func NormalizeWithStats(g *Graph) (NormalizeStats, error) {
+	return NormalizeWithCost(g, CostModel{})
+}
+
+// CostModel 描述图归一化的代价阈值与跳过策略。
+// 字段均按 0 表示无约束；空结构等价于自动使用默认 pass 序列。
+type CostModel struct {
+	// MinNodesForMerge 在 MergeEquivalentNodes/SquashLinearLiterals 之前生效，
+	// 小图收益低时直接跳过昂贵的 O(V²) 合并。
+	MinNodesForMerge int
+	// MinNodesForJoinBypass 在 BypassEpsilonJoins/SquashLinearJoins 之前生效，
+	// 小图的 join 旁路收益不明显。
+	MinNodesForJoinBypass int
+}
+
+// NormalizeWithCost 按 cost 模型决定每轮应用的归一化子集，
+// 返回本次应用的 NormalizeStats。CostModel 全零时等价 NormalizeWithStats。
+func NormalizeWithCost(g *Graph, cm CostModel) (NormalizeStats, error) {
 	var stats NormalizeStats
 	if g == nil {
 		return stats, nil
@@ -52,10 +69,15 @@ func NormalizeWithStats(g *Graph) (NormalizeStats, error) {
 	stats.RemovedEdges += RemoveRedundantEdges(work)
 	stats.Unreachable = PruneUnreachable(work)
 	stats.DeadEnds = PruneDeadEnds(work)
-	stats.BypassedJoins = BypassEpsilonJoins(work)
-	stats.SquashedJoins = SquashLinearJoins(work)
-	stats.MergedLiterals = SquashLinearLiterals(work)
-	stats.MergedNodes = MergeEquivalentNodes(work)
+	nodeCount := len(work.Nodes)
+	if cm.MinNodesForJoinBypass == 0 || nodeCount >= cm.MinNodesForJoinBypass {
+		stats.BypassedJoins += BypassEpsilonJoins(work)
+		stats.SquashedJoins += SquashLinearJoins(work)
+	}
+	if cm.MinNodesForMerge == 0 || nodeCount >= cm.MinNodesForMerge {
+		stats.MergedLiterals = SquashLinearLiterals(work)
+		stats.MergedNodes = MergeEquivalentNodes(work)
+	}
 	stats.RemovedEdges += RemoveRedundantEdges(work)
 	if err := work.Validate(); err != nil {
 		return stats, err
@@ -95,7 +117,15 @@ func Optimize(g *Graph) (NormalizeStats, error) {
 }
 
 // OptimizeWithLimit 执行有界图重写；超过轮数时恢复原图并返回错误。
+// 返回的错误携带本轮累计 NormalizeStats 与最后修改图的 pass 名称，
+// 便于调用方在编译期按 pass 粒度记录 optimization-fallback 的原因。
 func OptimizeWithLimit(g *Graph, maxRounds int) (NormalizeStats, error) {
+	return OptimizeWithCostAndLimit(g, CostModel{}, maxRounds)
+}
+
+// OptimizeWithCostAndLimit 在 OptimizeWithLimit 基础上叠加 CostModel，
+// 允许小图跳过昂贵 pass，降低编译期 CPU 成本。
+func OptimizeWithCostAndLimit(g *Graph, cm CostModel, maxRounds int) (NormalizeStats, error) {
 	var total NormalizeStats
 	if g == nil {
 		return total, nil
@@ -107,9 +137,10 @@ func OptimizeWithLimit(g *Graph, maxRounds int) (NormalizeStats, error) {
 		return total, fmt.Errorf("graph has no flow")
 	}
 	original := g.Clone()
+	lastModifiedPass := ""
 	for round := 0; round < maxRounds; round++ {
 		before := g.Clone()
-		stats, err := NormalizeWithStats(g)
+		stats, err := NormalizeWithCost(g, cm)
 		if err != nil {
 			return total, err
 		}
@@ -123,12 +154,39 @@ func OptimizeWithLimit(g *Graph, maxRounds int) (NormalizeStats, error) {
 		if before.Equal(g) {
 			return total, nil
 		}
+		// 记录本轮中真正改变图的 pass，作为失败时的可定位原因。
+		lastModifiedPass = lastChangingPass(stats)
 	}
 	// 收敛失败时恢复调用方图，避免将半成品继续交给后端。
 	if original != nil {
 		g.Flow, g.Nodes, g.Start = original.Flow, original.Nodes, original.Start
 	}
-	return total, fmt.Errorf("graph optimization did not converge")
+	if lastModifiedPass != "" {
+		return total, fmt.Errorf("graph optimization did not converge after %d rounds (last modified by %s, edges=%d nodes=%d)", maxRounds, lastModifiedPass, total.RemovedEdges, total.MergedNodes+total.MergedLiterals)
+	}
+	return total, fmt.Errorf("graph optimization did not converge after %d rounds", maxRounds)
+}
+
+// lastChangingPass 根据一轮 NormalizeStats 判断哪一个 pass 修改了图。
+// 优先级与 NormalizeWithStats 的调用顺序一致：合并节点/合并文字通常是震荡源。
+func lastChangingPass(s NormalizeStats) string {
+	switch {
+	case s.MergedNodes > 0:
+		return "MergeEquivalentNodes"
+	case s.MergedLiterals > 0:
+		return "SquashLinearLiterals"
+	case s.SquashedJoins > 0:
+		return "SquashLinearJoins"
+	case s.BypassedJoins > 0:
+		return "BypassEpsilonJoins"
+	case s.DeadEnds > 0:
+		return "PruneDeadEnds"
+	case s.Unreachable > 0:
+		return "PruneUnreachable"
+	case s.RemovedEdges > 0:
+		return "RemoveRedundantEdges"
+	}
+	return ""
 }
 
 // SquashLinearLiterals 合并无分支的相邻文字节点，减少执行状态数量。

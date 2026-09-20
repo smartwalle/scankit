@@ -303,6 +303,51 @@ func (p *Program) AcceptStates() []uint32 {
 // AcceptCount 返回接受状态数量。
 func (p *Program) AcceptCount() int { return len(p.AcceptStates()) }
 
+// AcceptReportIDs 收集所有接受状态关联的 ReportID 列表（去重）。
+// 与 DFA Report/SOM/EOD 传播配套使用：底图 nfagraph.Node 携带 ReportID，
+// DFA 接受态接受对应 NFA 节点集合，此处把它们汇集为编译期可追溯的稳定列表。
+func (p *Program) AcceptReportIDs() []uint32 {
+	if p == nil {
+		return nil
+	}
+	seen := make(map[uint32]struct{}, len(p.States))
+	out := make([]uint32, 0, len(p.States))
+	for _, state := range p.States {
+		if !state.Accept {
+			continue
+		}
+		for _, nfaID := range state.Nodes {
+			if state.Nodes == nil {
+				break
+			}
+			n := p.Graph.Nodes[nfaID]
+			if n == nil || n.ReportID == 0 {
+				continue
+			}
+			if _, ok := seen[n.ReportID]; ok {
+				continue
+			}
+			seen[n.ReportID] = struct{}{}
+			out = append(out, n.ReportID)
+		}
+	}
+	return out
+}
+
+// HasReports 报告 DFA 程序是否在图节点上携带非零 ReportID，
+// 用于编译期确定是否启用 ReportManager 路径。
+func (p *Program) HasReports() bool {
+	if p == nil || p.Graph == nil {
+		return false
+	}
+	for _, n := range p.Graph.Nodes {
+		if n != nil && n.ReportID != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // StartBytes 返回能从起始状态消费的字节集合快照。
 func (p *Program) StartBytes() []byte {
 	if p == nil || int(p.Start) >= len(p.States) {

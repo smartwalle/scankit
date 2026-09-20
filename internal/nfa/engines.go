@@ -2944,6 +2944,43 @@ func (p *lbrProgram) MatchAtInto(data []byte, start int, dst []int) []int {
 	return ends
 }
 
+// MatchAtRangeInto 返回指定起点的接受结束位置，要求所有结束位置均位于
+// 半开区间 [from, to] 内。复用调用方提供的 dst 缓冲，limit<=0 表示不限制数量。
+// 内部把搜索终点收紧到 min(to, start+maxBytes)，避免越过 to 后再回退过滤。
+func (p *lbrProgram) MatchAtRangeInto(data []byte, start, from, to, limit int, dst []int) []int {
+	if p == nil || p.graph == nil || start < 0 || start > len(data) || from < 0 || to < from || to > len(data) || limit < 0 {
+		return dst[:0]
+	}
+	if !lbrRuntimeShapeOK(p) {
+		return dst[:0]
+	}
+	all, _, _ := p.matchAtBudgetInto(data, start, 0, 0, dst[:0])
+	if to < start {
+		return dst[:0]
+	}
+	capEnd := start + p.maxBytes
+	if p.maxBytes < 0 || capEnd > len(data) {
+		capEnd = len(data)
+	}
+	out := dst[:0]
+	for _, e := range all {
+		if e < from {
+			continue
+		}
+		if e > to {
+			break
+		}
+		if e > capEnd {
+			break
+		}
+		out = append(out, e)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
 func (p *lbrProgram) MatchAt(data []byte, start int) []int {
 	ends, _, _ := p.MatchAtBudget(data, start, 0, 0)
 	return ends
@@ -2956,6 +2993,32 @@ func (p *lbrProgram) Spans(data []byte, limit int) []Span {
 	out := make([]Span, 0, initialSpanCapacity(data, limit))
 	forEachNFAStart(data, p.prefix, p.firstMask, p.acceptsEmpty, dispatch.DefaultBackend(), func(start int) bool {
 		ends, _, _ := p.matchAtBudget(data, start, 0, 0)
+		for _, end := range ends {
+			out = append(out, Span{From: start, To: end})
+			if limit > 0 && len(out) >= limit {
+				return false
+			}
+		}
+		return true
+	})
+	return out
+}
+
+// SpansInto 将 LBR 整块扫描结果写入调用方提供的 dst 缓冲，
+// 复用底层 endsBuf 避免每个起点分配结束偏移切片；limit>0 时遇限额即截断。
+// dst 容量不足时按 initialSpanCapacity 重新分配，保证长输入不被截断。
+func (p *lbrProgram) SpansInto(data []byte, limit int, dst []Span) []Span {
+	if p == nil || limit < 0 || !lbrRuntimeShapeOK(p) {
+		return nil
+	}
+	out := dst[:0]
+	if cap(out) < initialSpanCapacity(data, limit) {
+		out = make([]Span, 0, initialSpanCapacity(data, limit))
+	}
+	endsBuf := make([]int, 0, 8)
+	forEachNFAStart(data, p.prefix, p.firstMask, p.acceptsEmpty, dispatch.DefaultBackend(), func(start int) bool {
+		ends, _, _ := p.matchAtBudgetInto(data, start, 0, 0, endsBuf[:0])
+		endsBuf = ends
 		for _, end := range ends {
 			out = append(out, Span{From: start, To: end})
 			if limit > 0 && len(out) >= limit {
@@ -7499,13 +7562,33 @@ func selectTableKind(g *nfagraph.Graph) EngineKind {
 	if branches >= 8 {
 		return EngineMcSheng
 	}
+	// 在 Sheng / Shufti / Tamarama 三者都满足基本结构条件时，
+	// 由 estimateEngineCost 选取代价最低的引擎，避免启发式分支抖动。
+	candidates := make([]EngineKind, 0, 3)
 	if classes == 0 {
-		return EngineSheng
+		candidates = append(candidates, EngineSheng)
+		candidates = append(candidates, EngineShufti)
+	} else {
+		candidates = append(candidates, EngineShufti)
+		if branches > 0 {
+			candidates = append(candidates, EngineTamarama)
+		}
 	}
-	if branches > 0 {
-		return EngineTamarama
+	if len(candidates) == 0 {
+		return EngineShufti
 	}
-	return EngineShufti
+	if len(candidates) == 1 {
+		return candidates[0]
+	}
+	best := candidates[0]
+	bestCost := estimateEngineCost(g, best)
+	for _, k := range candidates[1:] {
+		if c := estimateEngineCost(g, k); c < bestCost {
+			best = k
+			bestCost = c
+		}
+	}
+	return best
 }
 
 // CompileAuto 根据图能力构建可用的专用引擎；已验证但不满足专用条件的图

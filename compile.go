@@ -379,10 +379,13 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			continue
 		}
 		optimized := true
+		var optimizeErr error
 		if _, err := nfagraph.Optimize(ng); err != nil {
 			// 优化不收敛不应使合法表达式编译失败；Optimize 已恢复原图，
-			// 后续继续使用未优化图并记录降级原因。
+			// 后续继续使用未优化图。optimization-fallback 元数据携带 Optimize
+			// 报告的 pass 粒度原因，便于调用方按 pass 排查震荡源。
 			optimized = false
+			optimizeErr = err
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, &compiler.CompileError{Kind: compiler.ErrorCancelled, Expression: i, Message: "compile cancelled"}
@@ -428,10 +431,17 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 		}
 		programBytes := satAdd64(uint64(len(pattern)), satAdd64(satMul64(uint64(len(ng.Nodes)), 32), satMul64(edges, 8)))
 		usage := compiler.Usage{GraphVertices: uint64(len(ng.Nodes)), GraphEdges: edges, RoseRoles: roles, ProgramBytes: programBytes, MemoryBytes: programBytes}
-		if autoProgram != nil && autoProgram.Kind == engine.KindDFA {
-			usage.DFAStates = uint64(engineStateCount(autoProgram))
-			if autoProgram.DFA != nil {
-				usage.MemoryBytes = satAdd64(usage.MemoryBytes, autoProgram.DFA.MemoryBytes())
+		if autoProgram != nil {
+			switch autoProgram.Kind {
+			case engine.KindDFA:
+				usage.DFAStates = uint64(engineStateCount(autoProgram))
+				if autoProgram.DFA != nil {
+					usage.MemoryBytes = satAdd64(usage.MemoryBytes, autoProgram.DFA.MemoryBytes())
+				}
+			case engine.KindNFA:
+				if autoProgram.NFA != nil {
+					usage.MemoryBytes = satAdd64(usage.MemoryBytes, autoProgram.NFA.MemoryBytes())
+				}
 			}
 		}
 		totalUsage.Add(usage)
@@ -469,7 +479,11 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			info.SetBailout("feature-gate")
 		}
 		if !optimized {
-			info.SetBailout("optimization-fallback")
+			if optimizeErr != nil {
+				info.SetBailout("optimization-fallback: " + optimizeErr.Error())
+			} else {
+				info.SetBailout("optimization-fallback")
+			}
 		}
 		rule := compiledRule{id: expression.Id, root: root, flags: flags, ext: extCopy, info: info, prefilter: candidate, program: autoProgram}
 		if extCopy == nil && !parser.HasScopedFlags(root) && flags&(FlagCaseless|FlagUTF8|FlagUCP|FlagMultiline|FlagDotAll) == 0 {

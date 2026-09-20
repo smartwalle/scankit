@@ -3,12 +3,14 @@ package scankit
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode"
 	"unicode/utf8"
 
@@ -62,28 +64,32 @@ func normalizeScannerUnicodeProperty(name string) string {
 
 // Scanner 是内存中的不可变编译规则执行计划，可安全地并发扫描，并管理所需的可复用扫描上下文。
 type Scanner struct {
-	contextPool     *sync.Pool
-	roseStatePool   *sync.Pool
-	roseSinglePool  *sync.Pool
+	contextPool    *sync.Pool
+	roseStatePool  *sync.Pool
+	roseSinglePool *sync.Pool
 	// canUseRoseInScan 缓存 canUseRoseInScan 的结果，避免每次 Scan 重复遍历。
 	canUseRoseInScan bool
-	rules           []compiledRule
-	ruleIndex       map[uint32]int
-	ruleOrder       map[uint32]int
-	hasCombo        bool
-	literalFind     func([]byte) []literalCandidate
-	literalFindInto func([]byte, []literalCandidate) []literalCandidate
-	literalKind     string
-	candidateIDs    map[uint32]struct{}
-	literalIDs      map[uint32]struct{}
-	usage           compiler.Usage
-	validationErr   error
-	rosePlan        *rose.Program
+	rules            []compiledRule
+	ruleIndex        map[uint32]int
+	ruleOrder        map[uint32]int
+	hasCombo         bool
+	literalFind      func([]byte) []literalCandidate
+	literalFindInto  func([]byte, []literalCandidate) []literalCandidate
+	literalKind      string
+	candidateIDs     map[uint32]struct{}
+	literalIDs       map[uint32]struct{}
+	usage            compiler.Usage
+	validationErr    error
+	rosePlan         *rose.Program
+	// cancelFlag 由 ScanContext 的 ctx.Done 异步设置，供主扫描循环周期探测，
+	// 避免把 context.Context 引入 scanInto 签名或破坏对象池。
+	cancelFlag uint32
 }
 
 type scanContext struct {
-	Scratch           *scratch.Scratch
-	Reports           *report.Manager
+	Scratch *scratch.Scratch
+	Reports *report.Manager
+
 	blockedUntil      []int
 	fired             []bool
 	comboTriggers     []report.Event
@@ -800,6 +806,53 @@ func (scanner *Scanner) Scan(data []byte) ([]Match, error) {
 	return scanner.ScanInto(data, nil)
 }
 
+// ErrCancelled 是 ScanContext 在上下文取消时返回的哨兵错误。
+var ErrCancelled = fmt.Errorf("scankit: scan cancelled")
+
+// ScanContext 支持通过 context.Context 取消的整块扫描。
+// ctx 在调用前若已取消或扫描期间被取消，立即返回 ErrCancelled 与已收集的 matches。
+func (scanner *Scanner) ScanContext(ctx context.Context, data []byte) ([]Match, error) {
+	return scanner.ScanContextInto(ctx, data, nil)
+}
+
+// ScanContextInto 与 ScanContext 类似，但复用调用方提供的 matches 缓冲。
+// ctx == nil 时等价于 ScanInto，保留现有调用语义。
+func (scanner *Scanner) ScanContextInto(ctx context.Context, data []byte, matches []Match) ([]Match, error) {
+	if scanner == nil {
+		return matches, nil
+	}
+	return scanner.scanContextInto(ctx, data, matches)
+}
+
+// scanContextInto 在现有 scanInto 主路径上增加 ctx.Err() 探测点，
+// 避免破坏现有调用方。cancelCh 在 ctx.Done 时同步关闭以快速唤醒跨候选循环。
+func (scanner *Scanner) scanContextInto(ctx context.Context, data []byte, matches []Match) ([]Match, error) {
+	if ctx == nil {
+		return scanner.scanInto(data, matches)
+	}
+	if err := ctx.Err(); err != nil {
+		return matches, ErrCancelled
+	}
+	// 通过 sync/atomic 标志把 ctx.Done 异步广播到主扫描循环，
+	// 让长输入扫描也能在 ctx 取消时提前返回，避免修改 scanInto 签名。
+	// sync.Once 保证 stop channel 恰好被关闭一次，避免 close-of-closed 竞争。
+	var stop sync.Once
+	stopCh := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			atomic.StoreUint32(&scanner.cancelFlag, 1)
+			stop.Do(func() { close(stopCh) })
+		case <-stopCh:
+		}
+	}()
+	defer func() {
+		stop.Do(func() { close(stopCh) })
+		atomic.StoreUint32(&scanner.cancelFlag, 0)
+	}()
+	return scanner.scanInto(data, matches)
+}
+
 // ScanInto 将匹配追加到 matches；输入数据不会被修改。
 func (scanner *Scanner) ScanInto(data []byte, matches []Match) ([]Match, error) {
 	return scanner.scanInto(data, matches)
@@ -1021,6 +1074,11 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 		return matches, nil
 	}
 	for start := 0; start <= len(data); start++ {
+		// 每 1024 个起点探测一次 ScanContext 异步设置的取消标志，
+		// 避免在每个候选都做原子读。
+		if start&1023 == 0 && atomic.LoadUint32(&scanner.cancelFlag) == 1 {
+			return matches, ErrCancelled
+		}
 		for ri, rule := range scanner.rules {
 			if backendOnly && rule.backendEligible {
 				continue
