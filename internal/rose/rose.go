@@ -122,6 +122,8 @@ type Program struct {
 	Roles           []Role
 	Instructions    []Instruction
 	matcher         *fdr.Matcher
+	// matchBuf 复用 matcher 返回的命中缓冲，避免每次 FindMatchesInto 都重新分配。
+	matchBuf        []fdr.Match
 	miracles        []*Miracle
 	miracleBuckets  [256][]int
 	miracleFirstSet [4]uint64
@@ -198,7 +200,9 @@ func (p *Program) FindMatchesInto(data []byte, dst []State) []State {
 		matcher = buildRoleMatcher(p.Roles)
 	}
 	if matcher != nil {
-		matches := matcher.Find(data)
+		// 复用 matcher 自身的匹配结果缓冲，避免每次扫描都重新分配。
+		matches := matcher.FindInto(data, p.matchBuf[:0])
+		p.matchBuf = matches
 		out := dst[:0]
 		if cap(out) < len(matches) {
 			out = make([]State, 0, len(matches))
