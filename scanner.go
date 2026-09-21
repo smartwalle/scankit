@@ -92,9 +92,20 @@ type Scanner struct {
 	// requiredCovered 标记规则是否由候选文字索引覆盖；覆盖的规则只需在
 	// 候选起点确认，不再参与整块后端扫描。
 	requiredCovered []bool
-	usage           compiler.Usage
-	validationErr   error
-	rosePlan        *rose.Program
+	// fastLiteral/backendOnly 只依赖编译结果，构造阶段固化以避免每次扫描重复推导。
+	fastLiteral bool
+	backendOnly bool
+	// confirmAllRules 是候选路径不可用时需要逐起点确认的规则；
+	// confirmUncoveredRules 是候选路径生效后仍未被索引覆盖的规则。
+	confirmAllRules       []int
+	confirmUncoveredRules []int
+	// startBytes/startBytesAll 是按首字节分组的逐起点确认索引，分别对应
+	// confirmUncoveredRules 与 confirmAllRules。
+	startBytes    *startByteIndex
+	startBytesAll *startByteIndex
+	usage         compiler.Usage
+	validationErr error
+	rosePlan      *rose.Program
 }
 
 type scanContext struct {
@@ -112,8 +123,13 @@ type scanContext struct {
 	ruleMatchBuf []int
 	// requiredHits 与 requiredStarts 复用候选文字命中及其派生的确认起点，
 	// 避免每次扫描重新分配候选切片。
-	requiredHits   []requiredHit
-	requiredStarts []uint64
+	requiredHits []requiredHit
+	// 候选起点线性排序所需的复用缓冲：第一轮按规则下标、第二轮按起点做稳定
+	// 计数排序，避免在候选密集时付比较排序的对数因子。
+	requiredSortScratch []uint64
+	requiredStartCounts []uint32
+	requiredRuleCounts  []uint32
+	requiredStarts      []uint64
 	// chainArena 是确认快路径的单次工作区，跨候选起点复用同一块内存。
 	chainArena byteChainArena
 	// confirmStack 是确认程序的回溯栈，跨候选起点复用。
@@ -283,13 +299,24 @@ func newScanner(rules []compiledRule) *Scanner {
 	if len(literals) > 1 {
 		scanner.literalKind, scanner.literalFind, scanner.literalFindInto = newLiteralCandidateFinder(literals)
 	}
-	scanner.requiredLiterals, scanner.requiredFindInto = buildRequiredIndex(copyRules)
-	if scanner.requiredFindInto != nil {
-		scanner.requiredCovered = make([]bool, len(copyRules))
-		for i := range copyRules {
-			scanner.requiredCovered[i] = requiredIndexEligible(copyRules[i])
+	scanner.requiredLiterals, scanner.requiredFindInto, scanner.requiredCovered = buildRequiredIndex(copyRules)
+	scanner.fastLiteral = !scanner.hasCombo && len(copyRules) > 1 &&
+		len(candidateIDs) == len(copyRules) && len(literalIDs) == len(copyRules)
+	if scanner.fastLiteral {
+		for _, rule := range copyRules {
+			if rule.flags&(FlagQuiet|FlagSingleMatch) != 0 {
+				scanner.fastLiteral = false
+				break
+			}
 		}
 	}
+	scanner.backendOnly = !scanner.hasCombo && !scanner.fastLiteral
+	scanner.buildConfirmRuleLists()
+	scanner.startBytes = newStartByteIndex(copyRules, scanner.confirmUncoveredRules)
+	if len(scanner.confirmAllRules) != len(scanner.confirmUncoveredRules) {
+		scanner.startBytesAll = newStartByteIndex(copyRules, scanner.confirmAllRules)
+	}
+
 	// Rose 角色图与文字候选索引随规则计划不可变，构造阶段完成一次，
 	// 扫描时直接复用，避免每个 Block 重建角色、指令和自动机。
 	scanner.rosePlan = scanner.buildRoseProgram()
@@ -315,19 +342,19 @@ func requiredIndexEligible(rule compiledRule) bool {
 	return !parser.HasScopedFlags(rule.root)
 }
 
-// buildRequiredIndex 为全部规则建立共享的必须文字候选索引。
-// 只要存在既没有候选文字、又不走后端直扫的规则，就返回 nil 以保留原确认路径。
-func buildRequiredIndex(rules []compiledRule) ([]requiredLiteral, func([]byte, []requiredHit) []requiredHit) {
+// buildRequiredIndex 为可安全提取必须文字的规则建立共享候选索引。
+// 返回的 covered 标记哪些规则真正进入索引：无法提取必须文字、或偏移窗口无法
+// 约束的规则保留原确认路径，不会让整个索引失效。窗口上界为负代表偏移无上界，
+// 此时必须携带 Back 字节集合才能把候选收缩到有限起点。
+func buildRequiredIndex(rules []compiledRule) ([]requiredLiteral, func([]byte, []requiredHit) []requiredHit, []bool) {
 	byValue := make(map[string]int)
 	literals := make([]hwlm.Literal, 0, 64)
 	index := make([]requiredLiteral, 0, 64)
+	covered := make([]bool, len(rules))
 	for ruleIndex := range rules {
 		rule := rules[ruleIndex]
-		if !requiredIndexEligible(rule) {
-			if rule.backendEligible {
-				continue
-			}
-			return nil, nil
+		if !requiredIndexEligible(rule) || !requiredWindowUsable(rule.required) {
+			continue
 		}
 		for _, variant := range rule.required {
 			key := string(variant.Value)
@@ -339,16 +366,31 @@ func buildRequiredIndex(rules []compiledRule) ([]requiredLiteral, func([]byte, [
 				literals = append(literals, hwlm.Literal{ID: uint32(position + 1), Value: variant.Value})
 			}
 			entry := requiredEntry{ruleID: rule.id, ruleIndex: ruleIndex, min: variant.MinOffset, max: variant.MaxOffset, back: variant.Back}
-			if entry.max-entry.min > maxRequiredWindow {
-				return nil, nil
-			}
 			index[position].entries = append(index[position].entries, entry)
 		}
+		covered[ruleIndex] = true
 	}
 	if len(index) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
-	return index, newRequiredFinder(literals)
+	return index, newRequiredFinder(literals), covered
+}
+
+// requiredWindowUsable 判断偏移窗口能否在扫描期展开为有限起点集合。
+func requiredWindowUsable(variants []prefilter.Variant) bool {
+	for _, variant := range variants {
+		if variant.MaxOffset >= variant.MinOffset {
+			if variant.MaxOffset-variant.MinOffset > maxRequiredWindow {
+				return false
+			}
+			continue
+		}
+		// 偏移无上界时依赖 Back 收缩左侧起点，缺少集合就无法限定窗口。
+		if variant.Back == nil {
+			return false
+		}
+	}
+	return true
 }
 
 // maxRequiredWindow 与编译期候选推导保持一致的偏移窗口上限。
@@ -1096,17 +1138,7 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 	base := len(matches)
 	// 所有规则均为精确文字且无需特殊报告语义时，优先使用共享文字索引：
 	// 一次候选扫描即覆盖全部规则，避免 Rose 角色按候选逐个确认的线性放大。
-	fastLiteral := !scanner.hasCombo && len(scanner.rules) > 1 &&
-		len(scanner.candidateIDs) == len(scanner.rules) &&
-		len(scanner.literalIDs) == len(scanner.rules)
-	if fastLiteral {
-		for _, rule := range scanner.rules {
-			if rule.flags&(FlagQuiet|FlagSingleMatch) != 0 {
-				fastLiteral = false
-				break
-			}
-		}
-	}
+	fastLiteral := scanner.fastLiteral
 	if fastLiteral && scanner.literalFind != nil {
 		// 复用栈上缓冲，避免每次扫描都重新分配候选切片。
 		var candBuf [256]literalCandidate
@@ -1141,18 +1173,13 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 	// 整块后端扫描只覆盖无法进入候选文字索引的规则；能由候选文字定位的
 	// 规则交给候选起点确认，避免每条规则各扫一遍整块输入。
 	requiredDriven := scanner.requiredFindInto != nil
-	backendOnly := !scanner.hasCombo && !fastLiteral
-	backendRuleCount := 0
+	backendOnly := scanner.backendOnly
 	if backendOnly {
 		for ri := range scanner.rules {
+			if !scanner.backendScanned(ri, backendOnly, requiredDriven) {
+				continue
+			}
 			rule := scanner.rules[ri]
-			if !rule.backendEligible {
-				continue
-			}
-			if requiredDriven && scanner.requiredCovered[ri] {
-				continue
-			}
-			backendRuleCount++
 			if rule.nfaEngine != nil {
 				// 缓冲只在真正执行后端扫描的规则作用域内声明，候选索引覆盖
 				// 全部规则时不会为未使用的缓冲付出每次扫描的堆分配。
@@ -1168,7 +1195,8 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 			}
 		}
 	}
-	if backendOnly && backendRuleCount == len(scanner.rules) {
+	// 候选索引未生效时全部规则都由后端整块扫描处理，无需进入确认路径。
+	if backendOnly && !requiredDriven && len(scanner.confirmAllRules) == 0 {
 		return matches, nil
 	}
 	pool := scanner.contextPool
@@ -1205,6 +1233,10 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 		} else {
 			ctx.requiredStarts = ctx.requiredStarts[:0]
 		}
+		// 线性排序缓冲按下标复用，超限时释放，避免长期占住大块内存。
+		resetRequiredSortBuffer(&ctx.requiredSortScratch)
+		resetRequiredSortBuffer(&ctx.requiredStartCounts)
+		resetRequiredSortBuffer(&ctx.requiredRuleCounts)
 		for id, starts := range ctx.prefilterStarts {
 			if len(starts) > 1<<20 {
 				delete(ctx.prefilterStarts, id)
@@ -1356,19 +1388,17 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 	}
 	// 必须文字候选驱动：任意匹配都包含至少一个候选文字，因此只需在候选文字
 	// 命中位置派生的起点上确认，跳过整块“每个起点 × 每条规则”的循环。
-	if scanner.requiredFindInto != nil {
+	if requiredDriven {
 		if starts, ok := scanner.requiredScanStarts(ctx, data, backendOnly, requiredDriven); ok {
 			state.requiredStartDriven = true
-			if scanner.simpleReports && cap(ctx.directMatches) < len(starts) {
+			// 真实命中数量有界于 (起点数 + 1)，而候选起点可以远多于命中；
+			// 这里只在候选不多时按候选数预分配，候选密集时交给 append 增长，
+			// 避免为稀疏场景申请整块等于候选数的结果缓冲。
+			if scanner.simpleReports && cap(ctx.directMatches) < len(starts) && len(starts) <= directMatchPrealloc {
 				ctx.directMatches = make([]Match, 0, len(starts))
 				state.direct = ctx.directMatches[:0]
 			}
-			for _, key := range starts {
-				start, rule := requiredStartParts(key)
-				if !state.verify(rule, start) {
-					break
-				}
-			}
+			state.confirmCandidatesAndFallback(starts, scanner.startBytes)
 			return state.finish(matches)
 		}
 		// 候选起点超过上限时退回逐起点确认；此时补建共享文字索引，
@@ -1378,18 +1408,14 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 			state.literalEnds = literalEnds
 		}
 	}
-	for start := 0; start <= len(data); start++ {
-		for ri := range scanner.rules {
-			if state.backendHandled(ri) {
-				continue
-			}
-			if !state.verify(ri, start) {
-				break
-			}
-		}
-		if ctx.Reports.Stopped() {
-			break
-		}
+	fallbackIndex := scanner.startBytesAll
+	if fallbackIndex == nil {
+		fallbackIndex = scanner.startBytes
+	}
+	if fallbackIndex == nil {
+		state.confirmPerStart(scanner.confirmAllRules)
+	} else {
+		state.confirmIndexed(fallbackIndex)
 	}
 	return state.finish(matches)
 }
@@ -1426,19 +1452,52 @@ type blockScanState struct {
 	direct []Match
 }
 
-// backendHandled 判断规则是否已由整块后端扫描产出结果，无需再逐起点确认。
-func (st *blockScanState) backendHandled(ri int) bool {
-	return st.scanner.backendHandled(ri, st.backendOnly, st.requiredDriven)
+// confirmPerStart 对给定规则集合逐起点确认，起点从 0 到数据末尾。
+func (st *blockScanState) confirmPerStart(rules []int) {
+	if len(rules) == 0 {
+		return
+	}
+	for start := 0; start <= len(st.data); start++ {
+		for _, ri := range rules {
+			if !st.verify(ri, start) {
+				return
+			}
+		}
+		if st.ctx.Reports.Stopped() {
+			return
+		}
+	}
 }
 
-func (scanner *Scanner) backendHandled(ri int, backendOnly, requiredDriven bool) bool {
-	if !backendOnly {
+// buildConfirmRuleLists 预计算逐起点确认所需的规则集合，避免每次扫描重复遍历。
+func (scanner *Scanner) buildConfirmRuleLists() {
+	requiredDriven := scanner.requiredFindInto != nil
+	scanner.confirmAllRules = make([]int, 0, len(scanner.rules))
+	scanner.confirmUncoveredRules = make([]int, 0, len(scanner.rules))
+	for ri := range scanner.rules {
+		if scanner.backendScanned(ri, scanner.backendOnly, requiredDriven) {
+			continue
+		}
+		scanner.confirmAllRules = append(scanner.confirmAllRules, ri)
+		if requiredDriven && scanner.requiredIndexCovered(ri) {
+			continue
+		}
+		scanner.confirmUncoveredRules = append(scanner.confirmUncoveredRules, ri)
+	}
+}
+
+// requiredIndexCovered 判断规则是否已进入必须文字候选索引。
+func (scanner *Scanner) requiredIndexCovered(ri int) bool {
+	return scanner.requiredCovered != nil && scanner.requiredCovered[ri]
+}
+
+// backendScanned 判断规则是否由整块后端扫描产出结果。后端扫描只在 backendOnly
+// 下执行，并且会跳过已被候选索引覆盖的规则，避免同一规则产出重复事件。
+func (scanner *Scanner) backendScanned(ri int, backendOnly, requiredDriven bool) bool {
+	if !backendOnly || !scanner.rules[ri].backendEligible {
 		return false
 	}
-	if requiredDriven {
-		return !scanner.requiredCovered[ri]
-	}
-	return scanner.rules[ri].backendEligible
+	return !(requiredDriven && scanner.requiredIndexCovered(ri))
 }
 
 // confirmArena 返回该规则可用于字节链快路径的工作区；返回 nil 表示规则
@@ -1493,7 +1552,7 @@ func (st *blockScanState) verify(ri int, start int) bool {
 		var ok bool
 		// 候选由必须文字索引派生时，起点处的入口文字已由匹配器确认，
 		// 可以直接从入口文字之后的指令开始求值。
-		if rule.confirmSkip > 0 && st.requiredStartDriven {
+		if rule.confirmSkip > 0 && st.requiredStartDriven && st.scanner.requiredIndexCovered(ri) {
 			end, ok = rule.confirm.run(st.data, rule.confirmEntry, start+rule.confirmSkip, rule.flags, st.ctx.confirmFrames())
 		} else {
 			end, ok = rule.confirm.preferredEnd(st.data, start, rule.flags, st.ctx.confirmFrames())
@@ -1617,19 +1676,26 @@ func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte, backen
 	for _, hit := range hits {
 		literal := scanner.requiredLiterals[hit.slot]
 		for _, entry := range literal.entries {
-			if scanner.backendHandled(entry.ruleIndex, backendOnly, requiredDriven) {
+			if scanner.backendScanned(entry.ruleIndex, backendOnly, requiredDriven) {
 				continue
 			}
-			from, to := hit.pos-entry.max, hit.pos-entry.min
-			if from < 0 {
-				from = 0
+			// 偏移上界为负表示无上界，此时起点只受数据左边界约束。
+			from, to := 0, hit.pos-entry.min
+			if entry.max >= 0 {
+				from = hit.pos - entry.max
+				if from < 0 {
+					from = 0
+				}
 			}
 			if to < 0 || to > len(data) {
 				continue
 			}
-			if entry.back != nil && entry.max > entry.min {
+			if entry.back != nil {
 				left := hit.pos - 1
-				edge := hit.pos - entry.max
+				edge := 0
+				if entry.max >= 0 {
+					edge = hit.pos - entry.max
+				}
 				for left >= 0 && left >= edge && entry.back[data[left]] == 1 {
 					left--
 				}
@@ -1637,16 +1703,8 @@ func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte, backen
 				if left > from {
 					from = left
 				}
-				// 前缀是有界类重复时，窗口内每个起点都会消耗到同一处候选文字，
-				// 之后的求值路径完全一致；最左起点一旦命中就会被记录并抑制其
-				// 余起点，因此只需保留最左起点即可覆盖整段候选。
-				if from > to {
-					continue
-				}
-				if len(starts) >= limit {
-					return nil, false
-				}
-				starts = append(starts, requiredStartKey(from, entry.ruleIndex))
+			}
+			if from > to {
 				continue
 			}
 			for start := from; start <= to; start++ {
@@ -1661,7 +1719,7 @@ func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte, backen
 	if len(starts) < 2 {
 		return starts, true
 	}
-	slices.Sort(starts)
+	scanner.sortRequiredStarts(ctx, starts, len(data))
 	deduped := starts[:1]
 	for _, entry := range starts[1:] {
 		if entry == deduped[len(deduped)-1] {
@@ -1671,6 +1729,88 @@ func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte, backen
 	}
 	ctx.requiredStarts = deduped
 	return deduped, true
+}
+
+// directMatchPrealloc 是候选驱动路径上直接结果切片的预分配上限：超过该
+// 数量时改为按实际命中增长，避免稀疏语料按候选数量预留大块内存。
+const directMatchPrealloc = 1 << 16
+
+// 候选起点线性排序的启用门槛：起点计数表按语料长度线性增长，语料过大时
+// 直接退回比较排序，避免为排序申请成倍于语料的内存。
+const (
+	requiredCountingSortMin     = 8192
+	requiredCountingSortMaxKeys = 1 << 21
+	requiredCountingSortMaxData = 1 << 20
+)
+
+// sortRequiredStarts 把候选键按 (起点, 规则下标) 升序整理。
+// 先按规则下标、再按起点做两轮稳定计数排序即可得到比较排序同样的顺序，
+// 代价是候选数量的线性函数；任一门槛不满足时退回 slices.Sort。
+func (scanner *Scanner) sortRequiredStarts(ctx *scanContext, starts []uint64, dataLen int) {
+	keyCount := len(starts)
+	if keyCount < requiredCountingSortMin || keyCount > requiredCountingSortMaxKeys || dataLen+2 > requiredCountingSortMaxData {
+		slices.Sort(starts)
+		return
+	}
+	ruleCount := len(scanner.rules) + 1
+	if cap(ctx.requiredSortScratch) < keyCount {
+		ctx.requiredSortScratch = make([]uint64, keyCount)
+	} else {
+		ctx.requiredSortScratch = ctx.requiredSortScratch[:keyCount]
+	}
+	scratch := ctx.requiredSortScratch
+	if cap(ctx.requiredRuleCounts) < ruleCount {
+		ctx.requiredRuleCounts = make([]uint32, ruleCount)
+	} else {
+		ctx.requiredRuleCounts = ctx.requiredRuleCounts[:ruleCount]
+	}
+	ruleCounts := ctx.requiredRuleCounts
+	if cap(ctx.requiredStartCounts) < dataLen+2 {
+		ctx.requiredStartCounts = make([]uint32, dataLen+2)
+	} else {
+		ctx.requiredStartCounts = ctx.requiredStartCounts[:dataLen+2]
+	}
+	startCounts := ctx.requiredStartCounts
+	clear(ruleCounts)
+	clear(startCounts)
+	for _, key := range starts {
+		ruleCounts[int(uint32(key))]++
+	}
+	sortByCount(ruleCounts)
+	for _, key := range starts {
+		rule := int(uint32(key))
+		scratch[ruleCounts[rule]] = key
+		ruleCounts[rule]++
+	}
+	for _, key := range scratch {
+		startCounts[int(uint32(key>>32))]++
+	}
+	sortByCount(startCounts)
+	for _, key := range scratch {
+		start := int(uint32(key >> 32))
+		starts[startCounts[start]] = key
+		startCounts[start]++
+	}
+}
+
+// sortByCount 把直方图原地转换为各桶的写入位置。
+func sortByCount(counts []uint32) {
+	var sum uint32
+	for index := range counts {
+		count := counts[index]
+		counts[index] = sum
+		sum += count
+	}
+}
+
+// resetRequiredSortBuffer 清空线性排序缓冲，容量过大时直接丢弃。
+func resetRequiredSortBuffer[T any](buffer *[]T) {
+	const maxRetained = 1 << 21
+	if cap(*buffer) > maxRetained {
+		*buffer = nil
+		return
+	}
+	*buffer = (*buffer)[:0]
 }
 
 // computeCanUseRoseInScan 一次性计算 Rose 是否覆盖全部规则且不包含组合依赖。

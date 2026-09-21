@@ -112,56 +112,24 @@ func TestRequiredIndexFallbackKeepsLiteralFilter(t *testing.T) {
 	}
 }
 
-// TestRequiredIndexBackPrefixKeepsLeftmostStart 验证前缀是有界类重复时，候选窗口
-// 只保留最左起点，避免在同一段等价起点上重复执行确认程序。
-func TestRequiredIndexBackPrefixKeepsLeftmostStart(t *testing.T) {
-	scanner, err := Compile([]Expression{{Id: 1, Pattern: `[A-Za-z]{1,16}@[a-z]{2,4}\b`}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if scanner.requiredFindInto == nil || len(scanner.requiredLiterals) != 1 {
-		t.Fatal("类重复前缀规则应建立必须文字候选索引")
-	}
-	entry := scanner.requiredLiterals[0].entries[0]
-	if entry.back == nil {
-		t.Fatal("类重复前缀规则应携带左侧字节集合")
-	}
-	ctx := scanner.contextPool.Get().(*scanContext)
-	starts, ok := scanner.requiredScanStarts(ctx, []byte("ts=abcde@xy done"), false, false)
-	scanner.contextPool.Put(ctx)
-	if !ok {
-		t.Fatal("候选起点未超出上限时不应回退")
-	}
-	if len(starts) != 1 {
-		t.Fatalf("类重复前缀窗口应只保留最左起点 3: %v", starts)
-	}
-	if start, rule := requiredStartParts(starts[0]); start != 3 || rule != 0 {
-		t.Fatalf("最左起点应解析为 (3, 0): got=(%d, %d)", start, rule)
-	}
+// perStartReferenceScanner 返回禁用候选索引与整块后端扫描的参照扫描器：
+// 全部规则都走逐起点确认，用于逐位比对候选驱动路径的命中集合与顺序。
+func perStartReferenceScanner(scanner *Scanner) *Scanner {
+	reference := *scanner
+	reference.requiredFindInto = nil
+	reference.requiredCovered = nil
+	reference.backendOnly = false
+	reference.buildConfirmRuleLists()
+	reference.startBytes = nil
+	reference.startBytesAll = nil
+	return &reference
 }
 
-// TestRequiredIndexBackPrefixAgreesWithPerStartScan 断言最左起点收缩不改变命中
-// 集合，逐条语料与禁用候选索引的逐起点确认结果完全一致。
-func TestRequiredIndexBackPrefixAgreesWithPerStartScan(t *testing.T) {
-	scanner, err := Compile([]Expression{{Id: 1, Pattern: `[A-Za-z]{1,16}@[a-z]{2,4}\b`}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if scanner.requiredFindInto == nil {
-		t.Fatal("类重复前缀规则应建立必须文字候选索引")
-	}
-	fallback := *scanner
-	fallback.requiredFindInto = nil
-	corpus := [][]byte{
-		[]byte("ts=abcde@xy done"),
-		[]byte("ts=@xy done"),
-		[]byte("ts=a@abc done"),
-		[]byte("ts=abcdefghijklmnopq@ab done"),
-		[]byte("ts=abc@xy ts=de@abc done"),
-		[]byte("no anchor here"),
-	}
+func assertScanAgreesWithReference(t *testing.T, scanner *Scanner, corpus [][]byte) {
+	t.Helper()
+	reference := perStartReferenceScanner(scanner)
 	for _, data := range corpus {
-		want, err := fallback.Scan(data)
+		want, err := reference.Scan(data)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -178,4 +146,74 @@ func TestRequiredIndexBackPrefixAgreesWithPerStartScan(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestRequiredIndexBackPrefixBoundsWindow 验证类重复前缀把候选起点收缩到命中
+// 位置左侧的连续类区间，而不是整个数据窗口。
+func TestRequiredIndexBackPrefixBoundsWindow(t *testing.T) {
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: `[A-Za-z]{1,16}@[a-z]{2,4}\b`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scanner.requiredFindInto == nil || len(scanner.requiredLiterals) != 1 {
+		t.Fatal("类重复前缀规则应建立必须文字候选索引")
+	}
+	if entry := scanner.requiredLiterals[0].entries[0]; entry.back == nil {
+		t.Fatal("类重复前缀规则应携带左侧字节集合")
+	}
+	ctx := scanner.contextPool.Get().(*scanContext)
+	starts, ok := scanner.requiredScanStarts(ctx, []byte("ts=abcde@xy done"), false, false)
+	scanner.contextPool.Put(ctx)
+	if !ok {
+		t.Fatal("候选起点未超出上限时不应回退")
+	}
+	want := []int{3, 4, 5, 6, 7}
+	if len(starts) != len(want) {
+		t.Fatalf("候选起点数量应为 %d: %v", len(want), starts)
+	}
+	for index, key := range starts {
+		start, rule := requiredStartParts(key)
+		if start != want[index] || rule != 0 {
+			t.Fatalf("第 %d 个候选起点应为 (%d, 0): got=(%d, %d)", index, want[index], start, rule)
+		}
+	}
+}
+
+// TestRequiredIndexBackPrefixAgreesWithPerStartScan 断言类区间内的候选起点与
+// 逐起点确认结果完全一致，包含最左起点被前一次命中抑制的情形。
+func TestRequiredIndexBackPrefixAgreesWithPerStartScan(t *testing.T) {
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: `[A-Za-z]{1,16}@[a-z]{2,4}\b`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scanner.requiredFindInto == nil {
+		t.Fatal("类重复前缀规则应建立必须文字候选索引")
+	}
+	assertScanAgreesWithReference(t, scanner, [][]byte{
+		[]byte("ts=abcde@xy done"),
+		[]byte("ts=@xy done"),
+		[]byte("ts=a@abc done"),
+		[]byte("ts=abcdefghijklmnopq@ab done"),
+		[]byte("ts=abc@xy ts=de@abc done"),
+		[]byte("no anchor here"),
+	})
+}
+
+// TestRequiredIndexBackPrefixAfterSuppression 覆盖最左起点被抑制后区间内更靠右
+// 的起点仍会产生命中的情形：候选索引必须保留同一段类区间，否则会漏报。
+func TestRequiredIndexBackPrefixAfterSuppression(t *testing.T) {
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: `[A-Za-z0-9.-]+:[0-9]{1,5}`}, {Id: 2, Pattern: `[0-9a-fA-F]{32}`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scanner.requiredFindInto == nil {
+		t.Fatal("类重复前缀规则应建立必须文字候选索引")
+	}
+	assertScanAgreesWithReference(t, scanner, [][]byte{
+		[]byte("server ipv6=2001:0db8:85a3:0000:0000:8a2e:0370:7334\n"),
+		[]byte("host 192.168.1.10:8080 and 10.0.0.1:22"),
+		[]byte("port:1234 node-1.example.com:443"),
+		[]byte("a:b c:12 d:3456789"),
+		[]byte("no colon here"),
+	})
 }

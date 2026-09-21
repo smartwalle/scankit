@@ -41,7 +41,15 @@ func FromAST(root parser.Node) (Required, bool) {
 	}
 	out := Required{Variants: make([]Variant, 0, len(best.variants))}
 	for _, v := range best.variants {
-		if len(v.value) == 0 || v.max-v.min > maxWindow {
+		if len(v.value) == 0 {
+			return Required{}, false
+		}
+		if v.max >= v.min {
+			if v.max-v.min > maxWindow {
+				return Required{}, false
+			}
+		} else if v.back == nil {
+			// 偏移无上界时必须能靠左侧字节集合收缩起点，否则窗口无法约束。
 			return Required{}, false
 		}
 		out.Variants = append(out.Variants, Variant{Value: v.value, MinOffset: v.min, MaxOffset: v.max, Back: v.back})
@@ -100,8 +108,9 @@ func sequencePlan(elements []parser.Node) (plan, bool) {
 	found := false
 	prefixMin, prefixMax := 0, 0
 	for i := 0; i <= len(elements); i++ {
-		if prefixMax >= 0 {
-			back := backByteSet(elements[:i])
+		// 前缀无上界时只有在能靠 Back 集合把起点收缩到有限位置时才可用。
+		back := backByteSet(elements[:i])
+		if prefixMax >= 0 || back != nil {
 			for _, variants := range expandSuffixSteps(elements[i:]) {
 				candidate := plan{variants: make([]planVariant, 0, len(variants))}
 				for _, value := range variants {
@@ -156,11 +165,12 @@ func planScore(candidate plan) float64 {
 
 // expandSuffixSteps 返回序列后缀逐单位展开后的累积前缀文字集合。
 // 每个元素内部的固定次数重复会逐轮暴露，便于调用方在“更长的文字”与
-// “更多变体”之间取舍。
+// “更多变体”之间取舍。元素未能完整展开时立即停止，避免把只成立在部分
+// 重复上的前缀与后续元素拼接成并不必然出现的文字。
 func expandSuffixSteps(elements []parser.Node) [][][]byte {
 	acc := [][][]byte{{{}}}
 	for _, element := range elements {
-		steps := expandPrefixSteps(element)
+		steps, complete := expandPrefixSteps(element)
 		if len(steps) == 0 {
 			break
 		}
@@ -174,75 +184,81 @@ func expandSuffixSteps(elements []parser.Node) [][][]byte {
 			}
 			acc = append(acc, nonEmpty(product))
 		}
-		if failed || !prefixComplete(element) {
+		if failed || !complete || !fixedWidth(element) {
 			break
 		}
 	}
 	out := make([][][]byte, 0, len(acc))
 	for _, step := range acc {
-		if len(step) > 0 {
-			out = append(out, step)
+		cleaned := nonEmpty(step)
+		if len(cleaned) > 0 {
+			out = append(out, cleaned)
 		}
 	}
 	return out
 }
 
-// expandPrefixSteps 返回节点在消费 1..n 个单位后各自的累积前缀文字集合。
-// 返回 nil 表示该节点无法展开为完整文字前缀；调用方依赖该严格语义判断
-// 某个节点能否作为定长重复的整体，因此这里不对不完整展开做保留。
-func expandPrefixSteps(n parser.Node) [][][]byte {
+// expandPrefixSteps 返回节点在消费 1..n 个单位后各自的累积前缀文字集合，
+// 以及这些步骤是否已覆盖节点的最小宽度。返回 nil 表示该节点无法展开为
+// 任何文字前缀；complete 为 false 表示最后一个步骤只是部分前缀，调用方
+// 只能把它当作候选文字使用，不能继续拼接后续元素。
+func expandPrefixSteps(n parser.Node) ([][][]byte, bool) {
 	switch v := n.(type) {
 	case parser.Group:
 		return expandPrefixSteps(v.Child)
 	case parser.Sequence:
 		acc := [][][]byte{{{}}}
 		for _, element := range v.Elements {
-			steps := expandPrefixSteps(element)
+			steps, complete := expandPrefixSteps(element)
 			if len(steps) == 0 {
-				return nil
+				return nil, false
 			}
 			base := acc[len(acc)-1]
 			for _, step := range steps {
 				product, ok := crossProduct(base, step)
 				if !ok {
-					return nil
+					return nil, false
 				}
 				acc = append(acc, product)
 			}
-			if !prefixComplete(element) {
-				return acc
+			if !complete {
+				return acc, false
 			}
 		}
-		return acc
+		return acc, true
 	case parser.Repeat:
 		return expandRepeatSteps(v)
 	case parser.Literal:
 		if len(v.Value) == 0 {
-			return [][][]byte{{{}}}
+			return [][][]byte{{{}}}, true
 		}
-		return [][][]byte{{v.Value}}
+		return [][][]byte{{v.Value}}, true
 	case parser.Class:
 		bytes, ok := classBytes(v)
 		if !ok {
-			return nil
+			return nil, false
 		}
 		out := make([][]byte, 0, len(bytes))
 		for _, b := range bytes {
 			out = append(out, []byte{b})
 		}
-		return [][][]byte{out}
+		return [][][]byte{out}, true
 	case parser.Assertion, parser.ControlVerb, parser.Lookaround:
-		return [][][]byte{{{}}}
+		return [][][]byte{{{}}}, true
 	case parser.Alternation:
 		if len(v.Options) == 0 {
-			return nil
+			return nil, false
 		}
 		optionSteps := make([][][][]byte, 0, len(v.Options))
 		longest := 0
+		complete := true
 		for _, option := range v.Options {
-			steps := expandPrefixSteps(option)
+			steps, optionComplete := expandPrefixSteps(option)
 			if len(steps) == 0 {
-				return nil
+				return nil, false
+			}
+			if !optionComplete {
+				complete = false
 			}
 			optionSteps = append(optionSteps, steps)
 			if len(steps) > longest {
@@ -258,56 +274,63 @@ func expandPrefixSteps(n parser.Node) [][][]byte {
 					index = len(steps) - 1
 				}
 				if len(union)+len(steps[index]) > maxVariants {
-					return nil
+					return out, false
 				}
 				union = append(union, steps[index]...)
 			}
 			out = append(out, union)
 		}
-		return out
+		return out, complete
 	default:
-		return nil
+		return nil, false
 	}
 }
 
-func expandRepeatSteps(v parser.Repeat) [][][]byte {
+func expandRepeatSteps(v parser.Repeat) ([][][]byte, bool) {
 	switch {
 	case v.Min == 0 && v.Max == 0:
-		return [][][]byte{{{}}}
+		return [][][]byte{{{}}}, true
 	case v.Min < 1 || v.Max < 0:
-		return nil
+		return nil, false
+	}
+	child := mustPrefix(v.Child)
+	if len(child) == 0 {
+		return nil, false
 	}
 	steps := [][][]byte{{{}}}
+	reachedMin := true
 	for range v.Min {
-		product, ok := crossProduct(steps[len(steps)-1], mustPrefix(v.Child))
+		product, ok := crossProduct(steps[len(steps)-1], child)
 		if !ok {
+			reachedMin = false
 			break
 		}
 		steps = append(steps, product)
 	}
 	if len(steps) == 1 {
-		return nil
+		return nil, false
 	}
-	return steps
+	return steps, reachedMin
 }
 
-// prefixComplete 判断节点能否被前一步展开完整覆盖。
-func prefixComplete(n parser.Node) bool {
+// fixedWidth 判断节点每次匹配消耗的字节数是否固定：可变宽度节点会让后续
+// 元素的相对偏移漂移，拼接得到的文字并不必然出现。
+func fixedWidth(n parser.Node) bool {
 	switch v := n.(type) {
 	case parser.Group:
-		return prefixComplete(v.Child)
+		return fixedWidth(v.Child)
 	case parser.Sequence:
 		for _, element := range v.Elements {
-			if !prefixComplete(element) {
+			if !fixedWidth(element) {
 				return false
 			}
 		}
 		return true
 	case parser.Repeat:
-		return v.Min == v.Max
+		return v.Min == v.Max && fixedWidth(v.Child)
 	case parser.Alternation:
 		for _, option := range v.Options {
-			if !prefixComplete(option) {
+			if !fixedWidth(option) {
 				return false
 			}
 		}
@@ -317,9 +340,10 @@ func prefixComplete(n parser.Node) bool {
 	}
 }
 
+// mustPrefix 返回节点最小宽度对应的完整前缀文字集合；节点无法完整展开时返回 nil。
 func mustPrefix(n parser.Node) [][]byte {
-	steps := expandPrefixSteps(n)
-	if len(steps) == 0 {
+	steps, complete := expandPrefixSteps(n)
+	if len(steps) == 0 || !complete {
 		return nil
 	}
 	return steps[len(steps)-1]
@@ -371,7 +395,10 @@ func backByteSet(elements []parser.Node) []byte {
 		node = group.Child
 	}
 	repeat, ok := node.(parser.Repeat)
-	if !ok || repeat.Min < 1 || repeat.Max < repeat.Min {
+	if !ok || repeat.Min < 1 {
+		return nil
+	}
+	if repeat.Max >= 0 && repeat.Max < repeat.Min {
 		return nil
 	}
 	class, ok := repeat.Child.(parser.Class)
