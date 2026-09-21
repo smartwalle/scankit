@@ -523,6 +523,10 @@ func Extract(root parser.Node) []Literal {
 // ExtractUnique 提取文字候选并按值及大小写属性去重。
 func ExtractUnique(root parser.Node) []Literal { return Deduplicate(Extract(root)) }
 
+// teddyLiteralLimit 是仍交给 Teddy 的文字数量上限；超过后 Teddy 的桶内线性
+// 确认成本会超过前缀树的分摊成本。
+const teddyLiteralLimit = 128
+
 func Select(literals []Literal) string {
 	if len(literals) == 0 {
 		return "none"
@@ -545,6 +549,12 @@ func Select(literals []Literal) string {
 		// Teddy 按首字节分桶后逐条确认，桶过大时单次确认成本随文字数线性增长；
 		// 首字节高度集中的文字集合交给前缀树，避免共享前缀退化为全桶比较。
 		if len(literals) >= 32 && 2*maxBucket(buckets) >= len(literals) {
+			return "noodle"
+		}
+		// 文字数量很大且首字节分散时 Teddy 的掩码几乎不跳过任何位置，每个触发
+		// 位置仍要在所属桶内线性确认，确认成本随文字总数增长；前缀树用压缩共享
+		// 前缀分摊这一步，因此数量超过阈值后交给前缀树。
+		if len(literals) >= teddyLiteralLimit {
 			return "noodle"
 		}
 		return "teddy"
@@ -890,15 +900,22 @@ const simdWidth = 16
 
 // ContainsAt 判断指定偏移是否完整匹配文字。
 func ContainsAt(data []byte, off int, literal Literal) bool {
-	if off < 0 || len(literal.Value) == 0 || off+len(literal.Value) > len(data) {
+	value := literal.Value
+	length := len(value)
+	if off < 0 || length == 0 || off+length > len(data) {
 		return false
 	}
-	for i, c := range literal.Value {
-		d := data[off+i]
-		if literal.CaseInsensitive {
-			c, d = foldByte(c), foldByte(d)
+	window := data[off : off+length]
+	if !literal.CaseInsensitive {
+		for i, c := range value {
+			if window[i] != c {
+				return false
+			}
 		}
-		if c != d {
+		return true
+	}
+	for i, c := range value {
+		if foldByte(c) != foldByte(window[i]) {
 			return false
 		}
 	}

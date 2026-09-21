@@ -118,8 +118,18 @@ func (st *blockScanState) confirmIndexed(index *startByteIndex) {
 // 输出顺序与纯逐起点确认一致。
 func (st *blockScanState) confirmCandidatesAndFallback(starts []uint64, index *startByteIndex) {
 	if index == nil {
+		// 候选已按 (起点, 规则) 升序。被重叠抑制或已终止的规则在这里直接
+		// 跳过，避免为必然返回的候选进入通用确认例程。
+		simple := st.scanner.simpleReports
 		for _, key := range starts {
-			start, rule := requiredStartParts(key)
+			start := int(key >> 32)
+			rule := int(uint32(key))
+			if start < st.blockedUntil[rule] || st.fired[rule] {
+				continue
+			}
+			if !simple && st.ctx.Reports.Stopped() {
+				return
+			}
 			if !st.verify(rule, start) {
 				return
 			}

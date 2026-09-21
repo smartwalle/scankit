@@ -120,6 +120,20 @@ func sequencePlan(elements []parser.Node) (plan, bool) {
 					best, bestScore, found = candidate, score, true
 				}
 			}
+			// 后续元素无法完整展开时（例如 `[0-9]{8}-[0-9]{4}` 这类长重复），
+			// 逐单位拼接会提前中断；此处至少取该元素起点处必然出现的文字，
+			// 让 `-`、`:` 这类固定分隔符仍能作为高选择性候选。
+			if i < len(elements) {
+				if variants, ok := leadingLiterals(elements[i]); ok && len(variants) > 0 {
+					candidate := plan{variants: make([]planVariant, 0, len(variants))}
+					for _, value := range variants {
+						candidate.variants = append(candidate.variants, planVariant{value: value, min: prefixMin, max: prefixMax, back: back})
+					}
+					if score := planScore(candidate); score > bestScore {
+						best, bestScore, found = candidate, score, true
+					}
+				}
+			}
 		}
 		if i == len(elements) {
 			break
@@ -313,6 +327,73 @@ func expandRepeatSteps(v parser.Repeat) ([][][]byte, bool) {
 	return steps, reachedMin
 }
 
+// leadingLiterals 返回节点起点处必然出现的候选文字集合。集合中的每个文字都是
+// "或"关系，且一定出现在节点消耗的第一个字节处；ok 为 false 表示无法保证任何
+// 文字出现在节点起点（例如节点可为空、以点号开头或类展开超过变体上限）。
+//
+// sequencePlan 用它补上"后续元素无法完整展开"时的候选：`[0-9]{8}-[0-9]{4}` 这类
+// 长重复无法逐字节拼接，但分隔符 `-` 一定出现在固定偏移处，是比单字节类成员更
+// 高选择性的候选。
+func leadingLiterals(n parser.Node) ([][]byte, bool) {
+	switch v := n.(type) {
+	case parser.Group:
+		return leadingLiterals(v.Child)
+	case parser.Literal:
+		if len(v.Value) == 0 {
+			return nil, false
+		}
+		return [][]byte{v.Value}, true
+	case parser.Class:
+		bytes, ok := classBytes(v)
+		if !ok || len(bytes) == 0 || len(bytes) > maxVariants {
+			return nil, false
+		}
+		out := make([][]byte, 0, len(bytes))
+		for _, b := range bytes {
+			out = append(out, []byte{b})
+		}
+		return out, true
+	case parser.Sequence:
+		for _, element := range v.Elements {
+			if zeroWidthNode(element) {
+				continue
+			}
+			return leadingLiterals(element)
+		}
+		return nil, false
+	case parser.Repeat:
+		if v.Min < 1 {
+			return nil, false
+		}
+		return leadingLiterals(v.Child)
+	case parser.Alternation:
+		if len(v.Options) == 0 {
+			return nil, false
+		}
+		out := make([][]byte, 0, len(v.Options))
+		for _, option := range v.Options {
+			part, ok := leadingLiterals(option)
+			if !ok || len(out)+len(part) > maxVariants {
+				return nil, false
+			}
+			out = append(out, part...)
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+// zeroWidthNode 判断节点是否不消耗任何字节。
+func zeroWidthNode(n parser.Node) bool {
+	switch n.(type) {
+	case parser.Assertion, parser.ControlVerb, parser.Lookaround:
+		return true
+	default:
+		return false
+	}
+}
+
 // fixedWidth 判断节点每次匹配消耗的字节数是否固定：可变宽度节点会让后续
 // 元素的相对偏移漂移，拼接得到的文字并不必然出现。
 func fixedWidth(n parser.Node) bool {
@@ -381,39 +462,84 @@ func crossProduct(left, right [][]byte) ([][]byte, bool) {
 	return out, true
 }
 
-// backByteSet 在序列前缀恰好是单个有界类重复时返回该类的字节集合。
+// maxBackBytes 限制 Back 集合的规模。集合越大，命中位置左侧的收缩区间越
+// 长，候选起点随之增多；规模过大的集合（例如取反类）不具备收缩价值。
+const maxBackBytes = 96
+
+// backByteSet 返回前缀可能消费的字节集合，用于无上界窗口的左侧收缩。
+//
+// 返回的集合是前缀全部字节的保守超集：命中位置左侧只有落在集合内的字节才
+// 属于前缀，扫描时据此把候选起点收缩到命中位置左侧的连续区间。返回 nil 表示
+// 无法给出这样的超集（含点号、无法展开的类或集合规模过大），此时调用方不能
+// 接受无上界窗口。
 func backByteSet(elements []parser.Node) []byte {
-	if len(elements) != 1 {
+	if len(elements) == 0 {
 		return nil
 	}
-	node := elements[0]
-	for {
-		group, ok := node.(parser.Group)
-		if !ok {
-			break
+	member := make([]bool, 256)
+	for _, element := range elements {
+		if !unionInto(member, element) {
+			return nil
 		}
-		node = group.Child
 	}
-	repeat, ok := node.(parser.Repeat)
-	if !ok || repeat.Min < 1 {
+	// 结果按字节值直接索引：扫描时对命中位置左侧的每个字节做一次 0/1 判定。
+	table := make([]byte, 256)
+	count := 0
+	for value := range 256 {
+		if member[value] {
+			table[value] = 1
+			count++
+		}
+	}
+	if count == 0 || count > maxBackBytes {
 		return nil
 	}
-	if repeat.Max >= 0 && repeat.Max < repeat.Min {
-		return nil
+	return table
+}
+
+// unionInto 把节点可能消费的全部字节并入集合。返回 false 表示该节点无法给出
+// 字节超集，调用方必须放弃基于 Back 的窗口收缩。
+func unionInto(set []bool, node parser.Node) bool {
+	switch v := node.(type) {
+	case parser.Literal:
+		for _, value := range v.Value {
+			set[value] = true
+		}
+		return true
+	case parser.Class:
+		bytes, ok := classBytes(v)
+		if !ok {
+			return false
+		}
+		for _, value := range bytes {
+			set[value] = true
+		}
+		return true
+	case parser.Sequence:
+		for _, element := range v.Elements {
+			if !unionInto(set, element) {
+				return false
+			}
+		}
+		return true
+	case parser.Alternation:
+		for _, option := range v.Options {
+			if !unionInto(set, option) {
+				return false
+			}
+		}
+		return true
+	case parser.Repeat:
+		return unionInto(set, v.Child)
+	case parser.Group:
+		return unionInto(set, v.Child)
+	case parser.Assertion, parser.ControlVerb, parser.Lookaround:
+		// 零宽结构不消费字节，也不影响后续字节的相对位置。
+		return true
+	default:
+		// Any、UnicodeClass、Backreference、Conditional 等无法给出字节超集。
+		return false
 	}
-	class, ok := repeat.Child.(parser.Class)
-	if !ok || class.Negated {
-		return nil
-	}
-	bytes, ok := classBytes(class)
-	if !ok {
-		return nil
-	}
-	set := make([]byte, 256)
-	for _, b := range bytes {
-		set[b] = 1
-	}
-	return set
 }
 
 func classBytes(class parser.Class) ([]byte, bool) {

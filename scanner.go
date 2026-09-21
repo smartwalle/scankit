@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"math/bits"
 	"slices"
 	"sort"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/smartwalle/scankit/internal/combination"
 	"github.com/smartwalle/scankit/internal/compiler"
+	"github.com/smartwalle/scankit/internal/dispatch"
 	"github.com/smartwalle/scankit/internal/engine"
 	"github.com/smartwalle/scankit/internal/fdr"
 	"github.com/smartwalle/scankit/internal/fuzzy"
@@ -28,6 +30,7 @@ import (
 	"github.com/smartwalle/scankit/internal/report"
 	"github.com/smartwalle/scankit/internal/rose"
 	"github.com/smartwalle/scankit/internal/scratch"
+	"github.com/smartwalle/scankit/internal/simd"
 	"github.com/smartwalle/scankit/internal/smallblock"
 	"github.com/smartwalle/scankit/internal/smallwrite"
 )
@@ -89,6 +92,10 @@ type Scanner struct {
 	// 任意匹配至少命中其中一个文字，因此只需要在这些命中位置派生的起点上确认。
 	requiredLiterals []requiredLiteral
 	requiredFindInto func([]byte, []requiredHit) []requiredHit
+	// guardRunCovered 标记哪些规则的候选起点由前缀字节约束枚举，
+	// guardRunGroups 按字节集合合并这些约束，使同集合的规则共享一次线性扫描。
+	guardRunCovered []bool
+	guardRunGroups  []guardRunGroup
 	// requiredCovered 标记规则是否由候选文字索引覆盖；覆盖的规则只需在
 	// 候选起点确认，不再参与整块后端扫描。
 	requiredCovered []bool
@@ -128,7 +135,6 @@ type scanContext struct {
 	// 计数排序，避免在候选密集时付比较排序的对数因子。
 	requiredSortScratch []uint64
 	requiredStartCounts []uint32
-	requiredRuleCounts  []uint32
 	requiredStarts      []uint64
 	// chainArena 是确认快路径的单次工作区，跨候选起点复用同一块内存。
 	chainArena byteChainArena
@@ -137,6 +143,59 @@ type scanContext struct {
 	// directMatches 复用 simpleReports 模式下的直接结果切片。
 	directMatches []Match
 }
+
+// guardRun 是由前缀字节约束直接派生的候选起点来源：约束在 [offset, offset+length)
+// 上是同一个字节集合，满足该窗口的全部位置构成规则的候选起点集合。
+type guardRun struct {
+	ruleIndex int
+	set       [4]uint64
+	offset    int
+	length    int
+	// guard 是规则的完整前缀字节约束。等值窗口之外的约束位置也要校验时，
+	// 候选起点在被展开成候选之前先过一次查表，可以挡掉大量必然失败的起点。
+	guard *prefixGuard
+	// prefixCovered 表示约束窗口本身已经覆盖全部前缀字节集合。此时窗口扫描
+	// 已经保证前缀成立，展开时只剩首尾断言折算出的相邻字节约束需要校验。
+	prefixCovered bool
+}
+
+// guardRunGroup 把共享同一字节集合的约束合并成一次线性扫描。
+type guardRunGroup struct {
+	set    [4]uint64
+	tables simd.ByteSetTables
+	// runs 按窗口长度升序排列：连续段短于某条规则的窗口时，后面的规则窗口
+	// 只会更长，展开可以直接结束。
+	runs []guardRun
+}
+
+// member 判断字节是否属于该组的约束集合。只有不足一个宽窗口的尾部和跨窗口边界
+// 需要逐字节判定，主体扫描走预编译的宽窗口掩码。
+func (group *guardRunGroup) member(value byte) bool {
+	return group.set[value>>6]&(uint64(1)<<(value&63)) != 0
+}
+
+// guardRunMinLength 是可派生候选起点的最短窗口长度。更短的约束在逐起点确认
+// 中只需一两次字节判定，单独做线性扫描并不划算。
+const guardRunMinLength = 4
+
+// guardRunShortLiteralBytes 是判定候选文字"过短"的字节数上限。单字节或双字节
+// 候选文字在混合字母数字语料上的命中密度远高于同长度的字节集合窗口，此时前缀
+// 约束枚举能显著压缩候选。
+const guardRunShortLiteralBytes = 2
+
+// guardRunPromoteWindow 是"候选文字过短"的规则改用约束枚举所需的最短窗口。
+// 窗口越长，约束窗口的命中密度下降越快，才值得放弃候选文字索引。
+const guardRunPromoteWindow = 8
+
+// guardRunPromoteCardinality 是"候选文字过短"时改用约束枚举允许的窗口集合规模。
+// 集合越大，窗口在自然文本里越容易连续命中，枚举出的候选反而多于候选文字命中；
+// 超过该规模时改看窗口长度。
+const guardRunPromoteCardinality = 24
+
+// guardRunPromoteLongWindow 是宽集合仍改用约束枚举所需的最短窗口。窗口内的每个
+// 字节都必须落在集合内，命中密度随长度指数下降，长度足够时即使集合很宽也比逐字节
+// 候选文字稀疏：`[A-Za-z0-9+/]{20,}` 要连续 20 个 base64 字符才算候选。
+const guardRunPromoteLongWindow = 16
 
 // requiredHit 是一次候选文字命中：编号来自 requiredLiterals 的序号加一。
 type requiredHit struct {
@@ -165,6 +224,10 @@ type requiredEntry struct {
 	min       int
 	max       int
 	back      []byte
+	// guard 是规则的前缀字节约束，skip 表示该规则已由整块后端扫描产出结果。
+	// 两者都在构造期固化，候选展开热路径直接读取，避免逐候选回查规则表。
+	guard *prefixGuard
+	skip  bool
 }
 
 // requiredLiteral 是一个候选文字及共享它的全部规则。
@@ -211,6 +274,9 @@ type compiledRule struct {
 	eodReports bool
 	// required 是编译期推导出的必须文字集合，用于候选起点驱动扫描。
 	required []prefilter.Variant
+	// guard 是匹配起点之后必然满足的逐字节集合约束，用于在确认程序之前
+	// 直接丢弃不可能命中的候选起点。
+	guard *prefixGuard
 	// confirm 是候选起点确认程序，nil 表示规则必须走通用确认路径。
 	confirm *confirmProgram
 	// confirmEntry 是跳过入口文字后的程序入口，confirmSkip 是跳过的文字长度。
@@ -235,6 +301,7 @@ func newScanner(rules []compiledRule) *Scanner {
 			if required, ok := prefilter.FromAST(copyRules[i].root); ok {
 				copyRules[i].required = required.Variants
 			}
+			copyRules[i].guard = newPrefixGuard(copyRules[i])
 			copyRules[i].confirm = compileConfirmProgram(copyRules[i].root, copyRules[i].flags)
 			if copyRules[i].confirm != nil {
 				if literal := leadingLiteral(copyRules[i].root); requiredImpliesLiteral(copyRules[i].required, literal) {
@@ -299,7 +366,11 @@ func newScanner(rules []compiledRule) *Scanner {
 	if len(literals) > 1 {
 		scanner.literalKind, scanner.literalFind, scanner.literalFindInto = newLiteralCandidateFinder(literals)
 	}
-	scanner.requiredLiterals, scanner.requiredFindInto, scanner.requiredCovered = buildRequiredIndex(copyRules)
+	// 无法提取必须文字的规则本来只能逐起点确认；当前缀字节约束能枚举起点时
+	// 改由约束驱动，省掉整块逐起点循环。改由约束枚举的规则不再登记候选文字，
+	// 避免同一规则同时走两条候选来源、在同一批命中上重复展开窗口。
+	scanner.guardRunCovered = guardRunCandidates(copyRules)
+	scanner.requiredLiterals, scanner.requiredFindInto, scanner.requiredCovered = buildRequiredIndex(copyRules, scanner.guardRunCovered)
 	scanner.fastLiteral = !scanner.hasCombo && len(copyRules) > 1 &&
 		len(candidateIDs) == len(copyRules) && len(literalIDs) == len(copyRules)
 	if scanner.fastLiteral {
@@ -312,6 +383,7 @@ func newScanner(rules []compiledRule) *Scanner {
 	}
 	scanner.backendOnly = !scanner.hasCombo && !scanner.fastLiteral
 	scanner.buildConfirmRuleLists()
+	scanner.markRequiredEntrySkips()
 	scanner.startBytes = newStartByteIndex(copyRules, scanner.confirmUncoveredRules)
 	if len(scanner.confirmAllRules) != len(scanner.confirmUncoveredRules) {
 		scanner.startBytesAll = newStartByteIndex(copyRules, scanner.confirmAllRules)
@@ -346,7 +418,7 @@ func requiredIndexEligible(rule compiledRule) bool {
 // 返回的 covered 标记哪些规则真正进入索引：无法提取必须文字、或偏移窗口无法
 // 约束的规则保留原确认路径，不会让整个索引失效。窗口上界为负代表偏移无上界，
 // 此时必须携带 Back 字节集合才能把候选收缩到有限起点。
-func buildRequiredIndex(rules []compiledRule) ([]requiredLiteral, func([]byte, []requiredHit) []requiredHit, []bool) {
+func buildRequiredIndex(rules []compiledRule, guardDriven []bool) ([]requiredLiteral, func([]byte, []requiredHit) []requiredHit, []bool) {
 	byValue := make(map[string]int)
 	literals := make([]hwlm.Literal, 0, 64)
 	index := make([]requiredLiteral, 0, 64)
@@ -354,6 +426,9 @@ func buildRequiredIndex(rules []compiledRule) ([]requiredLiteral, func([]byte, [
 	for ruleIndex := range rules {
 		rule := rules[ruleIndex]
 		if !requiredIndexEligible(rule) || !requiredWindowUsable(rule.required) {
+			continue
+		}
+		if ruleIndex < len(guardDriven) && guardDriven[ruleIndex] {
 			continue
 		}
 		for _, variant := range rule.required {
@@ -365,7 +440,10 @@ func buildRequiredIndex(rules []compiledRule) ([]requiredLiteral, func([]byte, [
 				index = append(index, requiredLiteral{})
 				literals = append(literals, hwlm.Literal{ID: uint32(position + 1), Value: variant.Value})
 			}
-			entry := requiredEntry{ruleID: rule.id, ruleIndex: ruleIndex, min: variant.MinOffset, max: variant.MaxOffset, back: variant.Back}
+			entry := requiredEntry{ruleID: rule.id, ruleIndex: ruleIndex, min: variant.MinOffset, max: variant.MaxOffset, back: variant.Back, guard: rule.guard}
+			if guardImpliedByBack(entry.guard, variant.Back, variant.MinOffset) {
+				entry.guard = nil
+			}
 			index[position].entries = append(index[position].entries, entry)
 		}
 		covered[ruleIndex] = true
@@ -405,6 +483,89 @@ const maxRequiredWindow = 64
 // 命中密集时这一步是候选展开前的固定开销，改用直写的转换循环可让它随
 // 命中数线性摊薄。
 func newRequiredFinder(literals []hwlm.Literal) func([]byte, []requiredHit) []requiredHit {
+	short, long := splitRequiredLiterals(literals)
+	if len(long) == 0 {
+		// 全部候选文字都是单字节：此时拆分拿不到任何 lane 收益，通用匹配器
+		// （FDR/Teddy）在稀疏命中语料上的跳过能力反而更好。
+		return newLiteralMatcherFinder(literals)
+	}
+	finders := make([]func([]byte, []requiredHit) []requiredHit, 0, 2)
+	finders = append(finders, newLiteralMatcherFinder(long))
+	if len(short) > 0 {
+		finders = append(finders, newSingleByteFinder(short))
+	}
+	switch len(finders) {
+	case 0:
+		return nil
+	case 1:
+		return finders[0]
+	default:
+		return func(data []byte, dst []requiredHit) []requiredHit {
+			for _, find := range finders {
+				dst = find(data, dst)
+			}
+			return dst
+		}
+	}
+}
+
+// splitRequiredLiterals 把候选文字按长度分成"单字节"与"多字节"两组。候选文字
+// 中的单字节成员会把匹配器的最短文字压到 1，候选掩码随之退化成"首字节集合"，
+// 几乎覆盖全部输入字节；拆开之后多字节匹配器可以启用 2 个以上 lane，掩码只保留
+// 连续多字节共同命中的位置。
+func splitRequiredLiterals(literals []hwlm.Literal) (short, long []hwlm.Literal) {
+	for _, literal := range literals {
+		if len(literal.Value) <= 1 {
+			short = append(short, literal)
+			continue
+		}
+		long = append(long, literal)
+	}
+	return short, long
+}
+
+// newSingleByteFinder 为长度为 1 的候选文字构建专用匹配器：命中判定只取决于当前
+// 字节，因此用一次 SIMD 字节集合扫描求出全部命中位置，再用 256 项查表换算成
+// 候选编号，省掉通用匹配器的分桶确认。
+func newSingleByteFinder(literals []hwlm.Literal) func([]byte, []requiredHit) []requiredHit {
+	var table [256]uint32
+	var set [4]uint64
+	for _, literal := range literals {
+		if len(literal.Value) == 0 {
+			continue
+		}
+		value := literal.Value[0]
+		table[value] = literal.ID
+		set[value>>6] |= uint64(1) << uint(value&63)
+	}
+	tables := simd.NewByteSetTables([4][4]uint64{set})
+	return func(data []byte, dst []requiredHit) []requiredHit {
+		backend := dispatch.DefaultBackend()
+		off := 0
+		for ; off+simd.WideWidth <= len(data); off += simd.WideWidth {
+			mask, ok := backend.WindowMask64(data, off, &tables, 1)
+			if !ok {
+				break
+			}
+			for mask != 0 {
+				bit := bits.TrailingZeros64(mask)
+				if id := table[data[off+bit]]; id != 0 {
+					dst = append(dst, requiredHit{slot: int(id) - 1, pos: off + bit})
+				}
+				mask &^= 1 << uint(bit)
+			}
+		}
+		for ; off < len(data); off++ {
+			if id := table[data[off]]; id != 0 {
+				dst = append(dst, requiredHit{slot: int(id) - 1, pos: off})
+			}
+		}
+		return dst
+	}
+}
+
+// newLiteralMatcherFinder 为全部长度不小于 2 的候选文字选择具体匹配后端。
+func newLiteralMatcherFinder(literals []hwlm.Literal) func([]byte, []requiredHit) []requiredHit {
 	switch hwlm.Select(literals) {
 	case "teddy":
 		matcher := teddy.New(literals)
@@ -1172,7 +1333,7 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 	}
 	// 整块后端扫描只覆盖无法进入候选文字索引的规则；能由候选文字定位的
 	// 规则交给候选起点确认，避免每条规则各扫一遍整块输入。
-	requiredDriven := scanner.requiredFindInto != nil
+	requiredDriven := scanner.requiredIndexDriven()
 	backendOnly := scanner.backendOnly
 	if backendOnly {
 		for ri := range scanner.rules {
@@ -1236,7 +1397,6 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 		// 线性排序缓冲按下标复用，超限时释放，避免长期占住大块内存。
 		resetRequiredSortBuffer(&ctx.requiredSortScratch)
 		resetRequiredSortBuffer(&ctx.requiredStartCounts)
-		resetRequiredSortBuffer(&ctx.requiredRuleCounts)
 		for id, starts := range ctx.prefilterStarts {
 			if len(starts) > 1<<20 {
 				delete(ctx.prefilterStarts, id)
@@ -1389,7 +1549,7 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 	// 必须文字候选驱动：任意匹配都包含至少一个候选文字，因此只需在候选文字
 	// 命中位置派生的起点上确认，跳过整块“每个起点 × 每条规则”的循环。
 	if requiredDriven {
-		if starts, ok := scanner.requiredScanStarts(ctx, data, backendOnly, requiredDriven); ok {
+		if starts, ok := scanner.requiredScanStarts(ctx, data); ok {
 			state.requiredStartDriven = true
 			// 真实命中数量有界于 (起点数 + 1)，而候选起点可以远多于命中；
 			// 这里只在候选不多时按候选数预分配，候选密集时交给 append 增长，
@@ -1471,24 +1631,193 @@ func (st *blockScanState) confirmPerStart(rules []int) {
 
 // buildConfirmRuleLists 预计算逐起点确认所需的规则集合，避免每次扫描重复遍历。
 func (scanner *Scanner) buildConfirmRuleLists() {
-	requiredDriven := scanner.requiredFindInto != nil
+	requiredDriven := scanner.requiredIndexDriven()
 	scanner.confirmAllRules = make([]int, 0, len(scanner.rules))
 	scanner.confirmUncoveredRules = make([]int, 0, len(scanner.rules))
+	scanner.guardRunGroups = nil
+	var runs []guardRun
 	for ri := range scanner.rules {
 		if scanner.backendScanned(ri, scanner.backendOnly, requiredDriven) {
 			continue
 		}
 		scanner.confirmAllRules = append(scanner.confirmAllRules, ri)
+		if scanner.guardRunCovers(ri) {
+			if run, ok := guardRunFor(ri, &scanner.rules[ri]); ok {
+				runs = append(runs, run)
+			}
+			continue
+		}
 		if requiredDriven && scanner.requiredIndexCovered(ri) {
 			continue
 		}
 		scanner.confirmUncoveredRules = append(scanner.confirmUncoveredRules, ri)
 	}
+	scanner.guardRunGroups = groupGuardRuns(runs)
 }
 
-// requiredIndexCovered 判断规则是否已进入必须文字候选索引。
+// guardRunCandidates 选出应该改由前缀字节约束枚举候选起点的规则。
+//
+// 选中条件是该约束窗口比候选文字索引更省：无法进入必须文字索引的规则一律
+// 改用约束枚举；可以进入但候选文字只有一两个字节时，其在混合字母数字语料上
+// 的命中密度远高于同长度的集合窗口，同样改用约束枚举。
+func guardRunCandidates(rules []compiledRule) []bool {
+	var promoted []bool
+	for ruleIndex := range rules {
+		if _, ok := guardRunFor(ruleIndex, &rules[ruleIndex]); !ok {
+			continue
+		}
+		if !guardRunOutshinesLiteral(rules[ruleIndex]) {
+			continue
+		}
+		if promoted == nil {
+			promoted = make([]bool, len(rules))
+		}
+		promoted[ruleIndex] = true
+	}
+	return promoted
+}
+
+// guardRunOutshinesLiteral 判断前缀字节约束枚举是否比候选文字索引更省。
+func guardRunOutshinesLiteral(rule compiledRule) bool {
+	if !requiredIndexEligible(rule) || !requiredWindowUsable(rule.required) {
+		return true
+	}
+	for _, variant := range rule.required {
+		if len(variant.Value) > guardRunShortLiteralBytes {
+			return false
+		}
+	}
+	set, _, length, ok := rule.guard.longestEqualWindow()
+	if !ok || length < guardRunPromoteWindow {
+		return false
+	}
+	// 集合越大，同一窗口长度在自然文本里的命中越密：`[a-z]{9,}` 这类规则的窗口
+	// 几乎覆盖英文日志里的每个单词，枚举出的候选远多于候选文字命中，此时保留
+	// 候选文字索引更省。只有窄集合（数字、部分十六进制）才值得改用约束枚举。
+	members := 0
+	for _, word := range set {
+		members += bits.OnesCount64(word)
+	}
+	if members <= guardRunPromoteCardinality {
+		return true
+	}
+	return length >= guardRunPromoteLongWindow
+}
+
+// guardRunFor 判断规则能否用前缀字节约束枚举候选起点。约束必须能完整覆盖
+// 规则的匹配前缀，且规则不允许空匹配，否则末尾起点会落在扫描范围之外。
+func guardRunFor(ruleIndex int, rule *compiledRule) (guardRun, bool) {
+	if rule.guard == nil || rule.root == nil || parser.Nullable(rule.root) {
+		return guardRun{}, false
+	}
+	set, offset, length, ok := rule.guard.longestEqualWindow()
+	if !ok || length < guardRunMinLength {
+		return guardRun{}, false
+	}
+	return guardRun{
+		ruleIndex:     ruleIndex,
+		set:           set,
+		offset:        offset,
+		length:        length,
+		guard:         rule.guard,
+		prefixCovered: offset == 0 && length == len(rule.guard.sets),
+	}, true
+}
+
+// groupGuardRuns 按字节集合合并约束，使同集合的规则共享一次线性扫描。
+func groupGuardRuns(runs []guardRun) []guardRunGroup {
+	if len(runs) == 0 {
+		return nil
+	}
+	groups := make([]guardRunGroup, 0, len(runs))
+	for _, run := range runs {
+		placed := -1
+		for index := range groups {
+			if groups[index].set == run.set {
+				placed = index
+				groups[index].runs = append(groups[index].runs, run)
+				break
+			}
+		}
+		if placed < 0 {
+			groups = append(groups, guardRunGroup{
+				set:    run.set,
+				tables: simd.NewByteSetTables([4][4]uint64{run.set}),
+				runs:   []guardRun{run},
+			})
+			continue
+		}
+	}
+	for index := range groups {
+		slices.SortFunc(groups[index].runs, func(left, right guardRun) int {
+			return left.length - right.length
+		})
+	}
+	return groups
+}
+
+// requiredIndexDriven 判断本次扫描是否存在候选起点索引（必须文字或前缀字节
+// 约束）。任一来源生效时都必须走候选驱动路径，否则这两类规则会退化成整块
+// 逐起点确认。判定只依赖构造期固化的字段，因此在确认规则集合构建之前即可用。
+func (scanner *Scanner) requiredIndexDriven() bool {
+	return scanner.requiredFindInto != nil || scanner.guardRunCovered != nil
+}
+
+// guardImpliedByBack 判断前缀约束是否只校验首字节、且该字节集合与左侧回退集合
+// 完全一致。此时窗口内的每个候选起点都已由回退扫描保证了首字节归属，逐点查表
+// 只是重复开销，可以整条约束直接省略。
+func guardImpliedByBack(guard *prefixGuard, back []byte, minOffset int) bool {
+	// 起点可以落在文字命中位置（minOffset 为 0）时，首字节就是文字本身，
+	// 不一定属于左侧集合，此时约束不能省略。首尾断言折算出的相邻字节约束
+	// 与左侧回退无关，携带这类约束时同样不能整条省略。
+	if guard == nil || back == nil || len(guard.sets) != 1 || minOffset < 1 || guard.hasBoundary() {
+		return false
+	}
+	set := guard.sets[0]
+	for value := range 256 {
+		member := byte(0)
+		if set[value>>6]&(uint64(1)<<(uint(value)&63)) != 0 {
+			member = 1
+		}
+		if member != back[value] {
+			return false
+		}
+	}
+	return true
+}
+
+// requiredIndexCovered 判断规则的候选起点是否已由候选索引（必须文字或前缀
+// 字节约束）枚举，覆盖的规则不再参与整块后端扫描。
 func (scanner *Scanner) requiredIndexCovered(ri int) bool {
-	return scanner.requiredCovered != nil && scanner.requiredCovered[ri]
+	if scanner.requiredCovered != nil && scanner.requiredCovered[ri] {
+		return true
+	}
+	return scanner.guardRunCovers(ri)
+}
+
+// literalIndexCovered 判断规则的候选起点是否由必须文字索引枚举。前缀字节约束
+// 枚举只校验约束窗口，不校验规则的入口文字，因此这类规则不能跳过确认程序的
+// 入口指令，否则会在窗口命中但入口文字不匹配的位置产生误报。
+func (scanner *Scanner) literalIndexCovered(ri int) bool {
+	return scanner.requiredCovered != nil && ri < len(scanner.requiredCovered) && scanner.requiredCovered[ri]
+}
+
+// guardRunCovers 判断规则是否由前缀字节约束枚举候选起点。
+func (scanner *Scanner) guardRunCovers(ri int) bool {
+	return scanner.guardRunCovered != nil && ri < len(scanner.guardRunCovered) && scanner.guardRunCovered[ri]
+}
+
+// markRequiredEntrySkips 把“该规则已由整块后端扫描产出结果”的判定结果固化到
+// 候选条目上。判定只依赖构造期确定的扫描计划，扫描热路径因此不必对每个候选
+// 重新求值。
+func (scanner *Scanner) markRequiredEntrySkips() {
+	requiredDriven := scanner.requiredIndexDriven()
+	for literalIndex := range scanner.requiredLiterals {
+		entries := scanner.requiredLiterals[literalIndex].entries
+		for entryIndex := range entries {
+			entries[entryIndex].skip = scanner.backendScanned(entries[entryIndex].ruleIndex, scanner.backendOnly, requiredDriven)
+		}
+	}
 }
 
 // backendScanned 判断规则是否由整块后端扫描产出结果。后端扫描只在 backendOnly
@@ -1552,7 +1881,7 @@ func (st *blockScanState) verify(ri int, start int) bool {
 		var ok bool
 		// 候选由必须文字索引派生时，起点处的入口文字已由匹配器确认，
 		// 可以直接从入口文字之后的指令开始求值。
-		if rule.confirmSkip > 0 && st.requiredStartDriven && st.scanner.requiredIndexCovered(ri) {
+		if rule.confirmSkip > 0 && st.requiredStartDriven && st.scanner.literalIndexCovered(ri) {
 			end, ok = rule.confirm.run(st.data, rule.confirmEntry, start+rule.confirmSkip, rule.flags, st.ctx.confirmFrames())
 		} else {
 			end, ok = rule.confirm.preferredEnd(st.data, start, rule.flags, st.ctx.confirmFrames())
@@ -1668,15 +1997,19 @@ func (st *blockScanState) finish(matches []Match) ([]Match, error) {
 
 // requiredScanStarts 把候选文字命中展开为按起点升序的 (起点, 规则) 组合。
 // 返回 false 表示候选数量异常膨胀，调用方应退回逐起点确认。
-func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte, backendOnly, requiredDriven bool) ([]uint64, bool) {
-	hits := scanner.requiredFindInto(data, ctx.requiredHits[:0])
-	ctx.requiredHits = hits
+func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte) ([]uint64, bool) {
 	starts := ctx.requiredStarts[:0]
 	limit := 16*len(data) + 4096
+	hits := []requiredHit(nil)
+	if scanner.requiredFindInto != nil {
+		hits = scanner.requiredFindInto(data, ctx.requiredHits[:0])
+		ctx.requiredHits = hits
+	}
 	for _, hit := range hits {
 		literal := scanner.requiredLiterals[hit.slot]
-		for _, entry := range literal.entries {
-			if scanner.backendScanned(entry.ruleIndex, backendOnly, requiredDriven) {
+		for index := range literal.entries {
+			entry := &literal.entries[index]
+			if entry.skip {
 				continue
 			}
 			// 偏移上界为负表示无上界，此时起点只受数据左边界约束。
@@ -1707,12 +2040,38 @@ func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte, backen
 			if from > to {
 				continue
 			}
+			ruleKey := uint64(uint32(entry.ruleIndex))
+			if to == from {
+				// 窗口退化为单个起点，前缀约束在起点位置上必然成立，查表只是
+				// 额外常数开销。
+				if len(starts) >= limit {
+					return nil, false
+				}
+				starts = append(starts, uint64(uint32(from))<<32|ruleKey)
+				continue
+			}
+			// 窗口较宽时同一次文字命中要摊开成多个起点，其中绝大多数连规则
+			// 前缀都过不了；先做一次约束查表，避免为它们建立候选并启动确认程序。
+			guard := entry.guard
 			for start := from; start <= to; start++ {
 				if len(starts) >= limit {
 					return nil, false
 				}
-				starts = append(starts, requiredStartKey(start, entry.ruleIndex))
+				if !guard.allows(data, start) {
+					continue
+				}
+				starts = append(starts, uint64(uint32(start))<<32|ruleKey)
 			}
+		}
+	}
+	// 前缀字节约束枚举出的起点本身与时序无关，但确认阶段必要时要与首字节索引
+	// 归并，因此必须和候选文字路径一样整理成 (起点, 规则) 升序；缺少这一步会
+	// 让归并游标错过靠前的约束候选，直接漏报。
+	if len(scanner.guardRunGroups) > 0 {
+		var ok bool
+		starts, ok = scanner.appendGuardRunStarts(data, starts, limit)
+		if !ok {
+			return nil, false
 		}
 	}
 	ctx.requiredStarts = starts
@@ -1731,6 +2090,228 @@ func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte, backen
 	return deduped, true
 }
 
+// appendGuardRunStarts 为只能由前缀字节约束定位的规则枚举候选起点。
+// 约束在 [offset, offset+length) 上是同一字节集合，同集合的规则共享一次扫描：
+// 先求出全部极大连续段，再把落在段内的窗口起点整段展开。
+func (scanner *Scanner) appendGuardRunStarts(data []byte, starts []uint64, limit int) ([]uint64, bool) {
+	backend := dispatch.DefaultBackend()
+	for index := range scanner.guardRunGroups {
+		var ok bool
+		starts, ok = scanner.guardRunGroups[index].appendStarts(backend, data, starts, limit)
+		if !ok {
+			return nil, false
+		}
+	}
+	return starts, true
+}
+
+// appendStarts 用宽窗口字节集合掩码求出该组的全部极大连续段，再把窗口完整落在
+// 连续段内的起点整段展开。连续段由掩码的"段起点位"与"段终点位"配对得到，跨窗口
+// 的唯一一段用 runStart 接力；不足一个宽窗口的尾部回退成逐字节求掩码后走同一套
+// 配对逻辑，因此结果与完全逐字节的实现逐位一致。
+func (group *guardRunGroup) appendStarts(backend simd.Backend, data []byte, starts []uint64, limit int) ([]uint64, bool) {
+	emitter := guardRunEmitter{starts: starts, limit: limit, data: data}
+	window := guardRunWindow{group: group, emitter: &emitter, runStart: -1}
+	off := 0
+	for ; off+simd.WideWidth <= len(data); off += simd.WideWidth {
+		mask, ok := backend.WindowMask64(data, off, &group.tables, 1)
+		if !ok {
+			return group.appendStartsScalar(data, starts, limit)
+		}
+		edgeIn := off > 0 && group.member(data[off-1])
+		edgeOut := off+simd.WideWidth < len(data) && group.member(data[off+simd.WideWidth])
+		window.process(off, simd.WideWidth, mask, edgeIn, edgeOut)
+		if emitter.overflow {
+			return nil, false
+		}
+	}
+	if off < len(data) {
+		width := len(data) - off
+		var mask uint64
+		for index := 0; index < width; index++ {
+			if group.member(data[off+index]) {
+				mask |= uint64(1) << uint(index)
+			}
+		}
+		window.process(off, width, mask, off > 0 && group.member(data[off-1]), false)
+	}
+	if window.runStart >= 0 {
+		window.close(len(data))
+	}
+	if emitter.overflow {
+		return nil, false
+	}
+	return emitter.starts, true
+}
+
+// guardRunEmitter 在宽窗口扫描期间累计候选起点。切片头保存在结构体字段里而不是
+// 闭包捕获的局部变量，追加时不必每次穿透一层间接寻址。
+type guardRunEmitter struct {
+	starts   []uint64
+	limit    int
+	overflow bool
+	data     []byte
+}
+
+// emitRun 把一个连续段 [from, to) 覆盖的窗口起点整段展开成候选键。
+func (emitter *guardRunEmitter) emitRun(run *guardRun, from, to int) {
+	// 窗口 [start+offset, start+offset+length) 必须落在 [from, to) 内。
+	first := from - run.offset
+	if first < 0 {
+		first = 0
+	}
+	last := to - run.length - run.offset
+	count := last - first + 1
+	if count <= 0 {
+		return
+	}
+	if run.needsGuardFilter() {
+		emitter.emitFiltered(run, first, last, run.prefixCovered)
+		return
+	}
+	if len(emitter.starts)+count > emitter.limit {
+		emitter.overflow = true
+		return
+	}
+	starts := emitter.starts
+	if cap(starts)-len(starts) < count {
+		starts = slices.Grow(starts, count)
+	}
+	base := len(starts)
+	starts = starts[:base+count]
+	ruleKey := uint64(uint32(run.ruleIndex))
+	for index := 0; index < count; index++ {
+		starts[base+index] = uint64(uint32(first+index))<<32 | ruleKey
+	}
+	emitter.starts = starts
+}
+
+// needsGuardFilter 判断约束窗口是否没有覆盖完整前缀约束。窗口落在前缀内部或
+// 短于前缀时，窗口之外的固定位置仍可能拒绝候选，需要在展开时逐起点校验。
+func (run *guardRun) needsGuardFilter() bool {
+	if run.guard == nil {
+		return false
+	}
+	return run.offset > 0 || len(run.guard.sets) > run.length || run.guard.hasBoundary()
+}
+
+// emitFiltered 逐起点通过完整前缀约束后追加候选键；窗口命中的起点只有少数
+// 真正满足完整前缀，逐点过滤比整段展开再确认省得多。boundaryOnly 表示窗口
+// 已覆盖全部前缀集合，只需校验首尾断言折算出的相邻字节约束。
+func (emitter *guardRunEmitter) emitFiltered(run *guardRun, first, last int, boundaryOnly bool) {
+	starts := emitter.starts
+	ruleKey := uint64(uint32(run.ruleIndex))
+	for start := first; start <= last; start++ {
+		allowed := false
+		if boundaryOnly {
+			allowed = run.guard.allowsBoundary(emitter.data, start)
+		} else {
+			allowed = run.guard.allows(emitter.data, start)
+		}
+		if !allowed {
+			continue
+		}
+		if len(starts) >= emitter.limit {
+			emitter.overflow = true
+			emitter.starts = starts
+			return
+		}
+		starts = append(starts, uint64(uint32(start))<<32|ruleKey)
+	}
+	emitter.starts = starts
+}
+
+// guardRunWindow 把掩码窗口配对出的极大连续段转换为候选起点。掩码窗口的 bit i
+// 对应 data[off+i] 是否属于集合，edgeIn/edgeOut 表示窗口两侧相邻字节的归属。
+type guardRunWindow struct {
+	group    *guardRunGroup
+	emitter  *guardRunEmitter
+	runStart int
+}
+
+// process 处理一个宽度为 width 的掩码窗口。
+func (window *guardRunWindow) process(off, width int, mask uint64, edgeIn, edgeOut bool) {
+	beginBits := mask &^ (mask << 1)
+	if edgeIn {
+		beginBits &^= 1
+	}
+	endBits := mask &^ (mask >> 1)
+	if edgeOut {
+		endBits &^= uint64(1) << uint(width-1)
+	}
+	if window.runStart >= 0 && endBits != 0 {
+		endBit := bits.TrailingZeros64(endBits)
+		endBits &^= uint64(1) << uint(endBit)
+		window.close(off + endBit + 1)
+	}
+	if window.runStart >= 0 {
+		return
+	}
+	for beginBits != 0 {
+		beginBit := bits.TrailingZeros64(beginBits)
+		beginBits &^= uint64(1) << uint(beginBit)
+		if endBits == 0 {
+			window.runStart = off + beginBit
+			return
+		}
+		endBit := bits.TrailingZeros64(endBits)
+		endBits &^= uint64(1) << uint(endBit)
+		window.emitRange(off+beginBit, off+endBit+1)
+	}
+}
+
+// close 结束跨窗口接力的连续段。
+func (window *guardRunWindow) close(end int) {
+	window.emitRange(window.runStart, end)
+	window.runStart = -1
+}
+
+// emitRange 把 [from, to) 段内所有成立的窗口起点交给同组的每条规则。组内规则按
+// 窗口长度升序排列，连续段长度不足时后面的规则只会更长，可以立即结束整段展开，
+// 省掉大量必然返回的逐规则调用。
+func (window *guardRunWindow) emitRange(from, to int) {
+	runs := window.group.runs
+	length := to - from
+	for index := range runs {
+		run := &runs[index]
+		if run.length > length {
+			break
+		}
+		window.emitter.emitRun(run, from, to)
+	}
+}
+
+// appendStartsScalar 是不支持宽窗口掩码的后端上的回退实现：逐字节求出极大连续段。
+func (group *guardRunGroup) appendStartsScalar(data []byte, starts []uint64, limit int) ([]uint64, bool) {
+	runStart := -1
+	for index := 0; index <= len(data); index++ {
+		if index < len(data) && group.member(data[index]) {
+			if runStart < 0 {
+				runStart = index
+			}
+			continue
+		}
+		if runStart < 0 {
+			continue
+		}
+		for _, run := range group.runs {
+			first := runStart - run.offset
+			if first < 0 {
+				first = 0
+			}
+			last := index - run.length - run.offset
+			for start := first; start <= last; start++ {
+				if len(starts) >= limit {
+					return nil, false
+				}
+				starts = append(starts, requiredStartKey(start, run.ruleIndex))
+			}
+		}
+		runStart = -1
+	}
+	return starts, true
+}
+
 // directMatchPrealloc 是候选驱动路径上直接结果切片的预分配上限：超过该
 // 数量时改为按实际命中增长，避免稀疏语料按候选数量预留大块内存。
 const directMatchPrealloc = 1 << 16
@@ -1743,54 +2324,64 @@ const (
 	requiredCountingSortMaxData = 1 << 20
 )
 
+// requiredBucketMaxShift 限制候选分桶排序的桶跨度。桶跨度按候选密度自适应：
+// 目标是每个桶平均不超过两个候选，桶内再用插入排序恢复完整顺序。
+const requiredBucketMaxShift = 16
+
 // sortRequiredStarts 把候选键按 (起点, 规则下标) 升序整理。
-// 先按规则下标、再按起点做两轮稳定计数排序即可得到比较排序同样的顺序，
-// 代价是候选数量的线性函数；任一门槛不满足时退回 slices.Sort。
+// 候选先按 "起点 >> shift" 分桶，桶内元素数量接近常数，再用插入排序恢复
+// 桶内的完整顺序；两次内置循环都是候选数量的线性函数，比整表计数排序少了
+// 一轮直方图和一次全量搬运。任一门槛不满足时退回 slices.Sort。
 func (scanner *Scanner) sortRequiredStarts(ctx *scanContext, starts []uint64, dataLen int) {
 	keyCount := len(starts)
-	if keyCount < requiredCountingSortMin || keyCount > requiredCountingSortMaxKeys || dataLen+2 > requiredCountingSortMaxData {
+	if keyCount < requiredCountingSortMin || keyCount > requiredCountingSortMaxKeys || dataLen > requiredCountingSortMaxData {
 		slices.Sort(starts)
 		return
 	}
-	ruleCount := len(scanner.rules) + 1
 	if cap(ctx.requiredSortScratch) < keyCount {
 		ctx.requiredSortScratch = make([]uint64, keyCount)
 	} else {
 		ctx.requiredSortScratch = ctx.requiredSortScratch[:keyCount]
 	}
 	scratch := ctx.requiredSortScratch
-	if cap(ctx.requiredRuleCounts) < ruleCount {
-		ctx.requiredRuleCounts = make([]uint32, ruleCount)
+	shift := 0
+	for shift < requiredBucketMaxShift && dataLen>>(shift+1) > keyCount/2 {
+		shift++
+	}
+	buckets := dataLen>>shift + 2
+	if cap(ctx.requiredStartCounts) < buckets {
+		ctx.requiredStartCounts = make([]uint32, buckets)
 	} else {
-		ctx.requiredRuleCounts = ctx.requiredRuleCounts[:ruleCount]
+		ctx.requiredStartCounts = ctx.requiredStartCounts[:buckets]
 	}
-	ruleCounts := ctx.requiredRuleCounts
-	if cap(ctx.requiredStartCounts) < dataLen+2 {
-		ctx.requiredStartCounts = make([]uint32, dataLen+2)
-	} else {
-		ctx.requiredStartCounts = ctx.requiredStartCounts[:dataLen+2]
-	}
-	startCounts := ctx.requiredStartCounts
-	clear(ruleCounts)
-	clear(startCounts)
+	counts := ctx.requiredStartCounts
+	clear(counts)
 	for _, key := range starts {
-		ruleCounts[int(uint32(key))]++
+		counts[key>>32>>shift]++
 	}
-	sortByCount(ruleCounts)
+	sortByCount(counts)
 	for _, key := range starts {
-		rule := int(uint32(key))
-		scratch[ruleCounts[rule]] = key
-		ruleCounts[rule]++
+		bucket := key >> 32 >> shift
+		scratch[counts[bucket]] = key
+		counts[bucket]++
 	}
-	for _, key := range scratch {
-		startCounts[int(uint32(key>>32))]++
+	// 每个桶覆盖至多 2^shift 个相邻起点，桶内按完整键插入排序即可得到
+	// (起点, 规则下标) 升序；桶内元素数量接近常数，这一步是线性代价。
+	begin := 0
+	for index := range buckets {
+		end := int(counts[index])
+		for current := begin + 1; current < end; current++ {
+			key := scratch[current]
+			position := current - 1
+			for position >= begin && scratch[position] > key {
+				scratch[position+1] = scratch[position]
+				position--
+			}
+			scratch[position+1] = key
+		}
+		begin = end
 	}
-	sortByCount(startCounts)
-	for _, key := range scratch {
-		start := int(uint32(key >> 32))
-		starts[startCounts[start]] = key
-		startCounts[start]++
-	}
+	copy(starts, scratch)
 }
 
 // sortByCount 把直方图原地转换为各桶的写入位置。
