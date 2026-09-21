@@ -8,9 +8,9 @@ import (
 // ReplaceFunc 将一个匹配片段的替换内容写入 buf。matched 是原始输入中与 match 对应的切片。
 type ReplaceFunc func(buf *bytes.Buffer, match Match, matched []byte)
 
-// MaskFunc 原地修改一个已命中的片段。value 与调用方传入的数据共享底层数组，
-// 长度固定；函数应只修改 value 的内容，不能修改命中片段外的数据。
-type MaskFunc func(match Match, value []byte)
+// MaskFunc 原地修改一个已命中的片段。matched 与调用方传入的数据共享底层数组，
+// 长度固定；函数应只修改 matched 的内容，不能修改命中片段外的数据。
+type MaskFunc func(match Match, matched []byte)
 
 // Replace 使用 fn 重组 data 中的匹配片段。重叠片段按起点最早、同起点跨度最长的规则处理。
 //
