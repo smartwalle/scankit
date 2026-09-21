@@ -111,3 +111,71 @@ func TestRequiredIndexFallbackKeepsLiteralFilter(t *testing.T) {
 		t.Fatalf("回退路径应命中全部同形规则: got=%d want=%d", len(hit), ruleCount)
 	}
 }
+
+// TestRequiredIndexBackPrefixKeepsLeftmostStart 验证前缀是有界类重复时，候选窗口
+// 只保留最左起点，避免在同一段等价起点上重复执行确认程序。
+func TestRequiredIndexBackPrefixKeepsLeftmostStart(t *testing.T) {
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: `[A-Za-z]{1,16}@[a-z]{2,4}\b`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scanner.requiredFindInto == nil || len(scanner.requiredLiterals) != 1 {
+		t.Fatal("类重复前缀规则应建立必须文字候选索引")
+	}
+	entry := scanner.requiredLiterals[0].entries[0]
+	if entry.back == nil {
+		t.Fatal("类重复前缀规则应携带左侧字节集合")
+	}
+	ctx := scanner.contextPool.Get().(*scanContext)
+	starts, ok := scanner.requiredScanStarts(ctx, []byte("ts=abcde@xy done"), false, false)
+	scanner.contextPool.Put(ctx)
+	if !ok {
+		t.Fatal("候选起点未超出上限时不应回退")
+	}
+	if len(starts) != 1 {
+		t.Fatalf("类重复前缀窗口应只保留最左起点 3: %v", starts)
+	}
+	if start, rule := requiredStartParts(starts[0]); start != 3 || rule != 0 {
+		t.Fatalf("最左起点应解析为 (3, 0): got=(%d, %d)", start, rule)
+	}
+}
+
+// TestRequiredIndexBackPrefixAgreesWithPerStartScan 断言最左起点收缩不改变命中
+// 集合，逐条语料与禁用候选索引的逐起点确认结果完全一致。
+func TestRequiredIndexBackPrefixAgreesWithPerStartScan(t *testing.T) {
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: `[A-Za-z]{1,16}@[a-z]{2,4}\b`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scanner.requiredFindInto == nil {
+		t.Fatal("类重复前缀规则应建立必须文字候选索引")
+	}
+	fallback := *scanner
+	fallback.requiredFindInto = nil
+	corpus := [][]byte{
+		[]byte("ts=abcde@xy done"),
+		[]byte("ts=@xy done"),
+		[]byte("ts=a@abc done"),
+		[]byte("ts=abcdefghijklmnopq@ab done"),
+		[]byte("ts=abc@xy ts=de@abc done"),
+		[]byte("no anchor here"),
+	}
+	for _, data := range corpus {
+		want, err := fallback.Scan(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := scanner.Scan(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("语料 %q 命中数量不一致: got=%v want=%v", data, got, want)
+		}
+		for index := range got {
+			if got[index] != want[index] {
+				t.Fatalf("语料 %q 第 %d 个命中不一致: got=%v want=%v", data, index, got[index], want[index])
+			}
+		}
+	}
+}

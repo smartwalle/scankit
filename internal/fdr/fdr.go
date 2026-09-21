@@ -2,12 +2,15 @@
 package fdr
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"math/bits"
+	"sort"
+
 	"github.com/smartwalle/scankit/internal/dispatch"
 	"github.com/smartwalle/scankit/internal/hwlm"
 	"github.com/smartwalle/scankit/internal/simd"
-	"sort"
 )
 
 const version = 1
@@ -49,10 +52,39 @@ type Matcher struct {
 	literals  []hwlm.Literal
 	sensitive automaton
 	folded    automaton
-	// sensitiveSet/foldedSet 是两棵自动机根状态的预编译首字节集合，
-	// 在构建期解析一次，供每次扫描的窗口跳过逻辑直接复用。
-	sensitiveSet simd.ByteSet
-	foldedSet    simd.ByteSet
+	// sensitiveRoot/foldedRoot 是两棵自动机根状态的首字节跳过信息，
+	// 在构建期解析一次，供每次扫描的根状态跳跃逻辑直接复用。
+	sensitiveRoot rootSkip
+	foldedRoot    rootSkip
+}
+
+// rootSkip 描述自动机根状态可用的首字节跳过信息。
+//
+// empty 为真表示根状态没有可用转移，任何输入都不会产生命中；tables 供整窗掩码
+// 跳过使用；single 为真时 first 是根首字节集合中的唯一字节，此时调用方可以用
+// 单字节检索直接跳到下一个候选，无需逐窗计算掩码。
+type rootSkip struct {
+	tables simd.ByteSetTables
+	empty  bool
+	single bool
+	first  byte
+}
+
+// newRootSkip 解析根首字节集合并预编译跳过信息。
+func newRootSkip(nodes []acNode) rootSkip {
+	set := automatonRootSet(nodes)
+	skip := rootSkip{tables: simd.FirstByteTables(set)}
+	count := 0
+	for index, word := range set {
+		for word != 0 {
+			skip.first = byte(index*64 + bits.TrailingZeros64(word))
+			word &= word - 1
+			count++
+		}
+	}
+	skip.single = count == 1
+	skip.empty = count == 0
+	return skip
 }
 
 // Validate 检查文字匹配器的编号和文字内容。
@@ -106,8 +138,8 @@ func New(literals []hwlm.Literal) *Matcher {
 	}
 	out.sensitive = buildAutomaton(out.literals, false)
 	out.folded = buildAutomaton(out.literals, true)
-	out.sensitiveSet = simd.NewByteSet(automatonRootSet(out.sensitive.nodes))
-	out.foldedSet = simd.NewByteSet(automatonRootSet(out.folded.nodes))
+	out.sensitiveRoot = newRootSkip(out.sensitive.nodes)
+	out.foldedRoot = newRootSkip(out.folded.nodes)
 	return out
 }
 func (m *Matcher) Len() int {
@@ -478,19 +510,61 @@ func (m *Matcher) FindIntoUnsorted(data []byte, dst []Match) []Match {
 		return dst[:0]
 	}
 	out := dst[:0]
-	appendMatches := func(nodes []acNode, rootSet *simd.ByteSet, folded bool) {
-		if len(nodes) == 0 {
+	appendMatches := func(nodes []acNode, skip *rootSkip, folded bool) {
+		if len(nodes) == 0 || skip.empty {
 			return
 		}
 		state := 0
+		if skip.single {
+			// 根首字节集合只有一个字节时，逐窗掩码退化为一次单字节检索：
+			// 中间字节既不改变根状态，也不可能启动任何文字。
+			first := skip.first
+			for offset := 0; offset < len(data); {
+				if state == 0 {
+					next := bytes.IndexByte(data[offset:], first)
+					if next < 0 {
+						return
+					}
+					offset += next
+				}
+				value := data[offset]
+				if folded {
+					value = foldASCII(value)
+				}
+				state = nodes[state].next[value]
+				for _, literal := range nodes[state].output {
+					from := offset - len(literal.Value) + 1
+					out = append(out, Match{literal.ID, from, offset + 1})
+				}
+				offset++
+			}
+			return
+		}
 		backend := dispatch.DefaultBackend()
-		for offset := 0; offset < len(data); offset++ {
-			// 处于根状态时，整块不含首字节的输入不会改变状态，可安全跳过。
-			if state == 0 && offset+simd.SuperWidth/2 <= len(data) {
-				vector, ok := backend.Load(data, offset)
-				if ok && backend.ByteSetMaskPrepared(vector, rootSet) == 0 {
-					offset += simd.SuperWidth/2 - 1
-					continue
+		// 根状态下的窗口缓存：winMask 的置位对应 winBase 起窗口内属于首字节
+		// 集合的字节。只要状态回到根且偏移仍落在同一窗口内就复用掩码，避免
+		// 首字节集合常见（例如数字类必需文字）时每个候选都重算一次窗口。
+		winBase := 0
+		winMask := uint64(0)
+		winWidth := 0
+		for offset := 0; offset < len(data); {
+			if state == 0 {
+				if winWidth == 0 || offset >= winBase+winWidth {
+					mask, width, ok := rootWindow(backend, data, offset, &skip.tables)
+					if !ok {
+						winWidth = 0
+					} else {
+						winBase, winMask, winWidth = offset, mask, width
+					}
+				}
+				if winWidth > 0 {
+					shifted := winMask >> uint(offset-winBase)
+					if shifted == 0 {
+						offset = winBase + winWidth
+						continue
+					}
+					// 置位之前的字节既不是任何文字的首字节，也不会离开根状态。
+					offset += bits.TrailingZeros64(shifted)
 				}
 			}
 			value := data[offset]
@@ -502,11 +576,31 @@ func (m *Matcher) FindIntoUnsorted(data []byte, dst []Match) []Match {
 				from := offset - len(literal.Value) + 1
 				out = append(out, Match{literal.ID, from, offset + 1})
 			}
+			offset++
 		}
 	}
-	appendMatches(m.sensitive.nodes, &m.sensitiveSet, false)
-	appendMatches(m.folded.nodes, &m.foldedSet, true)
+	appendMatches(m.sensitive.nodes, &m.sensitiveRoot, false)
+	appendMatches(m.folded.nodes, &m.foldedRoot, true)
 	return out
+}
+
+// rootWindow 返回 offset 处可用的根状态窗口。
+//
+// 返回值 mask 的每个置位对应窗口内一个属于根首字节集合的字节，width 是窗口宽度。
+// 优先使用 64 字节宽窗口，剩余不足时退回 32 字节超向量窗口；两者都放不下时返回
+// ok=false，调用方逐字节回退，保证缓冲区末尾的候选不会因为窗口不足而漏报。
+func rootWindow(backend simd.Backend, data []byte, offset int, tables *simd.ByteSetTables) (uint64, int, bool) {
+	if offset+simd.WideWidth <= len(data) {
+		if mask, ok := backend.WindowMask64(data, offset, tables, 1); ok {
+			return mask, simd.WideWidth, true
+		}
+	}
+	if offset+simd.SuperWidth <= len(data) {
+		if mask, ok := backend.WindowMask(data, offset, tables, 1); ok {
+			return uint64(mask), simd.SuperWidth, true
+		}
+	}
+	return 0, 0, false
 }
 
 func automatonRootSet(nodes []acNode) [4]uint64 {

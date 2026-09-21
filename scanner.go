@@ -113,7 +113,7 @@ type scanContext struct {
 	// requiredHits 与 requiredStarts 复用候选文字命中及其派生的确认起点，
 	// 避免每次扫描重新分配候选切片。
 	requiredHits   []requiredHit
-	requiredStarts []requiredStart
+	requiredStarts []uint64
 	// chainArena 是确认快路径的单次工作区，跨候选起点复用同一块内存。
 	chainArena byteChainArena
 	// confirmStack 是确认程序的回溯栈，跨候选起点复用。
@@ -128,10 +128,18 @@ type requiredHit struct {
 	pos  int
 }
 
-// requiredStart 是需要确认的 (起点, 规则下标) 组合，按起点升序排列。
-type requiredStart struct {
-	start int
-	rule  int
+// requiredStartKey 把需要确认的 (起点, 规则下标) 组合打包进一个机器字。
+//
+// 排序是候选展开后的固定开销，按机器字排序可以直接用 slices.Sort 的有序
+// 快路径，避免 16 字节结构体在比较器回调中来回搬运。起点放在高位，因此
+// 排序结果仍按起点升序、同起点按规则下标升序，与去重语义一致。
+func requiredStartKey(start, rule int) uint64 {
+	return uint64(uint32(start))<<32 | uint64(uint32(rule))
+}
+
+// requiredStartParts 拆回打包前的起点与规则下标。
+func requiredStartParts(key uint64) (int, int) {
+	return int(key >> 32), int(key & 0xFFFFFFFF)
 }
 
 // requiredEntry 把候选文字与具体规则及其偏移窗口关联起来。
@@ -1355,8 +1363,9 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 				ctx.directMatches = make([]Match, 0, len(starts))
 				state.direct = ctx.directMatches[:0]
 			}
-			for _, entry := range starts {
-				if !state.verify(entry.rule, entry.start) {
+			for _, key := range starts {
+				start, rule := requiredStartParts(key)
+				if !state.verify(rule, start) {
 					break
 				}
 			}
@@ -1600,7 +1609,7 @@ func (st *blockScanState) finish(matches []Match) ([]Match, error) {
 
 // requiredScanStarts 把候选文字命中展开为按起点升序的 (起点, 规则) 组合。
 // 返回 false 表示候选数量异常膨胀，调用方应退回逐起点确认。
-func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte, backendOnly, requiredDriven bool) ([]requiredStart, bool) {
+func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte, backendOnly, requiredDriven bool) ([]uint64, bool) {
 	hits := scanner.requiredFindInto(data, ctx.requiredHits[:0])
 	ctx.requiredHits = hits
 	starts := ctx.requiredStarts[:0]
@@ -1628,12 +1637,23 @@ func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte, backen
 				if left > from {
 					from = left
 				}
+				// 前缀是有界类重复时，窗口内每个起点都会消耗到同一处候选文字，
+				// 之后的求值路径完全一致；最左起点一旦命中就会被记录并抑制其
+				// 余起点，因此只需保留最左起点即可覆盖整段候选。
+				if from > to {
+					continue
+				}
+				if len(starts) >= limit {
+					return nil, false
+				}
+				starts = append(starts, requiredStartKey(from, entry.ruleIndex))
+				continue
 			}
 			for start := from; start <= to; start++ {
 				if len(starts) >= limit {
 					return nil, false
 				}
-				starts = append(starts, requiredStart{start: start, rule: entry.ruleIndex})
+				starts = append(starts, requiredStartKey(start, entry.ruleIndex))
 			}
 		}
 	}
@@ -1641,16 +1661,10 @@ func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte, backen
 	if len(starts) < 2 {
 		return starts, true
 	}
-	slices.SortFunc(starts, func(a, b requiredStart) int {
-		if a.start != b.start {
-			return a.start - b.start
-		}
-		return a.rule - b.rule
-	})
+	slices.Sort(starts)
 	deduped := starts[:1]
 	for _, entry := range starts[1:] {
-		last := deduped[len(deduped)-1]
-		if entry.start == last.start && entry.rule == last.rule {
+		if entry == deduped[len(deduped)-1] {
 			continue
 		}
 		deduped = append(deduped, entry)
