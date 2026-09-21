@@ -275,6 +275,15 @@ func (g *Directed) Successors(v Vertex) []Vertex {
 	return append([]Vertex(nil), g.succ[v]...)
 }
 
+// SuccessorView 返回 v 后继顶点的内部切片，只读遍历场景使用，
+// 避免热路径为每个状态复制后继列表。调用方不得修改返回值。
+func (g *Directed) SuccessorView(v Vertex) []Vertex {
+	if g == nil {
+		return nil
+	}
+	return g.succ[v]
+}
+
 // Predecessors 返回 v 的前驱顶点副本。
 func (g *Directed) Predecessors(v Vertex) []Vertex {
 	if g == nil {

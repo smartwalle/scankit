@@ -3,14 +3,13 @@ package scankit
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"unicode"
 	"unicode/utf8"
 
@@ -24,6 +23,7 @@ import (
 	"github.com/smartwalle/scankit/internal/hwlm/teddy"
 	nfalib "github.com/smartwalle/scankit/internal/nfa"
 	"github.com/smartwalle/scankit/internal/parser"
+	"github.com/smartwalle/scankit/internal/prefilter"
 	"github.com/smartwalle/scankit/internal/repeat"
 	"github.com/smartwalle/scankit/internal/report"
 	"github.com/smartwalle/scankit/internal/rose"
@@ -78,12 +78,23 @@ type Scanner struct {
 	literalKind      string
 	candidateIDs     map[uint32]struct{}
 	literalIDs       map[uint32]struct{}
-	usage            compiler.Usage
-	validationErr    error
-	rosePlan         *rose.Program
-	// cancelFlag 由 ScanContext 的 ctx.Done 异步设置，供主扫描循环周期探测，
-	// 避免把 context.Context 引入 scanInto 签名或破坏对象池。
-	cancelFlag uint32
+	// indexedRules/exactRules 是 candidateIDs 与 literalIDs 的下标视图，
+	// 供确认热路径避免每个候选起点都做一次 map 查询。
+	indexedRules []bool
+	exactRules   []bool
+	// simpleReports 表示本次扫描不需要报告管理器参与：没有组合规则，
+	// 也没有依赖 SOM/单次/静默语义的规则，可直接追加匹配结果。
+	simpleReports bool
+	// requiredLiterals 是必须文字候选索引：每个文字对应一组 (规则, 偏移窗口)。
+	// 任意匹配至少命中其中一个文字，因此只需要在这些命中位置派生的起点上确认。
+	requiredLiterals []requiredLiteral
+	requiredFindInto func([]byte, []requiredHit) []requiredHit
+	// requiredCovered 标记规则是否由候选文字索引覆盖；覆盖的规则只需在
+	// 候选起点确认，不再参与整块后端扫描。
+	requiredCovered []bool
+	usage           compiler.Usage
+	validationErr   error
+	rosePlan        *rose.Program
 }
 
 type scanContext struct {
@@ -99,6 +110,42 @@ type scanContext struct {
 	// ruleMatchBuf 复用规则 NFA/Repeat 路径的结束偏移缓冲，
 	// 避免每个起点都重新分配临时切片。
 	ruleMatchBuf []int
+	// requiredHits 与 requiredStarts 复用候选文字命中及其派生的确认起点，
+	// 避免每次扫描重新分配候选切片。
+	requiredHits   []requiredHit
+	requiredStarts []requiredStart
+	// chainArena 是确认快路径的单次工作区，跨候选起点复用同一块内存。
+	chainArena byteChainArena
+	// confirmStack 是确认程序的回溯栈，跨候选起点复用。
+	confirmStack []confirmFrame
+	// directMatches 复用 simpleReports 模式下的直接结果切片。
+	directMatches []Match
+}
+
+// requiredHit 是一次候选文字命中：编号来自 requiredLiterals 的序号加一。
+type requiredHit struct {
+	slot int
+	pos  int
+}
+
+// requiredStart 是需要确认的 (起点, 规则下标) 组合，按起点升序排列。
+type requiredStart struct {
+	start int
+	rule  int
+}
+
+// requiredEntry 把候选文字与具体规则及其偏移窗口关联起来。
+type requiredEntry struct {
+	ruleID    uint32
+	ruleIndex int
+	min       int
+	max       int
+	back      []byte
+}
+
+// requiredLiteral 是一个候选文字及共享它的全部规则。
+type requiredLiteral struct {
+	entries []requiredEntry
 }
 
 type literalCandidate struct {
@@ -128,6 +175,9 @@ type compiledRule struct {
 	containsAny bool
 	// nonGreedy 缓存 firstRepeatPreference 的结果，表示规则是否偏好非贪婪。
 	nonGreedy bool
+	// hasCapture 缓存 containsCaptureSemantics 的结果，确认快路径据此判断
+	// 能否跳过捕获语义求值。
+	hasCapture bool
 	// hasBackref 缓存 containsBackreference 的结果。
 	hasBackref bool
 	// hasConditional 缓存 containsConditional 的结果。
@@ -135,6 +185,14 @@ type compiledRule struct {
 	// eodReports 缓存后端是否携带只在数据末尾触发的报告，
 	// 避免每个起点重新遍历状态表。
 	eodReports bool
+	// required 是编译期推导出的必须文字集合，用于候选起点驱动扫描。
+	required []prefilter.Variant
+	// confirm 是候选起点确认程序，nil 表示规则必须走通用确认路径。
+	confirm *confirmProgram
+	// confirmEntry 是跳过入口文字后的程序入口，confirmSkip 是跳过的文字长度。
+	// confirmSkip 为 0 时从规则入口正常确认。
+	confirmEntry int32
+	confirmSkip  int
 }
 
 func newScanner(rules []compiledRule) *Scanner {
@@ -145,9 +203,24 @@ func newScanner(rules []compiledRule) *Scanner {
 		copyRules[i].requiresEndOfData = requiresEndOfData(copyRules[i].root)
 		copyRules[i].backendEligible = backendEligible(copyRules[i])
 		copyRules[i].nonGreedy = firstRepeatPreference(copyRules[i].root)
+		copyRules[i].hasCapture = containsCaptureSemantics(copyRules[i].root)
 		copyRules[i].hasBackref = containsBackreference(copyRules[i].root)
 		copyRules[i].hasConditional = containsConditional(copyRules[i].root)
 		copyRules[i].eodReports = copyRules[i].program != nil && copyRules[i].program.HasEODReports()
+		if copyRules[i].root != nil && copyRules[i].comb == nil {
+			if required, ok := prefilter.FromAST(copyRules[i].root); ok {
+				copyRules[i].required = required.Variants
+			}
+			copyRules[i].confirm = compileConfirmProgram(copyRules[i].root, copyRules[i].flags)
+			if copyRules[i].confirm != nil {
+				if literal := leadingLiteral(copyRules[i].root); requiredImpliesLiteral(copyRules[i].required, literal) {
+					if entry, ok := copyRules[i].confirm.afterLeadingLiteral(literal); ok {
+						copyRules[i].confirmEntry = entry
+						copyRules[i].confirmSkip = len(literal)
+					}
+				}
+			}
+		}
 	}
 	index := make(map[uint32]int, len(copyRules))
 	order := make(map[uint32]int, len(copyRules))
@@ -179,9 +252,35 @@ func newScanner(rules []compiledRule) *Scanner {
 			}
 		}
 	}
-	scanner := &Scanner{rules: copyRules, ruleIndex: index, ruleOrder: order, hasCombo: hasCombo, candidateIDs: candidateIDs, literalIDs: literalIDs, contextPool: &sync.Pool{New: func() any { return &scanContext{Scratch: scratch.New(), Reports: report.New()} }}, roseStatePool: &sync.Pool{New: func() any { return new([]rose.State) }}, roseSinglePool: &sync.Pool{New: func() any { return new(map[uint32]struct{}) }}}
+	indexedRules := make([]bool, len(copyRules))
+	exactRules := make([]bool, len(copyRules))
+	for i, rule := range copyRules {
+		if _, ok := candidateIDs[rule.id]; ok {
+			indexedRules[i] = true
+		}
+		if _, ok := literalIDs[rule.id]; ok {
+			exactRules[i] = true
+		}
+	}
+	simpleReports := !hasCombo
+	if simpleReports {
+		for _, rule := range copyRules {
+			if rule.flags&(FlagQuiet|FlagSingleMatch|FlagSOMLeftmost) != 0 {
+				simpleReports = false
+				break
+			}
+		}
+	}
+	scanner := &Scanner{rules: copyRules, ruleIndex: index, ruleOrder: order, hasCombo: hasCombo, candidateIDs: candidateIDs, literalIDs: literalIDs, indexedRules: indexedRules, exactRules: exactRules, simpleReports: simpleReports, contextPool: &sync.Pool{New: func() any { return &scanContext{Scratch: scratch.New(), Reports: report.New()} }}, roseStatePool: &sync.Pool{New: func() any { return new([]rose.State) }}, roseSinglePool: &sync.Pool{New: func() any { return new(map[uint32]struct{}) }}}
 	if len(literals) > 1 {
 		scanner.literalKind, scanner.literalFind, scanner.literalFindInto = newLiteralCandidateFinder(literals)
+	}
+	scanner.requiredLiterals, scanner.requiredFindInto = buildRequiredIndex(copyRules)
+	if scanner.requiredFindInto != nil {
+		scanner.requiredCovered = make([]bool, len(copyRules))
+		for i := range copyRules {
+			scanner.requiredCovered[i] = requiredIndexEligible(copyRules[i])
+		}
 	}
 	// Rose 角色图与文字候选索引随规则计划不可变，构造阶段完成一次，
 	// 扫描时直接复用，避免每个 Block 重建角色、指令和自动机。
@@ -190,6 +289,133 @@ func newScanner(rules []compiledRule) *Scanner {
 	// 编译结果不可变，计划校验只需在构造时执行一次；扫描热路径复用该结论。
 	scanner.validationErr = scanner.validate()
 	return scanner
+}
+
+// requiredIndexEligible 判断规则能否安全进入必须文字候选索引。
+// 大小写折叠、UTF-8/UCP 会改变文字或字符类的匹配语义，作用域修饰符同理。
+func requiredIndexEligible(rule compiledRule) bool {
+	if len(rule.required) == 0 {
+		return false
+	}
+	if rule.flags&(FlagCaseless|FlagUTF8|FlagUCP) != 0 {
+		return false
+	}
+	// 模糊匹配允许匹配文字本身发生变化，精确文字候选会漏报。
+	if rule.ext != nil && rule.ext.Flags&(ExtFlagEditDistance|ExtFlagHammingDistance) != 0 {
+		return false
+	}
+	return !parser.HasScopedFlags(rule.root)
+}
+
+// buildRequiredIndex 为全部规则建立共享的必须文字候选索引。
+// 只要存在既没有候选文字、又不走后端直扫的规则，就返回 nil 以保留原确认路径。
+func buildRequiredIndex(rules []compiledRule) ([]requiredLiteral, func([]byte, []requiredHit) []requiredHit) {
+	byValue := make(map[string]int)
+	literals := make([]hwlm.Literal, 0, 64)
+	index := make([]requiredLiteral, 0, 64)
+	for ruleIndex := range rules {
+		rule := rules[ruleIndex]
+		if !requiredIndexEligible(rule) {
+			if rule.backendEligible {
+				continue
+			}
+			return nil, nil
+		}
+		for _, variant := range rule.required {
+			key := string(variant.Value)
+			position, ok := byValue[key]
+			if !ok {
+				position = len(index)
+				byValue[key] = position
+				index = append(index, requiredLiteral{})
+				literals = append(literals, hwlm.Literal{ID: uint32(position + 1), Value: variant.Value})
+			}
+			entry := requiredEntry{ruleID: rule.id, ruleIndex: ruleIndex, min: variant.MinOffset, max: variant.MaxOffset, back: variant.Back}
+			if entry.max-entry.min > maxRequiredWindow {
+				return nil, nil
+			}
+			index[position].entries = append(index[position].entries, entry)
+		}
+	}
+	if len(index) == 0 {
+		return nil, nil
+	}
+	return index, newRequiredFinder(literals)
+}
+
+// maxRequiredWindow 与编译期候选推导保持一致的偏移窗口上限。
+const maxRequiredWindow = 64
+
+// newRequiredFinder 按候选文字规模选择匹配器，并把每次扫描的命中缓冲
+// 放入对象池，避免为每条命中重新分配临时切片。调用方 requiredScanStarts
+// 会重新按起点排序并在派生的起点上去重，因此这里统一使用无序输出，
+// 命中密集的语料上不再为同一批候选重复排序。
+//
+// 各分支把匹配器命中直接填入 requiredHit，避免为每条命中经过函数值调用；
+// 命中密集时这一步是候选展开前的固定开销，改用直写的转换循环可让它随
+// 命中数线性摊薄。
+func newRequiredFinder(literals []hwlm.Literal) func([]byte, []requiredHit) []requiredHit {
+	switch hwlm.Select(literals) {
+	case "teddy":
+		matcher := teddy.New(literals)
+		pool := &sync.Pool{New: func() any { s := make([]teddy.Match, 0, 64); return &s }}
+		return func(data []byte, dst []requiredHit) []requiredHit {
+			buf := pool.Get().(*[]teddy.Match)
+			matches := matcher.FindIntoUnsorted(data, (*buf)[:0])
+			*buf = matches
+			dst = growRequiredHits(dst, len(matches))
+			for index := range matches {
+				dst = append(dst, requiredHit{slot: int(matches[index].ID) - 1, pos: matches[index].From})
+			}
+			if cap(matches) > 1<<20 {
+				*buf = nil
+			}
+			pool.Put(buf)
+			return dst
+		}
+	case "fdr":
+		matcher := fdr.New(literals)
+		pool := &sync.Pool{New: func() any { s := make([]fdr.Match, 0, 64); return &s }}
+		return func(data []byte, dst []requiredHit) []requiredHit {
+			buf := pool.Get().(*[]fdr.Match)
+			matches := matcher.FindIntoUnsorted(data, (*buf)[:0])
+			*buf = matches
+			dst = growRequiredHits(dst, len(matches))
+			for index := range matches {
+				dst = append(dst, requiredHit{slot: int(matches[index].ID) - 1, pos: matches[index].From})
+			}
+			if cap(matches) > 1<<20 {
+				*buf = nil
+			}
+			pool.Put(buf)
+			return dst
+		}
+	default:
+		matcher := noodle.New(literals)
+		pool := &sync.Pool{New: func() any { s := make([]noodle.Match, 0, 64); return &s }}
+		return func(data []byte, dst []requiredHit) []requiredHit {
+			buf := pool.Get().(*[]noodle.Match)
+			matches := matcher.FindIntoUnsorted(data, (*buf)[:0])
+			*buf = matches
+			dst = growRequiredHits(dst, len(matches))
+			for index := range matches {
+				dst = append(dst, requiredHit{slot: int(matches[index].ID) - 1, pos: matches[index].From})
+			}
+			if cap(matches) > 1<<20 {
+				*buf = nil
+			}
+			pool.Put(buf)
+			return dst
+		}
+	}
+}
+
+// growRequiredHits 按本次命中数把目标切片调整到可复用的空切片。
+func growRequiredHits(dst []requiredHit, need int) []requiredHit {
+	if cap(dst) < need {
+		return make([]requiredHit, 0, need)
+	}
+	return dst[:0]
 }
 
 func newLiteralCandidateFinder(literals []hwlm.Literal) (string, func([]byte) []literalCandidate, func([]byte, []literalCandidate) []literalCandidate) {
@@ -846,53 +1072,6 @@ func (scanner *Scanner) Scan(data []byte) ([]Match, error) {
 	return scanner.ScanInto(data, nil)
 }
 
-// ErrCancelled 是 ScanContext 在上下文取消时返回的哨兵错误。
-var ErrCancelled = fmt.Errorf("scankit: scan cancelled")
-
-// ScanContext 支持通过 context.Context 取消的整块扫描。
-// ctx 在调用前若已取消或扫描期间被取消，立即返回 ErrCancelled 与已收集的 matches。
-func (scanner *Scanner) ScanContext(ctx context.Context, data []byte) ([]Match, error) {
-	return scanner.ScanContextInto(ctx, data, nil)
-}
-
-// ScanContextInto 与 ScanContext 类似，但复用调用方提供的 matches 缓冲。
-// ctx == nil 时等价于 ScanInto，保留现有调用语义。
-func (scanner *Scanner) ScanContextInto(ctx context.Context, data []byte, matches []Match) ([]Match, error) {
-	if scanner == nil {
-		return matches, nil
-	}
-	return scanner.scanContextInto(ctx, data, matches)
-}
-
-// scanContextInto 在现有 scanInto 主路径上增加 ctx.Err() 探测点，
-// 避免破坏现有调用方。cancelCh 在 ctx.Done 时同步关闭以快速唤醒跨候选循环。
-func (scanner *Scanner) scanContextInto(ctx context.Context, data []byte, matches []Match) ([]Match, error) {
-	if ctx == nil {
-		return scanner.scanInto(data, matches)
-	}
-	if err := ctx.Err(); err != nil {
-		return matches, ErrCancelled
-	}
-	// 通过 sync/atomic 标志把 ctx.Done 异步广播到主扫描循环，
-	// 让长输入扫描也能在 ctx 取消时提前返回，避免修改 scanInto 签名。
-	// sync.Once 保证 stop channel 恰好被关闭一次，避免 close-of-closed 竞争。
-	var stop sync.Once
-	stopCh := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			atomic.StoreUint32(&scanner.cancelFlag, 1)
-			stop.Do(func() { close(stopCh) })
-		case <-stopCh:
-		}
-	}()
-	defer func() {
-		stop.Do(func() { close(stopCh) })
-		atomic.StoreUint32(&scanner.cancelFlag, 0)
-	}()
-	return scanner.scanInto(data, matches)
-}
-
 // ScanInto 将匹配追加到 matches；输入数据不会被修改。
 func (scanner *Scanner) ScanInto(data []byte, matches []Match) ([]Match, error) {
 	return scanner.scanInto(data, matches)
@@ -907,19 +1086,8 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 		return matches, err
 	}
 	base := len(matches)
-	// 当全部规则都能安全转换为 Rose 角色时，整块扫描直接复用角色调度器；
-	// 只要存在无法转换的规则或组合规则，就保留原有统一确认路径，避免候选
-	// 调度改变未覆盖规则的结果语义。
-	if scanner.canUseRoseInScan {
-		// 纯文字角色没有状态迁移或确认依赖，直接消费共享候选索引，
-		// 避免为每个候选创建调度队列和执行去重表。
-		roseMatches := scanner.scanRoseDirectInto(data, matches[base:base])
-		matches = matches[:base]
-		matches = append(matches, roseMatches...)
-		return matches, nil
-	}
-	// 所有规则均为精确文字且无需特殊报告语义时，直接使用文字索引，
-	// 避免先构造后端结果再进入逐起点确认循环。
+	// 所有规则均为精确文字且无需特殊报告语义时，优先使用共享文字索引：
+	// 一次候选扫描即覆盖全部规则，避免 Rose 角色按候选逐个确认的线性放大。
 	fastLiteral := !scanner.hasCombo && len(scanner.rules) > 1 &&
 		len(scanner.candidateIDs) == len(scanner.rules) &&
 		len(scanner.literalIDs) == len(scanner.rules)
@@ -930,28 +1098,6 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 				break
 			}
 		}
-	}
-	backendOnly := !scanner.hasCombo && !fastLiteral
-	backendRuleCount := 0
-	if backendOnly {
-		for _, rule := range scanner.rules {
-			if !rule.backendEligible {
-				continue
-			}
-			backendRuleCount++
-			if rule.nfaEngine != nil {
-				for _, span := range rule.nfaEngine.Spans(data) {
-					matches = append(matches, Match{Id: rule.id, From: uint64(span.From), To: uint64(span.To)})
-				}
-			} else {
-				for _, span := range rule.program.Spans(data) {
-					matches = append(matches, Match{Id: rule.id, From: uint64(span[0]), To: uint64(span[1])})
-				}
-			}
-		}
-	}
-	if backendOnly && backendRuleCount == len(scanner.rules) {
-		return matches, nil
 	}
 	if fastLiteral && scanner.literalFind != nil {
 		// 复用栈上缓冲，避免每次扫描都重新分配候选切片。
@@ -973,6 +1119,50 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 		}
 		return matches, nil
 	}
+	// 当全部规则都能安全转换为 Rose 角色时，整块扫描直接复用角色调度器；
+	// 只要存在无法转换的规则或组合规则，就保留原有统一确认路径，避免候选
+	// 调度改变未覆盖规则的结果语义。
+	if scanner.canUseRoseInScan {
+		// 纯文字角色没有状态迁移或确认依赖，直接消费共享候选索引，
+		// 避免为每个候选创建调度队列和执行去重表。
+		roseMatches := scanner.scanRoseDirectInto(data, matches[base:base])
+		matches = matches[:base]
+		matches = append(matches, roseMatches...)
+		return matches, nil
+	}
+	// 整块后端扫描只覆盖无法进入候选文字索引的规则；能由候选文字定位的
+	// 规则交给候选起点确认，避免每条规则各扫一遍整块输入。
+	requiredDriven := scanner.requiredFindInto != nil
+	backendOnly := !scanner.hasCombo && !fastLiteral
+	backendRuleCount := 0
+	if backendOnly {
+		for ri := range scanner.rules {
+			rule := scanner.rules[ri]
+			if !rule.backendEligible {
+				continue
+			}
+			if requiredDriven && scanner.requiredCovered[ri] {
+				continue
+			}
+			backendRuleCount++
+			if rule.nfaEngine != nil {
+				// 缓冲只在真正执行后端扫描的规则作用域内声明，候选索引覆盖
+				// 全部规则时不会为未使用的缓冲付出每次扫描的堆分配。
+				var spanBuf [32]nfalib.Span
+				spans := rule.nfaEngine.SpansInto(data, spanBuf[:0], 0)
+				for _, span := range spans {
+					matches = append(matches, Match{Id: rule.id, From: uint64(span.From), To: uint64(span.To)})
+				}
+				continue
+			}
+			for _, span := range rule.program.Spans(data) {
+				matches = append(matches, Match{Id: rule.id, From: uint64(span[0]), To: uint64(span[1])})
+			}
+		}
+	}
+	if backendOnly && backendRuleCount == len(scanner.rules) {
+		return matches, nil
+	}
 	pool := scanner.contextPool
 	if pool == nil {
 		pool = &sync.Pool{New: func() any { return &scanContext{Scratch: scratch.New(), Reports: report.New()} }}
@@ -991,13 +1181,22 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 	defer func() {
 		ctx.Scratch.Reset()
 		ctx.Reports.Reset()
+		// 保留切片长度以便下次扫描直接复用容量，只清零内容。
 		clear(ctx.blockedUntil)
 		clear(ctx.fired)
-		ctx.blockedUntil = ctx.blockedUntil[:0]
-		ctx.fired = ctx.fired[:0]
 		ctx.comboTriggers = ctx.comboTriggers[:0]
 		ctx.literalCandidates = ctx.literalCandidates[:0]
 		ctx.ruleMatchBuf = ctx.ruleMatchBuf[:0]
+		if cap(ctx.requiredHits) > 1<<20 {
+			ctx.requiredHits = nil
+		} else {
+			ctx.requiredHits = ctx.requiredHits[:0]
+		}
+		if cap(ctx.requiredStarts) > 1<<20 {
+			ctx.requiredStarts = nil
+		} else {
+			ctx.requiredStarts = ctx.requiredStarts[:0]
+		}
 		for id, starts := range ctx.prefilterStarts {
 			if len(starts) > 1<<20 {
 				delete(ctx.prefilterStarts, id)
@@ -1005,16 +1204,30 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 			}
 			clear(starts)
 		}
-		clear(ctx.literalEnds)
+		// 逐起点子表跨扫描复用，只清空内容，避免每次扫描重建内层 map。
+		for start, byRule := range ctx.literalEnds {
+			if len(byRule) > 1<<16 {
+				delete(ctx.literalEnds, start)
+				continue
+			}
+			clear(byRule)
+		}
 		pool.Put(ctx)
 	}()
 	// 每个起点都必须独立求值，块模式允许同一规则产生重叠命中。
 	blockedUntil := reserveInts(ctx.blockedUntil, len(scanner.rules))
 	fired := reserveBools(ctx.fired, len(scanner.rules))
+	ctx.blockedUntil = blockedUntil
+	ctx.fired = fired
 	comboTriggers := ctx.comboTriggers[:0]
 	// SOM_LEFTMOST 对同一结束位置只保留最左起点，避免 AST 回溯产生重复事件。
 	var somSeen map[uint32]map[int]struct{}
-	literalEnds := ctx.literalEnds
+	// 候选驱动扫描不使用共享文字索引：池化上下文里可能残留上一次超限回退
+	// 建立的过滤表，直接复用会让确认阶段误判“起点不是候选”而漏报。
+	var literalEnds map[int]map[uint32]int
+	if !requiredDriven {
+		literalEnds = ctx.literalEnds
+	}
 	var literalCandidates []literalCandidate
 	// 对没有合并文字索引的规则预先建立前缀起点集合，避免在每个起点
 	// 重复执行 Contains；候选集合只用于过滤，命中后仍由完整规则确认。
@@ -1029,7 +1242,9 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 		}
 		delete(prefilterStarts, id)
 	}
-	if scanner.literalFind != nil {
+	// 必须文字索引已经为全部规则给出候选起点时，共享文字索引的整块扫描
+	// 只会重复同一份候选集合，直接跳过；规则确认仍由各自的完整语义完成。
+	if scanner.literalFind != nil && !requiredDriven {
 		if scanner.literalFindInto != nil {
 			literalCandidates = scanner.literalFindInto(data, ctx.literalCandidates[:0])
 			ctx.literalCandidates = literalCandidates
@@ -1041,12 +1256,14 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 				literalEnds = make(map[int]map[uint32]int)
 				ctx.literalEnds = literalEnds
 			}
-			clear(literalEnds)
+			resetLiteralEnds(literalEnds)
 			for _, candidate := range literalCandidates {
-				if literalEnds[candidate.From] == nil {
-					literalEnds[candidate.From] = make(map[uint32]int)
+				byRule := literalEnds[candidate.From]
+				if byRule == nil {
+					byRule = make(map[uint32]int)
+					literalEnds[candidate.From] = byRule
 				}
-				literalEnds[candidate.From][candidate.ID] = candidate.To
+				byRule[candidate.ID] = candidate.To
 			}
 		}
 	} else if len(scanner.candidateIDs) == 1 && len(scanner.literalIDs) == 1 {
@@ -1054,11 +1271,13 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 			literalEnds = make(map[int]map[uint32]int)
 			ctx.literalEnds = literalEnds
 		}
-		clear(literalEnds)
+		resetLiteralEnds(literalEnds)
 		scanner.fillSingleLiteralEnds(data, literalEnds)
 	}
 	for _, rule := range scanner.rules {
-		if len(rule.prefilter) == 0 || scanner.literalFind != nil {
+		// 编译期为所有规则推导出的候选文字只在调用方显式开启 FlagPrefilter 时
+		// 参与起点过滤（见 verify），其余规则建立起点表属于无效工作。
+		if rule.flags&FlagPrefilter == 0 || len(rule.prefilter) == 0 || scanner.literalFind != nil {
 			continue
 		}
 		if _, indexed := scanner.candidateIDs[rule.id]; indexed && literalEnds != nil {
@@ -1113,117 +1332,331 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 		}
 		return matches, nil
 	}
-	for start := 0; start <= len(data); start++ {
-		// 每 1024 个起点探测一次 ScanContext 异步设置的取消标志，
-		// 避免在每个候选都做原子读。
-		if start&1023 == 0 && atomic.LoadUint32(&scanner.cancelFlag) == 1 {
-			return matches, ErrCancelled
+	state := blockScanState{
+		scanner:         scanner,
+		data:            data,
+		ctx:             ctx,
+		blockedUntil:    blockedUntil,
+		fired:           fired,
+		comboTriggers:   comboTriggers,
+		somSeen:         somSeen,
+		literalEnds:     literalEnds,
+		direct:          ctx.directMatches[:0],
+		prefilterStarts: prefilterStarts,
+		backendOnly:     backendOnly,
+		requiredDriven:  requiredDriven,
+	}
+	// 必须文字候选驱动：任意匹配都包含至少一个候选文字，因此只需在候选文字
+	// 命中位置派生的起点上确认，跳过整块“每个起点 × 每条规则”的循环。
+	if scanner.requiredFindInto != nil {
+		if starts, ok := scanner.requiredScanStarts(ctx, data, backendOnly, requiredDriven); ok {
+			state.requiredStartDriven = true
+			if scanner.simpleReports && cap(ctx.directMatches) < len(starts) {
+				ctx.directMatches = make([]Match, 0, len(starts))
+				state.direct = ctx.directMatches[:0]
+			}
+			for _, entry := range starts {
+				if !state.verify(entry.rule, entry.start) {
+					break
+				}
+			}
+			return state.finish(matches)
 		}
-		for ri, rule := range scanner.rules {
-			if backendOnly && rule.backendEligible {
+		// 候选起点超过上限时退回逐起点确认；此时补建共享文字索引，
+		// 让确认循环仍能按候选位置过滤，而不是遍历全部起点。
+		if scanner.literalFind != nil && state.literalEnds == nil {
+			literalEnds = scanner.refreshLiteralEnds(ctx, data, ctx.literalEnds)
+			state.literalEnds = literalEnds
+		}
+	}
+	for start := 0; start <= len(data); start++ {
+		for ri := range scanner.rules {
+			if state.backendHandled(ri) {
 				continue
 			}
-			if ctx.Reports.Stopped() {
+			if !state.verify(ri, start) {
 				break
-			}
-			if rule.comb != nil {
-				continue
-			}
-			if fired[ri] {
-				continue
-			}
-			if start < blockedUntil[ri] {
-				continue
-			}
-			if rule.flags&FlagPrefilter != 0 && len(rule.prefilter) > 0 {
-				if starts, indexed := prefilterStarts[rule.id]; indexed {
-					if _, ok := starts[start]; !ok {
-						continue
-					}
-				} else if start+len(rule.prefilter) > len(data) || !hwlm.Contains(data[start:start+len(rule.prefilter)], hwlm.Literal{Value: rule.prefilter, CaseInsensitive: rule.flags&FlagCaseless != 0}) {
-					continue
-				}
-			}
-			var ends []int
-			if _, indexed := scanner.candidateIDs[rule.id]; indexed && literalEnds != nil {
-				end, ok := literalEnds[start][rule.id]
-				if !ok {
-					continue
-				}
-				if _, exact := scanner.literalIDs[rule.id]; exact {
-					ends = []int{end}
-				} else {
-					ends = matchRuleInto(rule, data, start, ctx.ruleMatchBuf[:0])
-					ctx.ruleMatchBuf = ends
-				}
-			} else {
-				ends = matchRuleInto(rule, data, start, ctx.ruleMatchBuf[:0])
-				ctx.ruleMatchBuf = ends
-			}
-			end := -1
-			// 结束偏移已按升序排序，直接取边界值即可获得贪婪/非贪婪的首选结束。
-			if rule.nonGreedy {
-				if len(ends) > 0 {
-					end = ends[0]
-				}
-			} else if len(ends) > 0 {
-				end = ends[len(ends)-1]
-			}
-			if end < 0 || end > len(data) {
-				continue
-			}
-			if rule.ext != nil {
-				if !rule.ext.OffsetAllowed(uint64(end)) {
-					continue
-				}
-				if !rule.ext.LengthAllowed(uint64(end - start)) {
-					continue
-				}
-			}
-			if rule.flags&FlagSOMLeftmost != 0 {
-				if somSeen == nil {
-					somSeen = make(map[uint32]map[int]struct{})
-				}
-				seenEnds := somSeen[rule.id]
-				if seenEnds == nil {
-					seenEnds = make(map[int]struct{})
-					somSeen[rule.id] = seenEnds
-				}
-				if _, exists := seenEnds[end]; exists {
-					continue
-				}
-				seenEnds[end] = struct{}{}
-			}
-			if scanner.hasCombo {
-				comboTriggers = append(comboTriggers, report.Event{ID: rule.id, From: uint64(start), To: uint64(end), Flags: uint32(rule.flags)})
-			}
-			quiet := rule.flags&FlagQuiet != 0
-			if quiet {
-				if rule.flags&FlagSingleMatch != 0 {
-					fired[ri] = true
-				}
-				continue
-			}
-			ctx.Reports.Add(report.Event{ID: rule.id, From: uint64(start), To: uint64(end), SOM: uint64(start), Flags: uint32(rule.flags)})
-			if end > start {
-				blockedUntil[ri] = end
-			}
-			if rule.flags&FlagSingleMatch != 0 {
-				fired[ri] = true
 			}
 		}
 		if ctx.Reports.Stopped() {
 			break
 		}
 	}
-	if scanner.hasCombo {
-		scanner.emitCombinationReports(ctx.Reports, comboTriggers, uint64(len(data)))
+	return state.finish(matches)
+}
+
+// confirmFrames 返回确认程序使用的回溯栈，按扫描上下文复用同一块内存。
+func (ctx *scanContext) confirmFrames() []confirmFrame {
+	if ctx.confirmStack == nil {
+		ctx.confirmStack = make([]confirmFrame, confirmMaxStack)
 	}
-	ctx.comboTriggers = comboTriggers
-	for _, event := range ctx.Reports.Events() {
+	return ctx.confirmStack
+}
+
+// blockScanState 保存块扫描的确认状态，供候选起点驱动与逐起点两条路径共用，
+// 保证两种派发方式的过滤、去重和报告语义完全一致。
+type blockScanState struct {
+	scanner         *Scanner
+	data            []byte
+	ctx             *scanContext
+	blockedUntil    []int
+	fired           []bool
+	comboTriggers   []report.Event
+	somSeen         map[uint32]map[int]struct{}
+	literalEnds     map[int]map[uint32]int
+	prefilterStarts map[uint32]map[int]struct{}
+	backendOnly     bool
+	// requiredDriven 表示本次扫描由候选文字索引驱动，此时整块后端扫描只
+	// 覆盖未被候选索引覆盖的规则。
+	requiredDriven bool
+	// requiredStartDriven 表示当前确认来自必须文字候选展开出的起点集合，
+	// 确认程序据此安全跳过已被候选索引验证过的入口文字。
+	requiredStartDriven bool
+	// direct 保存 simpleReports 模式下直接产出的匹配结果，避免经过报告
+	// 管理器的去重表与二次拷贝。
+	direct []Match
+}
+
+// backendHandled 判断规则是否已由整块后端扫描产出结果，无需再逐起点确认。
+func (st *blockScanState) backendHandled(ri int) bool {
+	return st.scanner.backendHandled(ri, st.backendOnly, st.requiredDriven)
+}
+
+func (scanner *Scanner) backendHandled(ri int, backendOnly, requiredDriven bool) bool {
+	if !backendOnly {
+		return false
+	}
+	if requiredDriven {
+		return !scanner.requiredCovered[ri]
+	}
+	return scanner.rules[ri].backendEligible
+}
+
+// confirmArena 返回该规则可用于字节链快路径的工作区；返回 nil 表示规则
+// 携带捕获、扩展参数或 UTF-8 语义，必须走通用确认路径。
+func (st *blockScanState) confirmArena(rule *compiledRule) *byteChainArena {
+	if rule.hasCapture || rule.ext != nil || rule.flags&(FlagUTF8|FlagUCP) != 0 {
+		return nil
+	}
+	return &st.ctx.chainArena
+}
+
+// verify 在指定起点确认单条规则；返回 false 表示报告已停止，扫描应立即结束。
+func (st *blockScanState) verify(ri int, start int) bool {
+	rule := &st.scanner.rules[ri]
+	if !st.scanner.simpleReports && st.ctx.Reports.Stopped() {
+		return false
+	}
+	if rule.comb != nil {
+		return true
+	}
+	if st.fired[ri] {
+		return true
+	}
+	if start < st.blockedUntil[ri] {
+		return true
+	}
+	if rule.flags&FlagPrefilter != 0 && len(rule.prefilter) > 0 {
+		if starts, indexed := st.prefilterStarts[rule.id]; indexed {
+			if _, ok := starts[start]; !ok {
+				return true
+			}
+		} else if start+len(rule.prefilter) > len(st.data) || !hwlm.Contains(st.data[start:start+len(rule.prefilter)], hwlm.Literal{Value: rule.prefilter, CaseInsensitive: rule.flags&FlagCaseless != 0}) {
+			return true
+		}
+	}
+	// 共享文字索引已经把精确文字规则的结束偏移算出来，直接使用即可。
+	if st.scanner.indexedRules[ri] && st.literalEnds != nil {
+		end, ok := st.literalEnds[start][rule.id]
+		if !ok {
+			return true
+		}
+		if st.scanner.exactRules[ri] {
+			var only [1]int
+			only[0] = end
+			return st.record(ri, start, only[:1])
+		}
+	}
+	// 确认程序直接给出 record 唯一使用的偏好结束偏移，命中密集时跳过
+	// 通用 AST 求值的逐节点切片与排序。
+	if rule.confirm != nil && rule.ext == nil {
+		var end int
+		var ok bool
+		// 候选由必须文字索引派生时，起点处的入口文字已由匹配器确认，
+		// 可以直接从入口文字之后的指令开始求值。
+		if rule.confirmSkip > 0 && st.requiredStartDriven {
+			end, ok = rule.confirm.run(st.data, rule.confirmEntry, start+rule.confirmSkip, rule.flags, st.ctx.confirmFrames())
+		} else {
+			end, ok = rule.confirm.preferredEnd(st.data, start, rule.flags, st.ctx.confirmFrames())
+		}
+		if ok {
+			// simpleReports 已排除组合、SOM、静默与单次语义，且扩展参数规则
+			// 不走确认程序，命中可以直接写入结果并抑制重叠。
+			if st.scanner.simpleReports {
+				if end >= 0 {
+					st.direct = append(st.direct, Match{Id: rule.id, From: uint64(start), To: uint64(end)})
+					if end > start {
+						st.blockedUntil[ri] = end
+					}
+				}
+				return true
+			}
+			var only [1]int
+			if end < 0 {
+				return st.record(ri, start, only[:0])
+			}
+			only[0] = end
+			return st.record(ri, start, only[:1])
+		}
+	}
+	arena := st.confirmArena(rule)
+	ends := matchRuleIntoArena(rule, st.data, start, st.ctx.ruleMatchBuf[:0], arena)
+	st.ctx.ruleMatchBuf = ends
+	return st.record(ri, start, ends)
+}
+
+// record 处理已确认的结束偏移：约束过滤、报告写入与重叠抑制。
+func (st *blockScanState) record(ri int, start int, ends []int) bool {
+	rule := &st.scanner.rules[ri]
+	end := -1
+	// 结束偏移已按升序排序，直接取边界值即可获得贪婪/非贪婪的首选结束。
+	if rule.nonGreedy {
+		if len(ends) > 0 {
+			end = ends[0]
+		}
+	} else if len(ends) > 0 {
+		end = ends[len(ends)-1]
+	}
+	if end < 0 || end > len(st.data) {
+		return true
+	}
+	if rule.ext != nil {
+		if !rule.ext.OffsetAllowed(uint64(end)) {
+			return true
+		}
+		if !rule.ext.LengthAllowed(uint64(end - start)) {
+			return true
+		}
+	}
+	if rule.flags&FlagSOMLeftmost != 0 {
+		if st.somSeen == nil {
+			st.somSeen = make(map[uint32]map[int]struct{})
+		}
+		seenEnds := st.somSeen[rule.id]
+		if seenEnds == nil {
+			seenEnds = make(map[int]struct{})
+			st.somSeen[rule.id] = seenEnds
+		}
+		if _, exists := seenEnds[end]; exists {
+			return true
+		}
+		seenEnds[end] = struct{}{}
+	}
+	if st.scanner.simpleReports {
+		// 没有组合依赖与 SOM/单次/静默语义时，事件不会重复也不需要排序，
+		// 直接产出结果即可跳过报告管理器的去重表与收尾拷贝。
+		st.direct = append(st.direct, Match{Id: rule.id, From: uint64(start), To: uint64(end)})
+		if end > start {
+			st.blockedUntil[ri] = end
+		}
+		return true
+	}
+	if st.scanner.hasCombo {
+		st.comboTriggers = append(st.comboTriggers, report.Event{ID: rule.id, From: uint64(start), To: uint64(end), Flags: uint32(rule.flags)})
+	}
+	quiet := rule.flags&FlagQuiet != 0
+	if quiet {
+		if rule.flags&FlagSingleMatch != 0 {
+			st.fired[ri] = true
+		}
+		return true
+	}
+	st.ctx.Reports.Add(report.Event{ID: rule.id, From: uint64(start), To: uint64(end), SOM: uint64(start), Flags: uint32(rule.flags)})
+	if end > start {
+		st.blockedUntil[ri] = end
+	}
+	if rule.flags&FlagSingleMatch != 0 {
+		st.fired[ri] = true
+	}
+	return true
+}
+
+// finish 收尾组合报告并将事件转换为结果切片。
+func (st *blockScanState) finish(matches []Match) ([]Match, error) {
+	if st.scanner.simpleReports {
+		out := append(matches, st.direct...)
+		st.ctx.directMatches = st.direct[:0]
+		return out, nil
+	}
+	if st.scanner.hasCombo {
+		st.scanner.emitCombinationReports(st.ctx.Reports, st.comboTriggers, uint64(len(st.data)))
+	}
+	st.ctx.comboTriggers = st.comboTriggers
+	for _, event := range st.ctx.Reports.Events() {
 		matches = append(matches, Match{Id: event.ID, From: event.From, To: event.To})
 	}
 	return matches, nil
+}
+
+// requiredScanStarts 把候选文字命中展开为按起点升序的 (起点, 规则) 组合。
+// 返回 false 表示候选数量异常膨胀，调用方应退回逐起点确认。
+func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte, backendOnly, requiredDriven bool) ([]requiredStart, bool) {
+	hits := scanner.requiredFindInto(data, ctx.requiredHits[:0])
+	ctx.requiredHits = hits
+	starts := ctx.requiredStarts[:0]
+	limit := 16*len(data) + 4096
+	for _, hit := range hits {
+		literal := scanner.requiredLiterals[hit.slot]
+		for _, entry := range literal.entries {
+			if scanner.backendHandled(entry.ruleIndex, backendOnly, requiredDriven) {
+				continue
+			}
+			from, to := hit.pos-entry.max, hit.pos-entry.min
+			if from < 0 {
+				from = 0
+			}
+			if to < 0 || to > len(data) {
+				continue
+			}
+			if entry.back != nil && entry.max > entry.min {
+				left := hit.pos - 1
+				edge := hit.pos - entry.max
+				for left >= 0 && left >= edge && entry.back[data[left]] == 1 {
+					left--
+				}
+				left++
+				if left > from {
+					from = left
+				}
+			}
+			for start := from; start <= to; start++ {
+				if len(starts) >= limit {
+					return nil, false
+				}
+				starts = append(starts, requiredStart{start: start, rule: entry.ruleIndex})
+			}
+		}
+	}
+	ctx.requiredStarts = starts
+	if len(starts) < 2 {
+		return starts, true
+	}
+	slices.SortFunc(starts, func(a, b requiredStart) int {
+		if a.start != b.start {
+			return a.start - b.start
+		}
+		return a.rule - b.rule
+	})
+	deduped := starts[:1]
+	for _, entry := range starts[1:] {
+		last := deduped[len(deduped)-1]
+		if entry.start == last.start && entry.rule == last.rule {
+			continue
+		}
+		deduped = append(deduped, entry)
+	}
+	ctx.requiredStarts = deduped
+	return deduped, true
 }
 
 // computeCanUseRoseInScan 一次性计算 Rose 是否覆盖全部规则且不包含组合依赖。
@@ -1448,6 +1881,42 @@ func (scanner *Scanner) findSingleLiteralEnds(data []byte) map[int]map[uint32]in
 	return ends
 }
 
+// resetLiteralEnds 清空起点到规则结束偏移的映射内容，保留内层 map 以便复用。
+// refreshLiteralEnds 用共享文字索引重建逐起点过滤表；内层 map 跨扫描复用，
+// 只清空内容，避免候选密集时每次扫描都重建哈希表。
+func (scanner *Scanner) refreshLiteralEnds(ctx *scanContext, data []byte, ends map[int]map[uint32]int) map[int]map[uint32]int {
+	var candidates []literalCandidate
+	if scanner.literalFindInto != nil {
+		candidates = scanner.literalFindInto(data, ctx.literalCandidates[:0])
+		ctx.literalCandidates = candidates
+	} else if scanner.literalFind != nil {
+		candidates = scanner.literalFind(data)
+	}
+	if ends == nil {
+		ends = make(map[int]map[uint32]int)
+		ctx.literalEnds = ends
+	}
+	resetLiteralEnds(ends)
+	for _, candidate := range candidates {
+		byRule := ends[candidate.From]
+		if byRule == nil {
+			byRule = make(map[uint32]int)
+			ends[candidate.From] = byRule
+		}
+		byRule[candidate.ID] = candidate.To
+	}
+	return ends
+}
+
+func resetLiteralEnds(ends map[int]map[uint32]int) {
+	if ends == nil {
+		return
+	}
+	for start := range ends {
+		clear(ends[start])
+	}
+}
+
 func (scanner *Scanner) fillSingleLiteralEnds(data []byte, ends map[int]map[uint32]int) {
 	if ends == nil {
 		return
@@ -1542,6 +2011,12 @@ func matchRule(rule compiledRule, data []byte, start int) []int {
 // matchRuleInto 在已确认快路径规则上复用调用方提供的结束偏移缓冲，
 // 避免每次起点重新分配结果切片。Fuzzy、Backreference、Conditional 仍返回新切片。
 func matchRuleInto(rule compiledRule, data []byte, start int, endsBuf []int) []int {
+	return matchRuleIntoArena(&rule, data, start, endsBuf, nil)
+}
+
+// matchRuleIntoArena 是 matchRuleInto 的工作区版本：arena 非空时优先用
+// 字节链快路径求值全部结束偏移，超出自持能力再退回通用后端与 AST 求值。
+func matchRuleIntoArena(rule *compiledRule, data []byte, start int, endsBuf []int, arena *byteChainArena) []int {
 	if rule.hasBackref || rule.hasConditional {
 		states := matchCaptured(rule.root, data, start, rule.flags, make(map[int][]byte))
 		out := make([]int, 0, len(states))
@@ -1556,6 +2031,11 @@ func matchRuleInto(rule compiledRule, data []byte, start int, endsBuf []int) []i
 		}
 		if rule.smallBlock != nil && rule.smallBlock.MatchAt(data, start) {
 			return []int{start + rule.smallBlock.Size()}
+		}
+		if arena != nil && !rule.hasCapture {
+			if ends, ok := matchByteChain(arena, rule.root, data, start, rule.flags); ok {
+				return append(endsBuf[:0], ends...)
+			}
 		}
 		if rule.repeat != nil {
 			return rule.repeat.MatchAtInto(data, start, endsBuf[:0])
@@ -2225,6 +2705,12 @@ func matchNode(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
 		}
 		return dedup(out)
 	}
+	return matchNodeBody(n, data, pos, flags)
+}
+
+// matchNodeBody 执行不涉及捕获语义的递归求值。捕获检查只在整个子树的入口
+// 做一次，避免每个子节点重复遍历语法树。
+func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
 	switch v := n.(type) {
 	case parser.Literal:
 		if flags&FlagUTF8 != 0 {
@@ -2297,14 +2783,7 @@ func matchNode(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
 			}
 			return nil
 		}
-		matched := false
-		for _, r := range v.Ranges {
-			if data[pos] >= r.Lo && data[pos] <= r.Hi || flags&FlagCaseless != 0 && ((data[pos] >= 'a' && data[pos] <= 'z' && data[pos]-'a'+'A' >= r.Lo && data[pos]-'a'+'A' <= r.Hi) || (data[pos] >= 'A' && data[pos] <= 'Z' && data[pos]-'A'+'a' >= r.Lo && data[pos]-'A'+'a' <= r.Hi)) {
-				matched = true
-				break
-			}
-		}
-		if matched != v.Negated {
+		if classByteMatch(v, data[pos], flags) {
 			return []int{pos + 1}
 		}
 		return nil
@@ -2325,25 +2804,7 @@ func matchNode(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
 		}
 		return nil
 	case parser.Assertion:
-		ok := false
-		switch v.Kind {
-		case parser.Begin:
-			ok = pos == 0 || flags&FlagMultiline != 0 && pos > 0 && data[pos-1] == '\n'
-		case parser.BeginAbsolute:
-			ok = pos == 0
-		case parser.End:
-			ok = pos == len(data) || flags&FlagMultiline != 0 && pos < len(data) && data[pos] == '\n'
-		case parser.EndAbsolute:
-			ok = pos == len(data)
-		case parser.EndBeforeFinalNewline:
-			ok = pos == len(data) || pos+1 == len(data) && data[pos] == '\n' || pos+2 == len(data) && data[pos] == '\r' && data[pos+1] == '\n'
-		case parser.WordBoundary, parser.NonWordBoundary:
-			left := wordBefore(data, pos, flags)
-			right := wordAfter(data, pos, flags)
-			boundary := left != right
-			ok = boundary == (v.Kind == parser.WordBoundary)
-		}
-		if ok {
+		if assertionHolds(v.Kind, data, pos, flags) {
 			return []int{pos}
 		}
 		return nil
@@ -2357,7 +2818,7 @@ func matchNode(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
 			state := selectAtomicState(states, v.Child)
 			return []int{state.pos}
 		}
-		return matchNode(v.Child, data, pos, flags)
+		return matchNodeBody(v.Child, data, pos, flags)
 	case parser.Lookaround:
 		positive := v.Kind == parser.Lookahead || v.Kind == parser.Lookbehind
 		if v.Kind == parser.Lookbehind || v.Kind == parser.NegativeLookbehind {
@@ -2377,7 +2838,7 @@ func matchNode(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
 				}
 			}
 			for _, start := range starts {
-				for _, e := range matchNode(v.Child, data, start, flags) {
+				for _, e := range matchNodeBody(v.Child, data, start, flags) {
 					if e == pos {
 						found = true
 						break
@@ -2389,7 +2850,7 @@ func matchNode(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
 			}
 			return nil
 		}
-		ends := matchNode(v.Child, data, pos, flags)
+		ends := matchNodeBody(v.Child, data, pos, flags)
 		if positive {
 			if len(ends) > 0 {
 				return []int{pos}
@@ -2408,7 +2869,7 @@ func matchNode(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
 			}
 			next := make([]int, 0, len(positions))
 			for _, p := range positions {
-				next = append(next, matchNode(child, data, p, flags)...)
+				next = append(next, matchNodeBody(child, data, p, flags)...)
 			}
 			positions = dedup(next)
 			if len(positions) == 0 {
@@ -2419,10 +2880,13 @@ func matchNode(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
 	case parser.Alternation:
 		var out []int
 		for _, child := range v.Options {
-			out = append(out, matchNode(child, data, pos, flags)...)
+			out = append(out, matchNodeBody(child, data, pos, flags)...)
 		}
 		return dedup(out)
 	case parser.Repeat:
+		if ends, ok := matchByteRepeat(v, data, pos, flags); ok {
+			return ends
+		}
 		positions := []int{pos}
 		results := []int{}
 		if v.Min == 0 {
@@ -2439,7 +2903,7 @@ func matchNode(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
 		for count := 1; count <= maxCount; count++ {
 			next := []int{}
 			for _, p := range positions {
-				next = append(next, matchNode(v.Child, data, p, flags)...)
+				next = append(next, matchNodeBody(v.Child, data, p, flags)...)
 			}
 			next = dedup(next)
 			if len(next) == 0 {
@@ -2470,6 +2934,91 @@ func matchNode(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
 	default:
 		return nil
 	}
+}
+
+// classByteMatch 判定单个字节是否落在字符类内，语义与 matchNodeBody 的
+// 非 UTF-8 字符类分支完全一致，供普通确认与确定性重复的快路径共用。
+func classByteMatch(v parser.Class, value byte, flags CompileFlag) bool {
+	matched := false
+	for _, r := range v.Ranges {
+		if value >= r.Lo && value <= r.Hi || flags&FlagCaseless != 0 && ((value >= 'a' && value <= 'z' && value-'a'+'A' >= r.Lo && value-'a'+'A' <= r.Hi) || (value >= 'A' && value <= 'Z' && value-'A'+'a' >= r.Lo && value-'A'+'a' <= r.Hi)) {
+			matched = true
+			break
+		}
+	}
+	return matched != v.Negated
+}
+
+// byteRepeatAtom 判断重复的子节点在当前模式下是否恰好消费一个字节。
+// UTF-8/UCP 模式下字符类按码位消费 1~4 字节，不能按字节推进，因此显式排除。
+func byteRepeatAtom(n parser.Node, flags CompileFlag) bool {
+	if flags&(FlagUTF8|FlagUCP) != 0 {
+		return false
+	}
+	switch v := n.(type) {
+	case parser.Group:
+		if v.Atomic || v.HasScopedFlags() {
+			return false
+		}
+		return byteRepeatAtom(v.Child, flags)
+	case parser.Literal:
+		return len(v.Value) == 1
+	case parser.Any:
+		return true
+	case parser.Class:
+		return true
+	}
+	return false
+}
+
+// matchByteAtom 判定恰好消费一个字节的原子节点是否匹配该字节。
+func matchByteAtom(n parser.Node, value byte, flags CompileFlag) bool {
+	switch v := n.(type) {
+	case parser.Group:
+		return matchByteAtom(v.Child, value, flags)
+	case parser.Literal:
+		return len(v.Value) == 1 && equalByte(v.Value[0], value, flags)
+	case parser.Any:
+		return value != '\n' || flags&FlagDotAll != 0
+	case parser.Class:
+		return classByteMatch(v, value, flags)
+	}
+	return false
+}
+
+// matchByteRepeat 处理“子节点恰好消费一个字节”的确定性重复：这类重复的结束
+// 位置只有一条链，直接按字节推进并一次性收集 min..max 区间内的结束位置，
+// 避免逐轮分配中间状态切片。返回 ok 为 false 表示该重复不适用快路径。
+func matchByteRepeat(v parser.Repeat, data []byte, pos int, flags CompileFlag) ([]int, bool) {
+	return matchByteRepeatInto(v, data, pos, flags, nil)
+}
+
+// matchByteRepeatInto 是 matchByteRepeat 的缓冲复用版本：调用方提供结束偏移
+// 缓冲时不再分配，供确认快路径在可复用工作区上直接写入。
+func matchByteRepeatInto(v parser.Repeat, data []byte, pos int, flags CompileFlag, dst []int) ([]int, bool) {
+	if !byteRepeatAtom(v.Child, flags) {
+		return nil, false
+	}
+	limit := len(data) - pos
+	if limit < 0 {
+		limit = 0
+	}
+	maxCount := v.Max
+	if maxCount < 0 || maxCount > limit {
+		maxCount = limit
+	}
+	count := 0
+	for count < maxCount && matchByteAtom(v.Child, data[pos+count], flags) {
+		count++
+	}
+	if count < v.Min {
+		return dst[:0], true
+	}
+	ends := dst[:0]
+	for c := v.Min; c <= count; c++ {
+		ends = append(ends, pos+c)
+	}
+	return ends, true
 }
 
 func validUTF8LiteralAt(data []byte, pos, width int) bool {
@@ -2881,6 +3430,415 @@ func dedup(values []int) []int {
 	}
 	return out
 }
+
+// assertionHolds 判定零宽断言在指定位置是否成立，通用 AST 求值与
+// 字节链快路径共用同一份语义，避免两条路径对边界条件的解释出现分歧。
+func assertionHolds(kind parser.AssertionKind, data []byte, pos int, flags CompileFlag) bool {
+	switch kind {
+	case parser.Begin:
+		return pos == 0 || flags&FlagMultiline != 0 && pos > 0 && data[pos-1] == '\n'
+	case parser.BeginAbsolute:
+		return pos == 0
+	case parser.End:
+		return pos == len(data) || flags&FlagMultiline != 0 && pos < len(data) && data[pos] == '\n'
+	case parser.EndAbsolute:
+		return pos == len(data)
+	case parser.EndBeforeFinalNewline:
+		return pos == len(data) || pos+1 == len(data) && data[pos] == '\n' || pos+2 == len(data) && data[pos] == '\r' && data[pos+1] == '\n'
+	case parser.WordBoundary, parser.NonWordBoundary:
+		left := wordBefore(data, pos, flags)
+		right := wordAfter(data, pos, flags)
+		return left != right == (kind == parser.WordBoundary)
+	}
+	return false
+}
+
+// byteChainFrontier 限制快路径单步推进的位置数，位置集合膨胀时退回通用求值。
+const byteChainFrontier = 64
+
+// byteChainRepeatBuf 是单字节原子重复的专用缓冲。它只被最内层重复占用，
+// 与位置前沿分开存放，避免嵌套层级把工作区按前沿宽度成倍放大。
+const byteChainRepeatBuf = 1024
+
+// byteChainArenaSize 是快路径单次确认可用的工作区规模，单位为 int。
+const byteChainArenaSize = 4096
+
+// byteChainMarksLimit 限制位置去重位图可覆盖的输入长度。超出该长度的输入
+// 直接退回通用求值，避免为一个 Block 预留过大的标记数组。
+const byteChainMarksLimit = 1 << 19
+
+// byteChainArena 是确认快路径的单次工作区。位置前沿、重复轮次和中间结果
+// 都从同一块可复用内存切分，避免每个候选起点都产生堆分配。
+type byteChainArena struct {
+	ints       []int
+	used       int
+	repeatBuf  []int
+	marks      []int32
+	generation int32
+}
+
+// nextGeneration 分配一个新的位置去重代次。嵌套求值各自持有独立代次，
+// 因此内层步骤不会污染外层的去重结果。
+func (arena *byteChainArena) nextGeneration() int32 {
+	arena.generation++
+	if arena.generation <= 0 {
+		clear(arena.marks)
+		arena.generation = 1
+	}
+	return arena.generation
+}
+
+// markSeen 判断位置是否已在当前代次出现；第二个返回值表示工作区是否可覆盖
+// 该位置，false 表示调用方必须退回通用求值。
+func (arena *byteChainArena) markSeen(generation int32, pos int) (bool, bool) {
+	if pos < 0 || pos >= byteChainMarksLimit {
+		return false, false
+	}
+	if pos >= len(arena.marks) {
+		size := len(arena.marks)
+		if size < 64 {
+			size = 64
+		}
+		for size <= pos {
+			size *= 2
+		}
+		if size > byteChainMarksLimit {
+			size = byteChainMarksLimit
+		}
+		marks := make([]int32, size)
+		copy(marks, arena.marks)
+		arena.marks = marks
+	}
+	if arena.marks[pos] == generation {
+		return true, true
+	}
+	arena.marks[pos] = generation
+	return false, true
+}
+
+func (arena *byteChainArena) ready() bool {
+	if arena == nil {
+		return false
+	}
+	if arena.ints == nil {
+		arena.ints = make([]int, byteChainArenaSize)
+	}
+	if arena.repeatBuf == nil {
+		arena.repeatBuf = make([]int, byteChainRepeatBuf)
+	}
+	arena.used = 0
+	return true
+}
+
+// take 从工作区切出 n 个 int，空间不足时返回 false 由调用方退回通用求值。
+func (arena *byteChainArena) take(n int) ([]int, bool) {
+	if n <= 0 {
+		return nil, true
+	}
+	if arena == nil || arena.used+n > len(arena.ints) {
+		return nil, false
+	}
+	out := arena.ints[arena.used : arena.used+n : arena.used+n]
+	arena.used += n
+	return out, true
+}
+
+// compactInts 原地排序并去重位置集合，与通用求值的 dedup 语义一致。
+func compactInts(values []int) []int {
+	if len(values) > 1 {
+		if !slices.IsSorted(values) {
+			slices.Sort(values)
+		}
+		write := 1
+		for _, value := range values[1:] {
+			if values[write-1] == value {
+				continue
+			}
+			values[write] = value
+			write++
+		}
+		values = values[:write]
+	}
+	return values
+}
+
+// matchByteChain 在单个起点上求值只由单字节原子、零宽断言、非捕获分组、
+// 序列、选择和重复构成的表达式，返回升序去重的全部结束偏移。
+// 返回 ok 为 false 表示超出快路径能力，调用方必须退回通用 AST 求值。
+func matchByteChain(arena *byteChainArena, node parser.Node, data []byte, pos int, flags CompileFlag) ([]int, bool) {
+	if arena == nil || !arena.ready() || pos < 0 || pos > len(data) {
+		return nil, false
+	}
+	return arena.eval(node, data, pos, flags)
+}
+
+func (arena *byteChainArena) eval(node parser.Node, data []byte, pos int, flags CompileFlag) ([]int, bool) {
+	switch v := node.(type) {
+	case parser.Literal:
+		if pos > len(data) || pos+len(v.Value) > len(data) {
+			return nil, true
+		}
+		if flags&FlagCaseless == 0 {
+			// 大小写敏感文字交给标准比较，命中密集时比逐字节判定更快。
+			if !bytes.Equal(data[pos:pos+len(v.Value)], v.Value) {
+				return nil, true
+			}
+		} else {
+			for index := range v.Value {
+				if !equalByte(v.Value[index], data[pos+index], flags) {
+					return nil, true
+				}
+			}
+		}
+		out, ok := arena.take(1)
+		if !ok {
+			return nil, false
+		}
+		out[0] = pos + len(v.Value)
+		return out, true
+	case parser.Class:
+		if pos >= len(data) || !classByteMatch(v, data[pos], flags) {
+			return nil, true
+		}
+		out, ok := arena.take(1)
+		if !ok {
+			return nil, false
+		}
+		out[0] = pos + 1
+		return out, true
+	case parser.Any:
+		if pos >= len(data) || data[pos] == '\n' && flags&FlagDotAll == 0 {
+			return nil, true
+		}
+		out, ok := arena.take(1)
+		if !ok {
+			return nil, false
+		}
+		out[0] = pos + 1
+		return out, true
+	case parser.Assertion:
+		if !assertionHolds(v.Kind, data, pos, flags) {
+			return nil, true
+		}
+		out, ok := arena.take(1)
+		if !ok {
+			return nil, false
+		}
+		out[0] = pos
+		return out, true
+	case parser.Group:
+		// 通用求值同样忽略捕获编号：只有反向引用和条件分支依赖捕获内容，
+		// 这两类结构在入口处已由 hasCapture 排除。
+		if v.Atomic || v.HasScopedFlags() {
+			return nil, false
+		}
+		return arena.eval(v.Child, data, pos, flags)
+	case parser.Sequence:
+		return arena.evalSequence(v.Elements, data, pos, flags)
+	case parser.Alternation:
+		return arena.evalAlternation(v.Options, data, pos, flags)
+	case parser.Repeat:
+		return arena.evalRepeat(v, data, pos, flags)
+	}
+	return nil, false
+}
+
+func (arena *byteChainArena) evalSequence(elements []parser.Node, data []byte, pos int, flags CompileFlag) ([]int, bool) {
+	mark := arena.used
+	current, ok := arena.take(byteChainFrontier)
+	if !ok {
+		return nil, false
+	}
+	next, ok := arena.take(byteChainFrontier)
+	if !ok {
+		return nil, false
+	}
+	count := 1
+	current[0] = pos
+	for _, child := range elements {
+		if verb, isVerb := child.(parser.ControlVerb); isVerb {
+			if strings.EqualFold(verb.Name, "ACCEPT") {
+				return current[:count], true
+			}
+			return nil, false
+		}
+		arena.used = mark + 2*byteChainFrontier
+		if count == 1 {
+			// 单一来源位置不会产生跨来源重复，子结果本身已升序去重，
+			// 直接替换前沿即可跳过去重位图与排序。
+			ends, ok := arena.eval(child, data, current[0], flags)
+			if !ok {
+				return nil, false
+			}
+			if len(ends) > len(current) {
+				return nil, false
+			}
+			copy(current, ends)
+			count = len(ends)
+			if count == 0 {
+				break
+			}
+			continue
+		}
+		generation := arena.nextGeneration()
+		written := 0
+		for _, start := range current[:count] {
+			ends, ok := arena.eval(child, data, start, flags)
+			if !ok {
+				return nil, false
+			}
+			for _, end := range ends {
+				seen, covered := arena.markSeen(generation, end)
+				if !covered {
+					return nil, false
+				}
+				if seen {
+					continue
+				}
+				if written == len(next) {
+					return nil, false
+				}
+				next[written] = end
+				written++
+			}
+		}
+		copy(current, next[:written])
+		count = len(compactInts(current[:written]))
+		if count == 0 {
+			break
+		}
+	}
+	return current[:count], true
+}
+
+func (arena *byteChainArena) evalAlternation(options []parser.Node, data []byte, pos int, flags CompileFlag) ([]int, bool) {
+	out, ok := arena.take(byteChainFrontier)
+	if !ok {
+		return nil, false
+	}
+	written := 0
+	for _, option := range options {
+		ends, ok := arena.eval(option, data, pos, flags)
+		if !ok {
+			return nil, false
+		}
+		if written+len(ends) > len(out) {
+			return nil, false
+		}
+		copy(out[written:], ends)
+		written += len(ends)
+	}
+	return compactInts(out[:written]), true
+}
+
+func (arena *byteChainArena) evalRepeat(v parser.Repeat, data []byte, pos int, flags CompileFlag) ([]int, bool) {
+	mark := arena.used
+	current, ok := arena.take(byteChainFrontier)
+	if !ok {
+		return nil, false
+	}
+	next, ok := arena.take(byteChainFrontier)
+	if !ok {
+		return nil, false
+	}
+	results, ok := arena.take(byteChainFrontier)
+	if !ok {
+		return nil, false
+	}
+	if ends, matched := matchByteRepeatInto(v, data, pos, flags, arena.repeatBuf[:0]); matched {
+		if len(ends) > len(results) {
+			return nil, false
+		}
+		copy(results, ends)
+		return compactInts(results[:len(ends)]), true
+	}
+	count := 1
+	current[0] = pos
+	written := 0
+	if v.Min == 0 {
+		results[0] = pos
+		written = 1
+	}
+	budget := len(data) - pos + 1
+	if budget < 1 {
+		budget = 1
+	}
+	maxCount := v.Max
+	if maxCount < 0 || maxCount > budget {
+		maxCount = budget
+	}
+	for round := 1; round <= maxCount; round++ {
+		arena.used = mark + 3*byteChainFrontier
+		if count == 1 {
+			// 单来源轮次不需要跨来源去重，直接轮换前沿缓冲。
+			ends, ok := arena.eval(v.Child, data, current[0], flags)
+			if !ok {
+				return nil, false
+			}
+			if len(ends) > len(next) {
+				return nil, false
+			}
+			copy(next, ends)
+			nextCount := len(ends)
+			if nextCount == 0 {
+				break
+			}
+			copy(current, next[:nextCount])
+			count = nextCount
+			if round >= v.Min {
+				if written+count > len(results) {
+					return nil, false
+				}
+				copy(results[written:], current[:count])
+				written += count
+			}
+			if count == 1 && current[0] == pos {
+				break
+			}
+			continue
+		}
+		generation := arena.nextGeneration()
+		nextCount := 0
+		for _, start := range current[:count] {
+			ends, ok := arena.eval(v.Child, data, start, flags)
+			if !ok {
+				return nil, false
+			}
+			for _, end := range ends {
+				seen, covered := arena.markSeen(generation, end)
+				if !covered {
+					return nil, false
+				}
+				if seen {
+					continue
+				}
+				if nextCount == len(next) {
+					return nil, false
+				}
+				next[nextCount] = end
+				nextCount++
+			}
+		}
+		nextCount = len(compactInts(next[:nextCount]))
+		if nextCount == 0 {
+			break
+		}
+		copy(current, next[:nextCount])
+		count = nextCount
+		if round >= v.Min {
+			if written+count > len(results) {
+				return nil, false
+			}
+			copy(results[written:], current[:count])
+			written += count
+		}
+		if count == 1 && current[0] == pos {
+			break
+		}
+	}
+	return compactInts(results[:written]), true
+}
+
 func equalByte(a, b byte, flags CompileFlag) bool {
 	if a == b {
 		return true

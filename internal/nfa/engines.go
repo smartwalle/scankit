@@ -6548,7 +6548,9 @@ func (e *Engine) Validate() error {
 		}
 	}
 	if e.bitNFA != nil {
-		if !bitNFAEligibleGraph(e.Program.Graph) {
+		// 位布局由展开后的字节图构建，判定必须使用同一张图，
+		// 否则多字节文字会被误判为不支持。
+		if !bitNFAEligibleGraph(nfagraph.ExpandLiterals(e.Program.Graph)) {
 			return fmt.Errorf("bit backend graph is unsupported")
 		}
 		if err := e.bitNFA.validate(); err != nil {
@@ -8003,10 +8005,13 @@ func (e *Engine) SupportsGraph(g *nfagraph.Graph) bool {
 	if len(g.Nodes) > 4096 || g.Flow == nil || g.Flow.EdgeCount() > 16384 {
 		return false
 	}
-	// 其余专用引擎只接受可消费的字节图；遇到 Unicode、断言或控制节点
+	// 位布局按展开后的字节图构建，允许有界/无界 Repeat 控制节点；
+	// 其余专用引擎只接受可消费的字节图，遇到 Unicode、断言或控制节点
 	// 必须由调用方回退到通用确认路径，避免错误报告。
 	if !dfaLikeGraph(g) {
-		return false
+		if e.Kind != EngineLimEx || !bitNFAEligibleGraph(nfagraph.ExpandLiterals(g)) {
+			return false
+		}
 	}
 	switch e.Kind {
 	case EngineLimEx:
@@ -8321,6 +8326,12 @@ func (e *Engine) Spans(data []byte) []Span {
 
 // SpansLimit 返回不超过 limit 个区间；零值表示不限制。
 func (e *Engine) SpansLimit(data []byte, limit int) []Span {
+	return e.SpansInto(data, nil, limit)
+}
+
+// SpansInto 与 SpansLimit 语义一致，但优先把结果写入调用方缓冲，
+// 避免调用方在每次扫描时重新分配结果切片。
+func (e *Engine) SpansInto(data []byte, dst []Span, limit int) []Span {
 	if e == nil || e.Program == nil || limit < 0 {
 		return nil
 	}
@@ -8328,7 +8339,7 @@ func (e *Engine) SpansLimit(data []byte, limit int) []Span {
 	if e.Kind == EngineMPV && e.mpv != nil && e.mpv.validate() == nil {
 		// MPV 的文字集合已在编译阶段完成归一化。扫描阶段直接复用，
 		// 避免每次调用重新遍历图并构建临时状态布局。
-		return e.mpv.spans(data, limit)
+		return e.mpv.spansInto(data, dst, limit)
 	}
 	if e.Kind == EngineLBR && e.lbr != nil && lbrRuntimeShapeOK(e.lbr) {
 		// 复用 LBR 自身的候选枚举，保证断言首节点的空掩码不会
@@ -8336,7 +8347,10 @@ func (e *Engine) SpansLimit(data []byte, limit int) []Span {
 		return e.lbr.Spans(data, limit)
 	}
 	if e.Independent() && (e.Kind == EngineLimEx || e.Kind == EngineSheng || e.Kind == EngineMcSheng || e.Kind == EngineTamarama || e.Kind == EngineVermicelli || e.Kind == EngineShufti || e.Kind == EngineTruffle) {
-		out := make([]Span, 0, initialSpanCapacity(data, limit))
+		out := dst[:0]
+		if cap(out) < initialSpanCapacity(data, limit) {
+			out = make([]Span, 0, initialSpanCapacity(data, limit))
+		}
 		prefix, candidateMask, candidateTables, acceptsEmpty, backend := e.executionCandidates()
 		// 复用确认路径的结束偏移缓冲，避免每个起点分配临时切片。
 		endsBuf := make([]int, 0, 8)
@@ -8366,32 +8380,39 @@ func (e *Engine) SpansLimit(data []byte, limit int) []Span {
 			return out
 		}
 	}
+	appendSpans := func(spans []Span) []Span {
+		out := dst[:0]
+		if cap(out) < len(spans) {
+			out = make([]Span, 0, len(spans))
+		}
+		return append(out, spans...)
+	}
 	if e.byteNFA != nil {
-		return e.byteNFA.Spans(data, limit)
+		return appendSpans(e.byteNFA.Spans(data, limit))
 	}
 	if e.bitNFA != nil && bitRuntimeShapeCached(e.bitNFA) {
-		return e.bitNFA.Spans(data, limit)
+		return appendSpans(e.bitNFA.Spans(data, limit))
 	}
 	if e.sparseNFA != nil && sparseRuntimeShapeOK(e.sparseNFA) {
-		return e.sparseNFA.Spans(data, limit)
+		return appendSpans(e.sparseNFA.Spans(data, limit))
 	}
 	if e.nibbleNFA != nil && nibbleRuntimeShapeOK(e.nibbleNFA) {
-		return e.nibbleNFA.Spans(data, limit)
+		return appendSpans(e.nibbleNFA.Spans(data, limit))
 	}
 	if e.rangeNFA != nil && rangeRuntimeShapeOK(e.rangeNFA) {
-		return e.rangeNFA.Spans(data, limit)
+		return appendSpans(e.rangeNFA.Spans(data, limit))
 	}
 	if repeatUsable(e) {
-		return e.repeatSpans(data, limit)
+		return appendSpans(e.repeatSpans(data, limit))
 	}
 	if e.tableNFA != nil && tableRuntimeShapeOK(e.tableNFA) {
-		return e.tableNFA.Spans(data, limit)
+		return appendSpans(e.tableNFA.Spans(data, limit))
 	}
 	if e.mpv != nil && e.mpv.validate() == nil {
-		return e.mpv.Spans(data, limit)
+		return appendSpans(e.mpv.Spans(data, limit))
 	}
 	if e.lbr != nil && lbrRuntimeShapeOK(e.lbr) {
-		return e.lbr.Spans(data, limit)
+		return appendSpans(e.lbr.Spans(data, limit))
 	}
 	if e.castle != nil && castleRuntimeShapeCached(e.castle) {
 		return e.castle.Spans(data, limit)
@@ -8474,10 +8495,18 @@ func initialSpanCapacity(data []byte, limit int) int {
 }
 
 func (p *mpvProgram) spans(data []byte, limit int) []Span {
+	return p.spansInto(data, nil, limit)
+}
+
+// spansInto 与 spans 语义一致，但把结果写入调用方缓冲以复用容量。
+func (p *mpvProgram) spansInto(data []byte, dst []Span, limit int) []Span {
 	if p == nil || limit < 0 {
 		return nil
 	}
-	out := make([]Span, 0, initialSpanCapacity(data, limit))
+	out := dst[:0]
+	if cap(out) < initialSpanCapacity(data, limit) {
+		out = make([]Span, 0, initialSpanCapacity(data, limit))
+	}
 	for _, literal := range p.literals {
 		if len(literal) == 0 {
 			continue

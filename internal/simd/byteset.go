@@ -172,6 +172,22 @@ func ComposeWindowMask64(laneMasks [4]uint64, lanes int) uint64 {
 	return strict | first&boundary
 }
 
+// ComposeWindowMask64Partial 在组合中途已知 strict 掩码为空时给出最终结果。
+//
+// 组合公式是 strict | first&boundary，strict 一旦为空就不可能再恢复，因此
+// 调用方可以跳过剩余 lane 的原生求值：只需保留窗口末端需要退让的首 lane 位置。
+func ComposeWindowMask64Partial(first uint64, lanes int) uint64 {
+	lanes = ClampLanes(lanes)
+	if lanes <= 1 {
+		return first
+	}
+	var boundary uint64
+	for lane := 0; lane < lanes-1; lane++ {
+		boundary |= 1 << uint(WideWidth-1-lane)
+	}
+	return first & boundary
+}
+
 // WindowMask64Scalar 是 Backend.WindowMask64 的可移植标量参考实现。
 // 各后端在缺少原生能力时回退到该实现，保证原生与通用结果逐位一致。
 func WindowMask64Scalar(data []byte, off int, tables *ByteSetTables, lanes int) (uint64, bool) {

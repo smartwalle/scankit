@@ -28,22 +28,22 @@ func BenchmarkPIIRedaction(b *testing.B) {
 				b.Run(density.name, func(b *testing.B) {
 					fixture := newPIIBenchmarkFixture(b, scenario, density)
 
-					b.Run("ScannerScanInto", func(b *testing.B) {
-						matches := make([]scankit.Match, 0, len(fixture.matches))
-						if _, err := fixture.scanner.ScanInto(fixture.data, matches); err != nil {
-							b.Fatal(err)
-						}
-						startPIIBenchmarkTimer(b, fixture)
-						for range b.N {
-							matches = matches[:0]
-							var err error
-							matches, err = fixture.scanner.ScanInto(fixture.data, matches)
-							if err != nil {
-								b.Fatal(err)
-							}
-						}
-						piiBenchmarkMatchesSink = matches
-					})
+					//b.Run("ScannerScanInto", func(b *testing.B) {
+					//	matches := make([]scankit.Match, 0, len(fixture.matches))
+					//	if _, err := fixture.scanner.ScanInto(fixture.data, matches); err != nil {
+					//		b.Fatal(err)
+					//	}
+					//	startPIIBenchmarkTimer(b, fixture)
+					//	for range b.N {
+					//		matches = matches[:0]
+					//		var err error
+					//		matches, err = fixture.scanner.ScanInto(fixture.data, matches)
+					//		if err != nil {
+					//			b.Fatal(err)
+					//		}
+					//	}
+					//	piiBenchmarkMatchesSink = matches
+					//})
 
 					//b.Run("EngineReplace", func(b *testing.B) {
 					//	if _, err := fixture.engine.Replace(fixture.data, writePIIMask); err != nil {
@@ -59,22 +59,22 @@ func BenchmarkPIIRedaction(b *testing.B) {
 					//	}
 					//})
 
-					//b.Run("EngineMask", func(b *testing.B) {
-					//	data := make([]byte, len(fixture.data))
-					//	copy(data, fixture.data)
-					//	if _, err := fixture.engine.Mask(data, maskPIIValue); err != nil {
-					//		b.Fatal(err)
-					//	}
-					//	startPIIBenchmarkTimer(b, fixture)
-					//	for range b.N {
-					//		copy(data, fixture.data)
-					//		result, err := fixture.engine.Mask(data, maskPIIValue)
-					//		if err != nil {
-					//			b.Fatal(err)
-					//		}
-					//		piiBenchmarkBytesSink = result
-					//	}
-					//})
+					b.Run("EngineMask", func(b *testing.B) {
+						data := make([]byte, len(fixture.data))
+						copy(data, fixture.data)
+						if _, err := fixture.engine.Mask(data, maskPIIValue); err != nil {
+							b.Fatal(err)
+						}
+						startPIIBenchmarkTimer(b, fixture)
+						for range b.N {
+							copy(data, fixture.data)
+							result, err := fixture.engine.Mask(data, maskPIIValue)
+							if err != nil {
+								b.Fatal(err)
+							}
+							piiBenchmarkBytesSink = result
+						}
+					})
 
 					b.Run("GoRegexpReplace", func(b *testing.B) {
 						if result := fixture.goRegexp.ReplaceAllFunc(fixture.data, fixture.maskRegexpMatch); !bytes.Equal(result, fixture.masked) {

@@ -90,7 +90,7 @@ func formatFixedCorpusBackends(backends map[uint32]string) string {
 // 命中集合与引擎布局发生变化说明行为或选择逻辑回归，必须显式更新基线。
 const (
 	fixedCorpusGoldenMatches  = "1=1,2=2,3=15,4=1,5=1,6=1,7=1,8=2,9=1,10=1,11=1,12=11"
-	fixedCorpusGoldenBackends = "1=nfa/11/1/60,2=literal,3=nfa/11/2/68,4=nfa/3/10/22831,5=dfa/12/14096,6=literal,7=literal,8=nfa/10/3/33,9=nfa/11/1/100,10=nfa/11/1/66,11=literal,12=dfa/6/9096"
+	fixedCorpusGoldenBackends = "1=nfa/11/1/60,2=literal,3=nfa/11/2/68,4=nfa/3/10/22831,5=nfa/3/15/33091,6=literal,7=literal,8=nfa/10/3/33,9=nfa/11/1/100,10=nfa/11/1/66,11=literal,12=nfa/3/8/19097"
 	// fixedCorpusAllocCeiling 是固定语料单次扫描允许的最大分配次数，
 	// 只允许下降不允许上升，避免把机器性能写成绝对阈值。
 	fixedCorpusAllocCeiling = 100

@@ -528,18 +528,50 @@ func Select(literals []Literal) string {
 		return "none"
 	}
 	long := 0
+	buckets := make(map[byte]int, 16)
 	for _, l := range literals {
 		if len(l.Value) > long {
 			long = len(l.Value)
 		}
+		if len(l.Value) == 0 {
+			continue
+		}
+		buckets[l.Value[0]]++
+		if l.CaseInsensitive {
+			buckets[foldASCIIByte(l.Value[0])]++
+		}
 	}
 	if long >= 8 {
+		// Teddy 按首字节分桶后逐条确认，桶过大时单次确认成本随文字数线性增长；
+		// 首字节高度集中的文字集合交给前缀树，避免共享前缀退化为全桶比较。
+		if len(literals) >= 32 && 2*maxBucket(buckets) >= len(literals) {
+			return "noodle"
+		}
 		return "teddy"
 	}
 	if len(literals) <= 4 {
 		return "fdr"
 	}
 	return "noodle"
+}
+
+// foldASCIIByte 返回 ASCII 大写字母的小写形式，其余字节保持不变。
+func foldASCIIByte(value byte) byte {
+	if value >= 'A' && value <= 'Z' {
+		return value + 'a' - 'A'
+	}
+	return value
+}
+
+// maxBucket 返回首字节分桶中的最大桶大小。
+func maxBucket(buckets map[byte]int) int {
+	largest := 0
+	for _, count := range buckets {
+		if count > largest {
+			largest = count
+		}
+	}
+	return largest
 }
 
 // SelectionDecision 返回候选匹配器选择及其依据。

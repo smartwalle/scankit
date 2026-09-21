@@ -838,10 +838,12 @@ func (p *Program) matchAtLimitBudget(data []byte, start int, limit int, multilin
 			}
 			continue
 		}
+		// 后继列表在本次状态出队期间保持不变，只读视图避免每个状态复制切片。
+		successors := p.Graph.Flow.SuccessorView(s.v)
 		switch n.Kind {
 		case nfagraph.KindLiteral:
 			if s.pos >= 0 && s.pos <= endLimit && len(n.Literal) <= endLimit-s.pos && equalLiteral(data[s.pos:s.pos+len(n.Literal)], n.Literal, caseless) {
-				for _, to := range p.Graph.Flow.Successors(s.v) {
+				for _, to := range successors {
 					if !enqueue(genericState{v: to, pos: s.pos + len(n.Literal), report: s.report}) {
 						return out, steps, true
 					}
@@ -863,7 +865,7 @@ func (p *Program) matchAtLimitBudget(data []byte, start int, limit int, multilin
 				if !ok {
 					continue
 				}
-				for _, to := range p.Graph.Flow.Successors(s.v) {
+				for _, to := range successors {
 					if !enqueue(genericState{v: to, pos: s.pos + size, report: s.report}) {
 						return out, steps, true
 					}
@@ -880,7 +882,7 @@ func (p *Program) matchAtLimitBudget(data []byte, start int, limit int, multilin
 				}
 			}
 			if matched {
-				for _, to := range p.Graph.Flow.Successors(s.v) {
+				for _, to := range successors {
 					if !enqueue(genericState{v: to, pos: s.pos + 1, report: s.report}) {
 						return out, steps, true
 					}
@@ -892,7 +894,7 @@ func (p *Program) matchAtLimitBudget(data []byte, start int, limit int, multilin
 			if n.Assertion == 0 || !assertion(n.Assertion, data, s.pos, multiline) {
 				continue
 			}
-			for _, to := range p.Graph.Flow.Successors(s.v) {
+			for _, to := range successors {
 				if !enqueue(genericState{v: to, pos: s.pos, report: s.report}) {
 					return out, steps, true
 				}
@@ -902,13 +904,13 @@ func (p *Program) matchAtLimitBudget(data []byte, start int, limit int, multilin
 			if n.ReportID != 0 {
 				nextReport = n.ReportID
 			}
-			for _, to := range p.Graph.Flow.Successors(s.v) {
+			for _, to := range successors {
 				if !enqueue(genericState{v: to, pos: s.pos, report: nextReport}) {
 					return out, steps, true
 				}
 			}
 		default:
-			for _, to := range p.Graph.Flow.Successors(s.v) {
+			for _, to := range successors {
 				if !enqueue(genericState{v: to, pos: s.pos, report: s.report}) {
 					return out, steps, true
 				}

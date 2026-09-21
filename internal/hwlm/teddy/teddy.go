@@ -124,12 +124,39 @@ func (m *Matcher) Find(data []byte) []Match {
 }
 
 // FindInto 将候选结果写入调用方切片，便于扫描上下文复用结果缓冲。
+// 结果按 (起点, 编号, 终点) 稳定排序并去重。
 func (m *Matcher) FindInto(data []byte, dst []Match) []Match {
+	out := m.FindIntoUnsorted(data, dst)
+	if len(out) <= 1 {
+		return out
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].From != out[j].From {
+			return out[i].From < out[j].From
+		}
+		if out[i].ID != out[j].ID {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].To < out[j].To
+	})
+	write := 1
+	for _, match := range out[1:] {
+		if match == out[write-1] {
+			continue
+		}
+		out[write] = match
+		write++
+	}
+	return out[:write]
+}
+
+// FindIntoUnsorted 与 FindInto 的候选集合一致，但跳过排序与去重。调用方在
+// 派生出按起点排序的确认起点时会重新排序，这里重复排序只放大常数开销。
+func (m *Matcher) FindIntoUnsorted(data []byte, dst []Match) []Match {
 	if m == nil {
 		return dst[:0]
 	}
 	out := dst[:0]
-	seen := make(map[[3]int]struct{})
 	backend := dispatch.DefaultBackend()
 	visit := func(from int) {
 		if from < 0 || from >= len(data) {
@@ -140,15 +167,7 @@ func (m *Matcher) FindInto(data []byte, dst []Match) []Match {
 			if !hwlm.ContainsAt(data, from, literal) {
 				continue
 			}
-			match := Match{ID: literal.ID, From: from, To: from + len(literal.Value)}
-			if seen != nil {
-				key := [3]int{int(match.ID), match.From, match.To}
-				if _, ok := seen[key]; ok {
-					continue
-				}
-				seen[key] = struct{}{}
-			}
-			out = append(out, match)
+			out = append(out, Match{ID: literal.ID, From: from, To: from + len(literal.Value)})
 		}
 	}
 	// 先用向量掩码筛选可能的首字节，再进入分桶确认，减少稀疏输入上的哈希查找。
@@ -181,15 +200,6 @@ func (m *Matcher) FindInto(data []byte, dst []Match) []Match {
 			visit(off)
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].From != out[j].From {
-			return out[i].From < out[j].From
-		}
-		if out[i].ID != out[j].ID {
-			return out[i].ID < out[j].ID
-		}
-		return out[i].To < out[j].To
-	})
 	return out
 }
 

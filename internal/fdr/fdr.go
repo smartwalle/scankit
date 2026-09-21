@@ -445,7 +445,35 @@ func (m *Matcher) Find(data []byte) []Match {
 }
 
 // FindInto 将候选结果写入调用方切片，减少重复扫描时的分配。
+// 结果按 (起点, 编号, 终点) 稳定排序并去重。
 func (m *Matcher) FindInto(data []byte, dst []Match) []Match {
+	out := m.FindIntoUnsorted(data, dst)
+	if len(out) <= 1 {
+		return out
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].From != out[j].From {
+			return out[i].From < out[j].From
+		}
+		if out[i].ID != out[j].ID {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].To < out[j].To
+	})
+	write := 1
+	for _, match := range out[1:] {
+		if match == out[write-1] {
+			continue
+		}
+		out[write] = match
+		write++
+	}
+	return out[:write]
+}
+
+// FindIntoUnsorted 与 FindInto 的候选集合一致，但跳过排序与去重。调用方在
+// 派生出按起点排序的确认起点时会重新排序，这里重复排序只放大常数开销。
+func (m *Matcher) FindIntoUnsorted(data []byte, dst []Match) []Match {
 	if m == nil {
 		return dst[:0]
 	}
@@ -478,26 +506,6 @@ func (m *Matcher) FindInto(data []byte, dst []Match) []Match {
 	}
 	appendMatches(m.sensitive.nodes, &m.sensitiveSet, false)
 	appendMatches(m.folded.nodes, &m.foldedSet, true)
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].From != out[j].From {
-			return out[i].From < out[j].From
-		}
-		if out[i].ID != out[j].ID {
-			return out[i].ID < out[j].ID
-		}
-		return out[i].To < out[j].To
-	})
-	if len(out) > 1 {
-		write := 1
-		for _, match := range out[1:] {
-			if match == out[write-1] {
-				continue
-			}
-			out[write] = match
-			write++
-		}
-		out = out[:write]
-	}
 	return out
 }
 

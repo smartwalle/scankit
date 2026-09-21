@@ -39,11 +39,28 @@ func (b Backend) WindowMask64(data []byte, off int, tables *simd.ByteSetTables, 
 	}
 	lanes = simd.ClampLanes(lanes)
 	window := data[off : off+simd.WideWidth]
-	var laneMasks [4]uint64
-	for lane := 0; lane < lanes; lane++ {
+	first := uint64(nativeByteSetMask32(window[:simd.SuperWidth], &tables[0])) |
+		uint64(nativeByteSetMask32(window[simd.SuperWidth:], &tables[0]))<<32
+	// 组合结果必然包含首 lane 掩码的按位与，因此首 lane 为空时窗口内
+	// 不可能有候选，直接省去其余 lane 的原生调用。稀疏语料下大多数窗口
+	// 都走该分支，是候选扫描的主要开销削减点。
+	if first == 0 {
+		return 0, true
+	}
+	if lanes == 1 {
+		return first, true
+	}
+	strict := first
+	laneMasks := [4]uint64{first}
+	for lane := 1; lane < lanes; lane++ {
 		lo := nativeByteSetMask32(window[:simd.SuperWidth], &tables[lane])
 		hi := nativeByteSetMask32(window[simd.SuperWidth:], &tables[lane])
-		laneMasks[lane] = uint64(lo) | uint64(hi)<<32
+		mask := uint64(lo) | uint64(hi)<<32
+		laneMasks[lane] = mask
+		strict &= mask >> uint(lane)
+		if strict == 0 {
+			return simd.ComposeWindowMask64Partial(first, lanes), true
+		}
 	}
 	return simd.ComposeWindowMask64(laneMasks, lanes), true
 }
