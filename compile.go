@@ -12,7 +12,7 @@ import (
 	"github.com/smartwalle/scankit/internal/compiler"
 	"github.com/smartwalle/scankit/internal/dfa"
 	"github.com/smartwalle/scankit/internal/engine"
-	nfalib "github.com/smartwalle/scankit/internal/nfa"
+	"github.com/smartwalle/scankit/internal/nfa"
 	"github.com/smartwalle/scankit/internal/nfagraph"
 	"github.com/smartwalle/scankit/internal/parser"
 	"github.com/smartwalle/scankit/internal/prefilter"
@@ -412,7 +412,7 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			autoProgram, err = engine.CompileAutoWithFeatures(ng, features, dfaLimit, limits.MemoryBytes)
 			if err != nil {
 				kind := compiler.ErrorUnsupported
-				if errors.Is(err, nfalib.ErrStateLimit) || errors.Is(err, nfalib.ErrEdgeLimit) || errors.Is(err, nfalib.ErrMemoryLimit) || errors.Is(err, dfa.ErrStateLimit) || errors.Is(err, dfa.ErrMemoryLimit) {
+				if errors.Is(err, nfa.ErrStateLimit) || errors.Is(err, nfa.ErrEdgeLimit) || errors.Is(err, nfa.ErrMemoryLimit) || errors.Is(err, dfa.ErrStateLimit) || errors.Is(err, dfa.ErrMemoryLimit) {
 					kind = compiler.ErrorResourceLimit
 				}
 				return nil, &compiler.CompileError{Kind: kind, Expression: i, Position: 0, Message: err.Error()}
@@ -505,7 +505,7 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			}
 		}
 		if rule.ext == nil && flags&(FlagCaseless|FlagUTF8|FlagUCP|FlagMultiline|FlagDotAll) == 0 && !rule.info.Stateful && !rule.info.LBR {
-			if specialized, compileErr := nfalib.CompileAuto(ng); compileErr == nil && specialized.SupportsGraph(ng) {
+			if specialized, compileErr := nfa.CompileAuto(ng); compileErr == nil && specialized.SupportsGraph(ng) {
 				backendBytes := specialized.MemoryBytes()
 				if limits.MemoryBytes == 0 || totalUsage.MemoryBytes <= limits.MemoryBytes && backendBytes <= limits.MemoryBytes-totalUsage.MemoryBytes {
 					rule.nfaEngine = specialized

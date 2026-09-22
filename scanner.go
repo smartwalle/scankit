@@ -23,7 +23,7 @@ import (
 	"github.com/smartwalle/scankit/internal/hwlm"
 	"github.com/smartwalle/scankit/internal/hwlm/noodle"
 	"github.com/smartwalle/scankit/internal/hwlm/teddy"
-	nfalib "github.com/smartwalle/scankit/internal/nfa"
+	"github.com/smartwalle/scankit/internal/nfa"
 	"github.com/smartwalle/scankit/internal/parser"
 	"github.com/smartwalle/scankit/internal/prefilter"
 	"github.com/smartwalle/scankit/internal/repeat"
@@ -252,7 +252,7 @@ type compiledRule struct {
 	smallBlock *smallblock.Program
 	smallWrite *smallwrite.Program
 	repeat     *repeat.Program
-	nfaEngine  *nfalib.Engine
+	nfaEngine  *nfa.Engine
 	// backendEligible 缓存 backendEligible 函数的结果，
 	// 避免每个起点重复遍历 AST。
 	backendEligible bool
@@ -1344,7 +1344,7 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 			if rule.nfaEngine != nil {
 				// 缓冲只在真正执行后端扫描的规则作用域内声明，候选索引覆盖
 				// 全部规则时不会为未使用的缓冲付出每次扫描的堆分配。
-				var spanBuf [32]nfalib.Span
+				var spanBuf [32]nfa.Span
 				spans := rule.nfaEngine.SpansInto(data, spanBuf[:0], 0)
 				for _, span := range spans {
 					matches = append(matches, Match{Id: rule.id, From: uint64(span.From), To: uint64(span.To)})
