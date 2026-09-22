@@ -369,3 +369,67 @@ func startPIIBenchmarkTimer(b *testing.B, fixture piiBenchmarkFixture) {
 	b.ResetTimer()
 	b.ReportMetric(float64(len(fixture.matches)), "matches/op")
 }
+
+// TestPIIRedactionStable 用 testing.AllocsPerRun(200, ...) + testing.Benchmark
+// 提供稳定的 EngineMask / GoRegexpReplace 对比基线。
+func TestPIIRedactionStable(t *testing.T) {
+	for _, scenario := range piiBenchmarkScenarios() {
+		for _, density := range piiBenchmarkDensities() {
+			fixture := newPIIBenchmarkFixture(t, scenario, density)
+
+			// --- EngineMask ---
+			data := make([]byte, len(fixture.data))
+			copy(data, fixture.data)
+			for i := 0; i < 10; i++ {
+				copy(data, fixture.data)
+				if _, err := fixture.engine.Mask(data, maskPIIValue); err != nil {
+					t.Fatal(err)
+				}
+			}
+			engineAllocs := testing.AllocsPerRun(200, func() {
+				copy(data, fixture.data)
+				result, err := fixture.engine.Mask(data, maskPIIValue)
+				if err != nil {
+					t.Fatal(err)
+				}
+				piiBenchmarkBytesSink = result
+			})
+			engineRes := testing.Benchmark(func(b *testing.B) {
+				data := make([]byte, len(fixture.data))
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					copy(data, fixture.data)
+					result, err := fixture.engine.Mask(data, maskPIIValue)
+					if err != nil {
+						b.Fatal(err)
+					}
+					piiBenchmarkBytesSink = result
+				}
+			})
+			nsPerOp := float64(engineRes.NsPerOp())
+			mbPerS := float64(len(fixture.data)) / nsPerOp * 1e9 / (1 << 20)
+			t.Logf("%s/%s/EngineMask ns/op=%.0f MB/s=%.2f B/op=%d allocs/op=%.1f matches=%d",
+				scenario.name, density.name, nsPerOp, mbPerS,
+				engineRes.AllocedBytesPerOp(), engineAllocs, len(fixture.matches))
+
+			// --- GoRegexpReplace ---
+			for i := 0; i < 10; i++ {
+				piiBenchmarkBytesSink = fixture.goRegexp.ReplaceAllFunc(fixture.data, fixture.maskRegexpMatch)
+			}
+			regexpAllocs := testing.AllocsPerRun(200, func() {
+				piiBenchmarkBytesSink = fixture.goRegexp.ReplaceAllFunc(fixture.data, fixture.maskRegexpMatch)
+			})
+			regexpRes := testing.Benchmark(func(b *testing.B) {
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					piiBenchmarkBytesSink = fixture.goRegexp.ReplaceAllFunc(fixture.data, fixture.maskRegexpMatch)
+				}
+			})
+			nsPerOp = float64(regexpRes.NsPerOp())
+			mbPerS = float64(len(fixture.data)) / nsPerOp * 1e9 / (1 << 20)
+			t.Logf("%s/%s/GoRegexpReplace ns/op=%.0f MB/s=%.2f B/op=%d allocs/op=%.1f matches=%d",
+				scenario.name, density.name, nsPerOp, mbPerS,
+				regexpRes.AllocedBytesPerOp(), regexpAllocs, len(fixture.matches))
+		}
+	}
+}

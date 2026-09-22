@@ -244,3 +244,58 @@ func buildNoise(size int) []byte {
 
 	return data[:size]
 }
+
+// TestEngineScanStable 用 testing.AllocsPerRun(200, ...) + testing.Benchmark
+// 提供稳定的 ns/op、MB/s、B/op、allocs/op 基线，避免 -benchtime=1s -benchmem
+// 在低 alloc 场景下的 cold-start 摊销噪声。
+func TestEngineScanStable(t *testing.T) {
+	expressions := make([]Expression, 0, len(Rules))
+	for index, pattern := range Rules {
+		expressions = append(expressions, Expression{
+			Id:      uint32(index + 1),
+			Pattern: pattern,
+		})
+	}
+	scanner, err := Compile(expressions)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type tc struct {
+		size    int
+		density int
+	}
+	cases := []tc{
+		{1 << 10, 0}, {1 << 10, 10}, {1 << 10, 100}, {1 << 10, 1000}, {1 << 10, 10000},
+		{1 << 20, 0}, {1 << 20, 10}, {1 << 20, 100}, {1 << 20, 1000}, {1 << 20, 10000},
+		{10 << 20, 0}, {10 << 20, 10}, {10 << 20, 100}, {10 << 20, 1000}, {10 << 20, 10000},
+	}
+
+	matches := make([]Match, 0, 16)
+	for _, c := range cases {
+		data := buildBenchmarkCorpus(c.size, c.density)
+		// warm up pool: 10 scans bring ctx to steady state
+		for i := 0; i < 10; i++ {
+			matches = matches[:0]
+			matches, _ = scanner.scanInto(data, matches)
+		}
+		// AllocsPerRun 内部跑多次取平均，更稳定
+		allocs := testing.AllocsPerRun(200, func() {
+			matches = matches[:0]
+			matches, _ = scanner.scanInto(data, matches)
+		})
+		// testing.Benchmark 内部 b.N 较大，cold-start 摊销到接近 0
+		res := testing.Benchmark(func(b *testing.B) {
+			matches := make([]Match, 0, 16)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				matches = matches[:0]
+				matches, _ = scanner.scanInto(data, matches)
+			}
+		})
+		nsPerOp := float64(res.NsPerOp())
+		mbPerS := float64(c.size) / nsPerOp * 1e9 / (1 << 20)
+		t.Logf("size=%dMB density=%d/MB ns/op=%.0f MB/s=%.2f B/op=%d allocs/op=%.1f",
+			c.size>>20, c.density, nsPerOp, mbPerS, res.AllocedBytesPerOp(), allocs)
+	}
+}

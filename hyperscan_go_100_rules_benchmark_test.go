@@ -645,3 +645,63 @@ func startHyperscan100RulesTimer(b *testing.B, fixture hyperscan100RulesFixture)
 	b.ResetTimer()
 	b.ReportMetric(float64(fixture.matches), "matches/op")
 }
+
+// TestHyperscanGo100RulesStable 用 testing.AllocsPerRun(200, ...) + testing.Benchmark
+// 提供稳定的 EngineMask / GoRegexpReplace 对比基线。
+func TestHyperscanGo100RulesStable(t *testing.T) {
+	for _, size := range CorpusSizes {
+		fixture := newHyperscan100RulesFixture(t, size)
+
+		// --- EngineMask ---
+		data := make([]byte, len(fixture.data))
+		copy(data, fixture.data)
+		for i := 0; i < 10; i++ {
+			copy(data, fixture.data)
+			if _, err := fixture.engine.Mask(data, writeHyperscan100RulesMask); err != nil {
+				t.Fatal(err)
+			}
+		}
+		engineAllocs := testing.AllocsPerRun(200, func() {
+			copy(data, fixture.data)
+			result, err := fixture.engine.Mask(data, writeHyperscan100RulesMask)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hyperscan100RulesBytesSink = result
+		})
+		engineRes := testing.Benchmark(func(b *testing.B) {
+			data := make([]byte, len(fixture.data))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				copy(data, fixture.data)
+				result, err := fixture.engine.Mask(data, writeHyperscan100RulesMask)
+				if err != nil {
+					b.Fatal(err)
+				}
+				hyperscan100RulesBytesSink = result
+			}
+		})
+		nsPerOp := float64(engineRes.NsPerOp())
+		mbPerS := float64(size) / nsPerOp * 1e9 / (1 << 20)
+		t.Logf("Size=%d/EngineMask ns/op=%.0f MB/s=%.2f B/op=%d allocs/op=%.1f matches=%d",
+			size, nsPerOp, mbPerS, engineRes.AllocedBytesPerOp(), engineAllocs, fixture.matches)
+
+		// --- GoRegexpReplace ---
+		for i := 0; i < 10; i++ {
+			hyperscan100RulesBytesSink = fixture.goRegexp.ReplaceAllFunc(fixture.data, fixture.maskRegexpMatch)
+		}
+		regexpAllocs := testing.AllocsPerRun(200, func() {
+			hyperscan100RulesBytesSink = fixture.goRegexp.ReplaceAllFunc(fixture.data, fixture.maskRegexpMatch)
+		})
+		regexpRes := testing.Benchmark(func(b *testing.B) {
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				hyperscan100RulesBytesSink = fixture.goRegexp.ReplaceAllFunc(fixture.data, fixture.maskRegexpMatch)
+			}
+		})
+		nsPerOp = float64(regexpRes.NsPerOp())
+		mbPerS = float64(size) / nsPerOp * 1e9 / (1 << 20)
+		t.Logf("Size=%d/GoRegexpReplace ns/op=%.0f MB/s=%.2f B/op=%d allocs/op=%.1f matches=%d",
+			size, nsPerOp, mbPerS, regexpRes.AllocedBytesPerOp(), regexpAllocs, fixture.matches)
+	}
+}
