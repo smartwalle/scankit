@@ -7,21 +7,39 @@ import (
 )
 
 var (
-	engineScanSink any
+	engineScanSink []Match
 
 	engineScanCorpusSizes = []int{
-		1 << 10, // 1 KiB
-		1 << 20, // 1 MiB
-		//10 << 20, // 10 MiB
-		//100 << 20, // 100 MiB
-		//500 << 20, // 500 MiB
+		1 << 10,  // 1 KiB
+		1 << 20,  // 1 MiB
+		10 << 20, // 10 MiB
+		// 100 << 20, // 100 MiB
+		// 500 << 20, // 500 MiB
+	}
+
+	// 每 MiB 插入多少个正向样本。
+	//
+	// 注意：
+	// 这里控制的是 Samples 数量，而不是最终 Match 数量。
+	// 如果多个 Rule 可以同时命中一个 Sample，
+	// 最终 matches/op 可能明显大于这里的值。
+	engineScanSampleDensities = []int{
+		0,
+		10,
+		100,
+		1000,
+		10000,
 	}
 )
 
 func BenchmarkEngineScan(b *testing.B) {
 	expressions := make([]Expression, 0, len(Rules))
+
 	for index, pattern := range Rules {
-		expressions = append(expressions, Expression{Id: uint32(index + 1), Pattern: pattern})
+		expressions = append(expressions, Expression{
+			Id:      uint32(index + 1),
+			Pattern: pattern,
+		})
 	}
 
 	scanner, err := Compile(expressions)
@@ -30,26 +48,77 @@ func BenchmarkEngineScan(b *testing.B) {
 	}
 
 	for _, size := range engineScanCorpusSizes {
-		b.Run(formatBenchmarkSize(size), func(b *testing.B) {
-			data := buildBenchmarkCorpus(size)
+		for _, samplesPerMB := range engineScanSampleDensities {
+			name := fmt.Sprintf(
+				"%s_%dsampleMB",
+				formatBenchmarkSize(size),
+				samplesPerMB,
+			)
 
-			b.SetBytes(int64(len(data)))
-			b.ReportAllocs()
+			b.Run(name, func(b *testing.B) {
+				data := buildBenchmarkCorpus(
+					size,
+					samplesPerMB,
+				)
 
-			b.ResetTimer()
-
-			var matches = make([]Match, 0, 1000)
-
-			for range b.N {
-				matches = matches[:0]
-				matches, err = scanner.scanInto(data, matches)
+				// 先做一次实际扫描。
+				//
+				// 目的：
+				// 1. 验证 corpus 没有问题
+				// 2. 得到真实 match 数量
+				// 3. 根据真实 match 数量预估 capacity
+				matches, err := scanner.scanInto(data, nil)
 				if err != nil {
 					b.Fatal(err)
 				}
 
+				actualMatches := len(matches)
+
+				b.ReportMetric(
+					float64(actualMatches),
+					"initial-matches/op",
+				)
+
+				// 根据第一次扫描结果预分配。
+				//
+				// 这样可以避免 benchmark 因为 []Match 扩容，
+				// 把“扫描性能”和“slice 扩容性能”混在一起。
+				matchCapacity := actualMatches
+
+				if matchCapacity < 16 {
+					matchCapacity = 16
+				}
+
+				b.SetBytes(int64(len(data)))
+				b.ReportAllocs()
+
+				b.ResetTimer()
+
+				var totalMatches int64
+
+				matches = make([]Match, 0, matchCapacity)
+
+				for range b.N {
+					matches = matches[:0]
+
+					matches, err = scanner.scanInto(data, matches)
+					if err != nil {
+						b.Fatal(err)
+					}
+
+					totalMatches += int64(len(matches))
+				}
+
+				b.StopTimer()
+
+				b.ReportMetric(
+					float64(totalMatches)/float64(b.N),
+					"matches/op",
+				)
+
 				engineScanSink = matches
-			}
-		})
+			})
+		}
 	}
 }
 
@@ -57,68 +126,120 @@ func formatBenchmarkSize(size int) string {
 	switch {
 	case size >= 1<<30:
 		return fmt.Sprintf("%dGB", size>>30)
+
 	case size >= 1<<20:
 		return fmt.Sprintf("%dMB", size>>20)
+
 	case size >= 1<<10:
 		return fmt.Sprintf("%dKB", size>>10)
+
 	default:
 		return fmt.Sprintf("%dB", size)
 	}
 }
 
-func buildBenchmarkCorpus(size int) []byte {
-	const (
-		noiseRatio = 0.90
-		matchRatio = 0.10
-	)
+// buildBenchmarkCorpus 构造 benchmark 数据。
+//
+// samplesPerMB 表示：
+// 每 1 MiB 数据插入多少个 Samples。
+//
+// 注意：
+// 这里控制的是“正向样本数量”，不是最终 Hyperscan Match 数量。
+func buildBenchmarkCorpus(size int, samplesPerMB int) []byte {
+	if size <= 0 {
+		return nil
+	}
 
-	data := make([]byte, 0, size)
+	data := buildNoise(size)
 
-	noiseSize := int(float64(size) * noiseRatio)
-	matchSize := size - noiseSize
+	if samplesPerMB <= 0 || len(Samples) == 0 {
+		return data
+	}
 
-	// 90% 普通文本
-	data = append(data, buildNoise(noiseSize)...)
+	// 根据数据大小计算需要插入多少个 Sample。
+	sampleCount := size * samplesPerMB / (1 << 20)
 
-	// 10% 正向样本
-	data = append(data, buildPositive(matchSize)...)
+	// 小于 1MiB 时，如果 density > 0，
+	// 至少插入一个 sample。
+	if sampleCount == 0 {
+		sampleCount = 1
+	}
 
-	return data[:size]
-}
+	// 使用固定 seed，保证 benchmark 每次运行数据一致。
+	rng := rand.New(rand.NewPCG(
+		uint64(size),
+		uint64(samplesPerMB),
+	))
 
-func buildNoise(size int) []byte {
-	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ,.;:!?-_ "
+	// 把 corpus 划分成 sampleCount 个 segment。
+	//
+	// 每个 sample 放到自己的 segment 中，
+	// 避免不同 Sample 相互覆盖。
+	segmentSize := size / sampleCount
 
-	data := make([]byte, size)
+	if segmentSize <= 0 {
+		return data
+	}
 
-	for i := range data {
-		data[i] = alphabet[rand.IntN(len(alphabet))]
+	for i := 0; i < sampleCount; i++ {
+		sample := Samples[rng.IntN(len(Samples))]
+
+		if len(sample) >= segmentSize {
+			continue
+		}
+
+		segmentStart := i * segmentSize
+		segmentEnd := segmentStart + segmentSize
+
+		// 给 sample 留一点边界空间。
+		maxOffset := segmentEnd - len(sample)
+
+		if maxOffset <= segmentStart {
+			continue
+		}
+
+		offset := segmentStart
+
+		if maxOffset > segmentStart {
+			offset += rng.IntN(maxOffset - segmentStart)
+		}
+
+		copy(data[offset:], sample)
 	}
 
 	return data
 }
 
-func buildPositive(size int) []byte {
-	if size <= 0 {
-		return nil
-	}
+// buildNoise 生成不会刻意制造大量 regex match 的普通日志文本。
+//
+// 不再使用：
+//
+//	abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+//
+// 因为这类随机内容会严重污染：
+//
+//	\d+
+//	[A-Za-z]+
+//	[A-Za-z0-9]+
+//	\w+
+//
+// 等规则的 benchmark。
+func buildNoise(size int) []byte {
+	const alphabet = " "
+	const line = "INFO request completed successfully message=hello world\n"
 
 	data := make([]byte, 0, size)
 
-	for len(data) < size {
-		sample := Samples[rand.IntN(len(Samples))]
-
-		if len(data)+len(sample)+1 > size {
-			break
-		}
-
-		data = append(data, sample...)
-		data = append(data, ' ')
+	for len(data)+len(line) <= size {
+		data = append(data, line...)
 	}
 
-	// 如果最后不足，用普通噪声补齐。
 	if len(data) < size {
-		data = append(data, buildNoise(size-len(data))...)
+		remaining := size - len(data)
+
+		for i := 0; i < remaining; i++ {
+			data = append(data, alphabet[0])
+		}
 	}
 
 	return data[:size]
