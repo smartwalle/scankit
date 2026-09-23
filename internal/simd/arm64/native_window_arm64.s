@@ -70,9 +70,9 @@ TEXT ·nativeByteSetMask32(SB), NOSPLIT, $0-36
 // 与 32 字节版本逐步骤一致，只是把 64 字节窗口拆成四个 128 位半区，在一次函数
 // 调用内复用同一份查找表与量化常量：32 字节版本每个半窗口都要重做「装载查找表 +
 // 量化 0x0f/0x07/0x08/0x01 + 乘法常量」，宽窗口扫描里这部分是纯重复开销。
-TEXT ·nativeByteSetMask64(SB), NOSPLIT, $0-40
+TEXT ·nativeByteSetMask64(SB), NOSPLIT, $0-24
 	MOVD window+0(FP), R0
-	MOVD tables+24(FP), R1
+	MOVD tables+8(FP), R1
 	MOVD $0x0f, R2
 	VDUP R2, V11.B16
 	MOVD $0x07, R3
@@ -174,5 +174,5 @@ TEXT ·nativeByteSetMask64(SB), NOSPLIT, $0-40
 	ORR R10, R9, R12
 	LSL $48, R12, R12
 	ORR R12, R7, R7
-	MOVD R7, ret+32(FP)
+	MOVD R7, ret+16(FP)
 	RET

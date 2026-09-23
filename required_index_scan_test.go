@@ -328,17 +328,20 @@ func TestRequiredIndexGuardRunWindowOffsets(t *testing.T) {
 // TestRequiredIndexSplitsSingleByteLiterals 验证候选文字按长度拆分后，单字节文字
 // 与多字节文字仍共同产出候选起点，扫描结果与逐起点确认一致。
 func TestRequiredIndexSplitsSingleByteLiterals(t *testing.T) {
-	short, long := splitRequiredLiterals([]hwlm.Literal{
+	single, medium, long := splitRequiredLiterals([]hwlm.Literal{
 		{ID: 1, Value: []byte(":")},
 		{ID: 2, Value: []byte(".go")},
 		{ID: 3, Value: []byte("#")},
 		{ID: 4, Value: []byte("sha256:")},
 	})
-	if len(short) != 2 || short[0].Value[0] != ':' || short[1].Value[0] != '#' {
-		t.Fatalf("单字节分组=%v", short)
+	if len(single) != 2 || single[0].Value[0] != ':' || single[1].Value[0] != '#' {
+		t.Fatalf("单字节分组=%v", single)
 	}
-	if len(long) != 2 || string(long[0].Value) != ".go" || string(long[1].Value) != "sha256:" {
-		t.Fatalf("多字节分组=%v", long)
+	if len(medium) != 1 || string(medium[0].Value) != ".go" {
+		t.Fatalf("短分组=%v", medium)
+	}
+	if len(long) != 1 || string(long[0].Value) != "sha256:" {
+		t.Fatalf("长分组=%v", long)
 	}
 
 	scanner, err := Compile([]Expression{
@@ -508,7 +511,9 @@ func TestSortRequiredStartsMatchesSlicesSort(t *testing.T) {
 		{name: "稀疏起点", keyCount: 20000, dataLen: 1 << 20},
 		{name: "同起点多规则", keyCount: 12000, dataLen: 1024},
 		{name: "超过键上限", keyCount: requiredCountingSortMaxKeys + 1, dataLen: 1 << 20},
-		{name: "超过语料上限", keyCount: 16000, dataLen: requiredCountingSortMaxData + 1},
+		{name: "超出一兆语料", keyCount: 16000, dataLen: (1 << 20) + 1},
+		{name: "十兆语料稀疏起点", keyCount: 16000, dataLen: 10 << 20},
+		{name: "十兆语料密集起点", keyCount: 2000000, dataLen: 10 << 20},
 	}
 	rng := rand.New(rand.NewPCG(0x5deece66d, 0x1234567))
 	scanner := &Scanner{}
@@ -849,11 +854,25 @@ func TestGuardRunStartsRandomizedMatchesScalar(t *testing.T) {
 	const limit = 1 << 20
 
 	for round := 0; round < 3000; round++ {
-		// 随机字节集合：从 256 个取值里抽 1~10 个，覆盖极稀疏与较稠密两类掩码。
+		// 随机字节集合：偶数轮从 256 个取值里抽 1~10 个，覆盖稀疏掩码；奇数轮从
+		// 3~6 个字节的小字母表里取值，构造"窗口内几乎全是成员、连续段只有几个
+		// 字节"的密集掩码——这正是日志语料上的真实形态（单词由分隔符切开），也是
+		// skipPairing 快速路径的主要收益来源。
+		dense := round%2 == 1
 		var set [4]uint64
-		for picked := rng.IntN(10) + 1; picked > 0; picked-- {
-			value := byte(rng.IntN(256))
-			set[value>>6] |= uint64(1) << uint(value&63)
+		var alphabet []byte
+		if !dense {
+			for picked := rng.IntN(10) + 1; picked > 0; picked-- {
+				value := byte(rng.IntN(256))
+				set[value>>6] |= uint64(1) << uint(value&63)
+			}
+		} else {
+			for picked := rng.IntN(4) + 3; picked > 0; picked-- {
+				alphabet = append(alphabet, byte('a'+rng.IntN(6)))
+			}
+			for _, value := range alphabet {
+				set[value>>6] |= uint64(1) << uint(value&63)
+			}
 		}
 		// 随机约束组：1~3 条规则，窗口长度覆盖 1、宽窗口附近与超过宽窗口。
 		runCount := rng.IntN(3) + 1
@@ -879,9 +898,19 @@ func TestGuardRunStartsRandomizedMatchesScalar(t *testing.T) {
 			minLength: minLength,
 		}
 		// 语料长度特意覆盖 0、单个宽窗口内、宽窗口边界与多个宽窗口。
-		size := []int{0, 1, 3, 16, 33, 63, 64, 65, 127, 128, 129, 191, 192, 193, 257}[rng.IntN(15)]
+		size := []int{0, 1, 3, 16, 33, 63, 64, 65, 127, 128, 129, 191, 192, 193, 257, 1024, 4097}[rng.IntN(17)]
 		data := make([]byte, size)
 		for index := range data {
+			if dense {
+				// 密集模式：以 75% 概率取字母表成员、否则取分隔符，制造若干条
+				// 跨越宽窗口边界的"单词"连续段。
+				if rng.IntN(4) != 0 {
+					data[index] = alphabet[rng.IntN(len(alphabet))]
+					continue
+				}
+				data[index] = byte(' ' + rng.IntN(3))
+				continue
+			}
 			if rng.IntN(3) == 0 {
 				// 提高集合成员占比，制造长度落在最短窗口上下的连续段。
 				for {

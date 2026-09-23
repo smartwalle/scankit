@@ -108,7 +108,7 @@ func TestNativeByteSetMask64CoversAllValues(t *testing.T) {
 			if raw[b/64]&(1<<uint(b%64)) != 0 {
 				want = ^uint64(0)
 			}
-			if got := nativeByteSetMask64(window, set.TableVector()); got != want {
+			if got := nativeByteSetMask64(&window[0], set.TableVector()); got != want {
 				t.Fatalf("raw=%v byte=%d got=%064b want=%064b", raw, b, got, want)
 			}
 		}
@@ -128,7 +128,7 @@ func TestNativeByteSetMask64PinsBitOrder(t *testing.T) {
 			}
 			window[lane] = byte(b)
 			want := uint64(1) << uint(lane)
-			if got := nativeByteSetMask64(window, set.TableVector()); got != want {
+			if got := nativeByteSetMask64(&window[0], set.TableVector()); got != want {
 				t.Fatalf("byte=%d lane=%d got=%064b want=%064b", b, lane, got, want)
 			}
 		}
@@ -151,7 +151,7 @@ func TestNativeByteSetMask64RandomWindows(t *testing.T) {
 				want |= 1 << uint(j)
 			}
 		}
-		if got := nativeByteSetMask64(window, set.TableVector()); got != want {
+		if got := nativeByteSetMask64(&window[0], set.TableVector()); got != want {
 			t.Fatalf("raw=%v window=%v got=%064b want=%064b", raw, window, got, want)
 		}
 	}
@@ -173,7 +173,7 @@ func BenchmarkNativeByteSetMask64(b *testing.B) {
 	b.ReportAllocs()
 	var acc uint64
 	for i := 0; i < b.N; i++ {
-		acc |= nativeByteSetMask64(window, tables)
+		acc |= nativeByteSetMask64(&window[0], tables)
 	}
 	if acc == 0 {
 		b.Fatal("掩码不应全为零")

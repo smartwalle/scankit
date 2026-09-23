@@ -186,10 +186,11 @@ func New(literals []hwlm.Literal) *Matcher {
 	if m.lanes > len(m.laneSets) {
 		m.lanes = len(m.laneSets)
 	}
-	// 扁平索引可用时，候选确认已经退化成一次 8 字节主键比较：多 lane 掩码
-	// 挡下的位置本来也只会付一次哈希查找，省下的确认次数不足以抵消每窗口
-	// 成倍的窗口查表开销，因此固定退回单 lane 首字节掩码。
-	if m.flat != nil {
+	// 8 字节主键下候选确认已经退化成一次主键读取，多 lane 掩码挡下的位置
+	// 本来也只会付一次哈希查找，省下的确认次数不足以抵消每窗口成倍的查表
+	// 开销，因此退回单 lane 首字节掩码；4 字节主键的桶更长、候选密度更高，
+	// 保留多 lane 掩码更划算（实测 10 MB 语料 4 lane 17.7 ms vs 1 lane 27.2 ms）。
+	if m.flat != nil && m.flat.keyBytes >= hwlm.FlatKeyLong {
 		m.lanes = 1
 	}
 	for _, literal := range m.literals {
@@ -287,11 +288,10 @@ func (m *Matcher) FindIntoUnsorted(data []byte, dst []Match) []Match {
 	}
 	out := dst[:0]
 	backend := dispatch.DefaultBackend()
-	if m.flat != nil && m.lanes == 1 {
-		// 扁平索引下候选确认已经退化成一次主键读取，这里直接展开三段扫描，
-		// 省去每条命中都要经过的闭包间接调用与 nil 判定；脚本固定按单 lane
-		// 判定，因此只在 New 已把 lane 数收敛为 1 时走该入口。
-		return m.flat.findInto(out, data, backend, &m.tables, &m.laneSets[0])
+	if m.flat != nil {
+		// 扁平索引下候选确认已经退化成一次定长主键比较，这里直接展开三段扫描，
+		// 省去每条命中都要经过的闭包间接调用与 nil 判定。
+		return m.flat.findInto(out, data, backend, &m.tables, &m.laneSets[0], m.lanes)
 	}
 	folded := m.folded.children()
 	visit := func(from int) {

@@ -38,5 +38,8 @@ func nativeByteSetMask32(window []byte, tables *[32]byte) uint32
 // 与 32 字节版本逐位一致，但在一次调用内处理四个 128 位半区，省掉宽窗口扫描里第二次
 // 调用的查找表装载与常数量化。
 //
+// 首参用 *byte 而不是 []byte：函数只读窗口内容、不需要长度与容量，而切片入参在
+// ABI0 下要额外搬运长度与容量两个字，热路径上每次调用都要多两条存储。
+//
 //go:noescape
-func nativeByteSetMask64(window []byte, tables *[32]byte) uint64
+func nativeByteSetMask64(window *byte, tables *[32]byte) uint64

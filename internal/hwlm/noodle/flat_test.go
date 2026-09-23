@@ -2,44 +2,46 @@ package noodle
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/smartwalle/scankit/internal/hwlm"
 )
 
-// TestFlatEligibleRejectsUnsupportedLiterals 验证扁平索引只接受定长、大小写
-// 敏感的 ASCII 文字，长度低于主键宽度或超过尾部上限时都必须回退前缀树。
+// TestFlatEligibleRejectsUnsupportedLiterals 验证扁平索引的适用范围：只接受
+// 大小写敏感、长度落在 [FlatKeyShort, FlatMaxLiteral] 的文字。最短文字不足
+// 8 字节时退到 4 字节主键，仍有一段更短的文字或超长文字才回退前缀树。
 func TestFlatEligibleRejectsUnsupportedLiterals(t *testing.T) {
 	cases := []struct {
 		name     string
 		literals []hwlm.Literal
-		want     bool
+		want     int
 	}{
-		{name: "empty", literals: nil, want: false},
-		{name: "tooShort", literals: []hwlm.Literal{{ID: 1, Value: []byte("field0=")}}, want: false},
-		{name: "keyLength", literals: []hwlm.Literal{{ID: 1, Value: []byte("field000")}}, want: true},
-		{name: "maxLength", literals: []hwlm.Literal{{ID: 1, Value: []byte("field00000000000")}}, want: true},
-		{name: "tooLong", literals: []hwlm.Literal{{ID: 1, Value: []byte("field000000000000")}}, want: false},
-		{name: "caseless", literals: []hwlm.Literal{{ID: 1, Value: []byte("field000"), CaseInsensitive: true}}, want: false},
+		{name: "empty", literals: nil, want: 0},
+		{name: "tooShort", literals: []hwlm.Literal{{ID: 1, Value: []byte("fie")}}, want: 0},
+		{name: "shortKey", literals: []hwlm.Literal{{ID: 1, Value: []byte("field0=")}}, want: hwlm.FlatKeyShort},
+		{name: "keyLength", literals: []hwlm.Literal{{ID: 1, Value: []byte("field000")}}, want: hwlm.FlatKeyLong},
+		{name: "maxLength", literals: []hwlm.Literal{{ID: 1, Value: []byte("field00000000000")}}, want: hwlm.FlatKeyLong},
+		{name: "tooLong", literals: []hwlm.Literal{{ID: 1, Value: []byte("field000000000000")}}, want: 0},
+		{name: "caseless", literals: []hwlm.Literal{{ID: 1, Value: []byte("field000"), CaseInsensitive: true}}, want: 0},
 		{name: "mixedLengths", literals: []hwlm.Literal{
 			{ID: 1, Value: []byte("field000")},
 			{ID: 2, Value: []byte("field0000000")},
-		}, want: true},
-		{name: "mixedTooShort", literals: []hwlm.Literal{
+		}, want: hwlm.FlatKeyLong},
+		{name: "mixedShortKey", literals: []hwlm.Literal{
 			{ID: 1, Value: []byte("field000")},
 			{ID: 2, Value: []byte("field00")},
-		}, want: false},
+		}, want: hwlm.FlatKeyShort},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := flatEligible(tc.literals); got != tc.want {
-				t.Fatalf("flatEligible = %v, want %v", got, tc.want)
+			if got := hwlm.FlatKeyWidth(tc.literals); got != tc.want {
+				t.Fatalf("FlatKeyWidth = %d, want %d", got, tc.want)
 			}
 			table := newFlatTable(tc.literals)
-			if tc.want != (table != nil) {
-				t.Fatalf("newFlatTable != nil = %v, want %v", table != nil, tc.want)
+			if (tc.want != 0) != (table != nil) {
+				t.Fatalf("newFlatTable != nil = %v, want %v", table != nil, tc.want != 0)
 			}
 		})
 	}
@@ -210,12 +212,99 @@ func TestFlatTableOpenAddressingLoad(t *testing.T) {
 	}
 	for value := range 64 {
 		key := []byte(fmt.Sprintf("field%03d=", value))
-		entries := table.bucket(binary.LittleEndian.Uint64(key[:flatKeyBytes]))
+		entries := table.bucket(table.keyAt(key, 0))
 		if len(entries) == 0 {
 			t.Fatalf("主键 field%03d= 没有命中桶", value)
 		}
 	}
-	if entries := table.bucket(binary.LittleEndian.Uint64([]byte("no-such-"))); len(entries) != 0 {
+	if entries := table.bucket(table.keyAt([]byte("no-such-"), 0)); len(entries) != 0 {
 		t.Fatalf("未知主键命中桶 = %v, want 空", entries)
+	}
+}
+
+// flatShortLiterals 覆盖 4 字节主键路径：最短文字 4 字节，最长 16 字节，
+// 尾部跨越 hi/hi2 两个定长视图。
+func flatShortLiterals() []hwlm.Literal {
+	return []hwlm.Literal{
+		{ID: 1, Value: []byte("abcd")},
+		{ID: 2, Value: []byte("abcd" + "\x00" + "\x01")},
+		{ID: 3, Value: []byte("abcd" + "\x00" + "\x01" + "efghij")},
+		{ID: 4, Value: []byte("abcd" + "\x00" + "\x01" + "efghijkl")},
+		{ID: 5, Value: []byte{0xFF, 0xFE, 0xFD, 0xFC, 0x00, 0x01}},
+		{ID: 6, Value: []byte("abcdzzzzzzzzzzz")},
+	}
+}
+
+// flatShortCorpus 构造同时覆盖共享主键、跨 hi/hi2 尾部比较与缓冲区末尾
+// 不足一个定长窗口的数据。
+func flatShortCorpus() []byte {
+	data := []byte("abcd" + "\x00" + "\x01" + "efghijkl abcd" + "\x00" + "\x01" + "efghij abcd" + "\x00" + "\x01" + " abcd abcdzzzzzzzzzzz ")
+	return append(data, 0xFF, 0xFE, 0xFD, 0xFC, 0x00, 0x01)
+}
+
+// TestFlatShortKeyMatchesNaiveScan 用 4 字节主键覆盖共享主键、跨 hi/hi2 的
+// 尾部比较与缓冲区末尾不足一个定长窗口的回退路径。
+func TestFlatShortKeyMatchesNaiveScan(t *testing.T) {
+	literals := flatShortLiterals()
+	table := newFlatTable(literals)
+	if table == nil {
+		t.Fatal("预期启用扁平索引")
+	}
+	if table.keyBytes != hwlm.FlatKeyShort {
+		t.Fatalf("主键宽度 = %d, want %d", table.keyBytes, hwlm.FlatKeyShort)
+	}
+	data := flatShortCorpus()
+	for from := 0; from < len(data); from++ {
+		got := table.appendMatches(nil, data, from)
+		want := make([]Match, 0, 2)
+		for _, literal := range literals {
+			if bytes.HasPrefix(data[from:], literal.Value) {
+				want = append(want, Match{ID: literal.ID, From: from, To: from + len(literal.Value)})
+			}
+		}
+		if len(got) != len(want) {
+			t.Fatalf("起点 %d 匹配数量 = %d, want %d (%v vs %v)", from, len(got), len(want), got, want)
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("起点 %d 第 %d 个匹配 = %+v, want %+v", from, i, got[i], want[i])
+			}
+		}
+	}
+}
+
+// TestFlatShortKeyMatcherMatchesBruteForce 验证 4 字节主键的匹配器在多 lane
+// 掩码下的候选集合与朴素实现一致。
+func TestFlatShortKeyMatcherMatchesBruteForce(t *testing.T) {
+	m := New(flatShortLiterals())
+	if m.flat == nil {
+		t.Fatal("预期启用扁平索引")
+	}
+	if m.flat.keyBytes != hwlm.FlatKeyShort {
+		t.Fatalf("主键宽度 = %d, want %d", m.flat.keyBytes, hwlm.FlatKeyShort)
+	}
+	if m.Lanes() != hwlm.FlatKeyShort {
+		t.Fatalf("扁平索引下 lane 数 = %d, want %d", m.Lanes(), hwlm.FlatKeyShort)
+	}
+	inputs := [][]byte{
+		nil,
+		[]byte("abcd"),
+		[]byte("abcd" + "\x00" + "\x01"),
+		[]byte("prefix abcd" + "\x00" + "\x01" + "efghijkl suffix"),
+		[]byte("abcd" + "\x00" + "\x01" + "efghi abcd" + "\x00" + "\x01" + "efghij abcd" + "\x00" + "\x01" + "efghijkl"),
+		bytes.Repeat([]byte("abcd"), 32),
+		[]byte(strings.Repeat("x", 70) + "abcd"),
+	}
+	for _, data := range inputs {
+		got := m.Find(data)
+		want := bruteForceMatches(data, m.literals)
+		if len(got) != len(want) {
+			t.Fatalf("输入 %q 候选数量 = %d, want %d (%v vs %v)", data, len(got), len(want), got, want)
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("输入 %q 第 %d 个候选 = %+v, want %+v", data, i, got[i], want[i])
+			}
+		}
 	}
 }

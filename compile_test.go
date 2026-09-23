@@ -239,7 +239,7 @@ func TestLiteralCandidateSelectionExecutesSelectedMatcher(t *testing.T) {
 		count       int
 	}{
 		{"短文字", []Expression{{Id: 1, Pattern: "ab"}, {Id: 2, Pattern: "cd"}}, []byte("ab cd"), "fdr", 2},
-		{"长文字", []Expression{{Id: 1, Pattern: "long-literal"}, {Id: 2, Pattern: "short"}}, []byte("short long-literal"), "teddy", 2},
+		{"长文字", []Expression{{Id: 1, Pattern: "long-literal"}, {Id: 2, Pattern: "short"}}, []byte("short long-literal"), "noodle", 2},
 		{"共享前缀", []Expression{{Id: 1, Pattern: "hero"}, {Id: 2, Pattern: "her"}, {Id: 3, Pattern: "hers"}, {Id: 4, Pattern: "she"}, {Id: 5, Pattern: "his"}}, []byte("hers she his"), "noodle", 4},
 	}
 	for _, tc := range cases {

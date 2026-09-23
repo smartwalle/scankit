@@ -11,8 +11,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/smartwalle/scankit/internal/combination"
 	"github.com/smartwalle/scankit/internal/compiler"
@@ -67,9 +69,14 @@ func normalizeScannerUnicodeProperty(name string) string {
 
 // Scanner 是内存中的不可变编译规则执行计划，可安全地并发扫描，并管理所需的可复用扫描上下文。
 type Scanner struct {
-	contextPool    *sync.Pool
-	roseStatePool  *sync.Pool
-	roseSinglePool *sync.Pool
+	contextPool *sync.Pool
+	// retainedContext 是最近一次扫描结束后留在 Scanner 上的扫描上下文槽位。
+	// sync.Pool 会在任意一次 GC 时被清空，工作集较大的扫描因此会反复重新
+	// 增长同一批缓冲；这里额外保留一个槽位，让顺序扫描在 GC 之后仍能直接
+	// 复用上次的容量。并发扫描时多出来的上下文照旧回到 contextPool。
+	retainedContext *retainedContextSlot
+	roseStatePool   *sync.Pool
+	roseSinglePool  *sync.Pool
 	// canUseRoseInScan 缓存 canUseRoseInScan 的结果，避免每次 Scan 重复遍历。
 	canUseRoseInScan bool
 	rules            []compiledRule
@@ -116,6 +123,17 @@ type Scanner struct {
 	usage         compiler.Usage
 	validationErr error
 	rosePlan      *rose.Program
+}
+
+// retainedContextSlot 是 Scanner 上不参与 GC 清理的扫描上下文槽位。
+//
+// 槽位之所以用指针持有、而不是把 atomic.Pointer 直接内嵌进 Scanner，是为了让
+// Scanner 保持可拷贝：Scanner 的其余字段都是只读执行计划，若干测试会浅拷贝它
+// 构造对照实现（例如关闭候选窗口复用或前缀约束后再比对结果）。槽位本身只是
+// 一份缓存，浅拷贝共享同一槽位不影响语义——取出是原子交换，任何时刻只有一个
+// 持有者。
+type retainedContextSlot struct {
+	ctx atomic.Pointer[scanContext]
 }
 
 type scanContext struct {
@@ -434,7 +452,7 @@ func newScanner(rules []compiledRule) *Scanner {
 			}
 		}
 	}
-	scanner := &Scanner{rules: copyRules, ruleIndex: index, ruleOrder: order, hasCombo: hasCombo, candidateIDs: candidateIDs, literalIDs: literalIDs, indexedRules: indexedRules, exactRules: exactRules, simpleReports: simpleReports, contextPool: &sync.Pool{New: func() any { return &scanContext{Scratch: scratch.New(), Reports: report.New()} }}, roseStatePool: &sync.Pool{New: func() any { return new([]rose.State) }}, roseSinglePool: &sync.Pool{New: func() any { return new(map[uint32]struct{}) }}}
+	scanner := &Scanner{rules: copyRules, ruleIndex: index, ruleOrder: order, hasCombo: hasCombo, candidateIDs: candidateIDs, literalIDs: literalIDs, indexedRules: indexedRules, exactRules: exactRules, simpleReports: simpleReports, retainedContext: &retainedContextSlot{}, contextPool: &sync.Pool{New: func() any { return newScanContext() }}, roseStatePool: &sync.Pool{New: func() any { return new([]rose.State) }}, roseSinglePool: &sync.Pool{New: func() any { return new(map[uint32]struct{}) }}}
 	if len(literals) > 1 {
 		scanner.literalKind, scanner.literalFind, scanner.literalFindInto = newLiteralCandidateFinder(literals)
 	}
@@ -558,16 +576,21 @@ const maxRequiredWindow = 64
 // 命中密集时这一步是候选展开前的固定开销，改用直写的转换循环可让它随
 // 命中数线性摊薄。
 func newRequiredFinder(literals []hwlm.Literal) func([]byte, []requiredHit) []requiredHit {
-	short, long := splitRequiredLiterals(literals)
-	if len(long) == 0 {
+	single, medium, long := splitRequiredLiterals(literals)
+	if len(medium) == 0 && len(long) == 0 {
 		// 全部候选文字都是单字节：此时拆分拿不到任何 lane 收益，通用匹配器
 		// （FDR/Teddy）在稀疏命中语料上的跳过能力反而更好。
 		return newLiteralMatcherFinder(literals)
 	}
-	finders := make([]func([]byte, []requiredHit) []requiredHit, 0, 2)
-	finders = append(finders, newLiteralMatcherFinder(long))
-	if len(short) > 0 {
-		finders = append(finders, newSingleByteFinder(short))
+	finders := make([]func([]byte, []requiredHit) []requiredHit, 0, 3)
+	if len(long) > 0 {
+		finders = append(finders, newLiteralMatcherFinder(long))
+	}
+	if len(medium) > 0 {
+		finders = append(finders, newLiteralMatcherFinder(medium))
+	}
+	if len(single) > 0 {
+		finders = append(finders, newSingleByteFinder(single))
 	}
 	switch len(finders) {
 	case 0:
@@ -584,19 +607,28 @@ func newRequiredFinder(literals []hwlm.Literal) func([]byte, []requiredHit) []re
 	}
 }
 
-// splitRequiredLiterals 把候选文字按长度分成"单字节"与"多字节"两组。候选文字
+// splitRequiredLiterals 把候选文字按长度分成"单字节"、"短"与"长"三组。候选文字
 // 中的单字节成员会把匹配器的最短文字压到 1，候选掩码随之退化成"首字节集合"，
 // 几乎覆盖全部输入字节；拆开之后多字节匹配器可以启用 2 个以上 lane，掩码只保留
 // 连续多字节共同命中的位置。
-func splitRequiredLiterals(literals []hwlm.Literal) (short, long []hwlm.Literal) {
+//
+// 短组（2~3 字节）与长组（不小于 4 字节）再拆一次，是因为二者的最佳后端不同：
+// 长组可以走 4 字节主键的扁平索引，把逐候选确认压成一次定长比较；短组的文字
+// 长度不足主键宽度，只能留在前缀树上。混在一起会把长组拖回前缀树，实测 10 MB
+// 语料上拆开后长组从 21.5 ms 降到 9.2 ms。短组自身的首字节集合很窄，留在
+// 前缀树上代价有限。
+func splitRequiredLiterals(literals []hwlm.Literal) (single, medium, long []hwlm.Literal) {
 	for _, literal := range literals {
-		if len(literal.Value) <= 1 {
-			short = append(short, literal)
-			continue
+		switch length := len(literal.Value); {
+		case length <= 1:
+			single = append(single, literal)
+		case length < hwlm.FlatKeyShort:
+			medium = append(medium, literal)
+		default:
+			long = append(long, literal)
 		}
-		long = append(long, literal)
 	}
-	return short, long
+	return single, medium, long
 }
 
 // newSingleByteFinder 为长度为 1 的候选文字构建专用匹配器：命中判定只取决于当前
@@ -686,7 +718,7 @@ func newLiteralMatcherFinder(literals []hwlm.Literal) func([]byte, []requiredHit
 			buf := pool.Get().(*[]teddy.Match)
 			matches := matcher.FindIntoUnsorted(data, (*buf)[:0])
 			*buf = matches
-			dst = growRequiredHits(dst, len(matches))
+			dst = growRequiredHits(dst, len(dst)+len(matches))
 			for index := range matches {
 				dst = append(dst, requiredHit{slot: int(matches[index].ID) - 1, pos: matches[index].From})
 			}
@@ -703,7 +735,7 @@ func newLiteralMatcherFinder(literals []hwlm.Literal) func([]byte, []requiredHit
 			buf := pool.Get().(*[]fdr.Match)
 			matches := matcher.FindIntoUnsorted(data, (*buf)[:0])
 			*buf = matches
-			dst = growRequiredHits(dst, len(matches))
+			dst = growRequiredHits(dst, len(dst)+len(matches))
 			for index := range matches {
 				dst = append(dst, requiredHit{slot: int(matches[index].ID) - 1, pos: matches[index].From})
 			}
@@ -720,7 +752,7 @@ func newLiteralMatcherFinder(literals []hwlm.Literal) func([]byte, []requiredHit
 			buf := pool.Get().(*[]noodle.Match)
 			matches := matcher.FindIntoUnsorted(data, (*buf)[:0])
 			*buf = matches
-			dst = growRequiredHits(dst, len(matches))
+			dst = growRequiredHits(dst, len(dst)+len(matches))
 			for index := range matches {
 				dst = append(dst, requiredHit{slot: int(matches[index].ID) - 1, pos: matches[index].From})
 			}
@@ -733,12 +765,18 @@ func newLiteralMatcherFinder(literals []hwlm.Literal) func([]byte, []requiredHit
 	}
 }
 
-// growRequiredHits 按本次命中数把目标切片调整到可复用的空切片。
+// growRequiredHits 在追加命中前保证目标切片能容纳 need 条结果。
+//
+// 之前各分支都把目标切片截成 [:0]，只有在"单个匹配器独占输出"时才是等价的：
+// 必须文字索引按文字长度拆成多组后，后一组的空结果会把前一组已经积累的命中
+// 一起清掉，因此这里改成只扩容、不截断，把"清空"留给调用方的初始切片。
 func growRequiredHits(dst []requiredHit, need int) []requiredHit {
 	if cap(dst) < need {
-		return make([]requiredHit, 0, need)
+		grown := make([]requiredHit, len(dst), need)
+		copy(grown, dst)
+		return grown
 	}
-	return dst[:0]
+	return dst
 }
 
 func newLiteralCandidateFinder(literals []hwlm.Literal) (string, func([]byte) []literalCandidate, func([]byte, []literalCandidate) []literalCandidate) {
@@ -1400,6 +1438,64 @@ func (scanner *Scanner) ScanInto(data []byte, matches []Match) ([]Match, error) 
 	return scanner.scanInto(data, matches)
 }
 
+// newScanContext 分配一个全新的扫描上下文。
+func newScanContext() *scanContext {
+	return &scanContext{Scratch: scratch.New(), Reports: report.New()}
+}
+
+// acquireScanContext 取出一个可复用的扫描上下文。优先使用保留槽位，其次才是
+// sync.Pool：保留槽位不参与 GC 清理，顺序调用时缓冲容量可以跨扫描保持。
+func (scanner *Scanner) acquireScanContext() *scanContext {
+	if slot := scanner.retainedContext; slot != nil {
+		if ctx := slot.ctx.Swap(nil); ctx != nil {
+			return ctx
+		}
+	}
+	if scanner.contextPool != nil {
+		if ctx, _ := scanner.contextPool.Get().(*scanContext); ctx != nil {
+			return ctx
+		}
+	}
+	return newScanContext()
+}
+
+// releaseScanContext 归还扫描上下文。保留槽位为空、且工作集没有超出保留上限时
+// 留下当前上下文，否则回退到 sync.Pool；并发扫描多出来的上下文因此仍然可复用，
+// 不会退化成每次重建。
+func (scanner *Scanner) releaseScanContext(ctx *scanContext) {
+	if ctx == nil {
+		return
+	}
+	if slot := scanner.retainedContext; slot != nil && ctx.retainedBytes() <= retainedContextLimit && slot.ctx.CompareAndSwap(nil, ctx) {
+		return
+	}
+	if scanner.contextPool != nil {
+		scanner.contextPool.Put(ctx)
+	}
+}
+
+// retainedContextLimit 是允许留在保留槽位（不参与 GC 回收）的上下文缓冲估算
+// 上限。保留槽位让顺序扫描在 GC 之后仍能直接复用容量，但把超大工作集也钉住会
+// 让长期存活的 Scanner 一直背着上百 MB，因此超过上限的上下文只回到 sync.Pool，
+// 由 GC 在需要时回收。
+const retainedContextLimit = 64 << 20
+
+// retainedBytes 估算上下文里随输入长度线性增长的主要缓冲占用。
+func (ctx *scanContext) retainedBytes() int {
+	var (
+		hit       requiredHit
+		match     Match
+		candidate literalCandidate
+	)
+	return cap(ctx.requiredHits)*int(unsafe.Sizeof(hit)) +
+		cap(ctx.requiredStarts)*int(unsafe.Sizeof(uint64(0))) +
+		cap(ctx.requiredSortScratch)*int(unsafe.Sizeof(uint64(0))) +
+		cap(ctx.requiredStartCounts)*int(unsafe.Sizeof(uint32(0))) +
+		cap(ctx.directMatches)*int(unsafe.Sizeof(match)) +
+		cap(ctx.literalCandidates)*int(unsafe.Sizeof(candidate)) +
+		cap(ctx.ruleMatchBuf)*int(unsafe.Sizeof(int(0)))
+}
+
 func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) {
 	if scanner == nil {
 		return matches, nil
@@ -1472,14 +1568,7 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 	if backendOnly && !requiredDriven && len(scanner.confirmAllRules) == 0 {
 		return matches, nil
 	}
-	pool := scanner.contextPool
-	if pool == nil {
-		pool = &sync.Pool{New: func() any { return &scanContext{Scratch: scratch.New(), Reports: report.New()} }}
-	}
-	ctx, _ := pool.Get().(*scanContext)
-	if ctx == nil {
-		ctx = &scanContext{Scratch: scratch.New(), Reports: report.New()}
-	}
+	ctx := scanner.acquireScanContext()
 	if ctx.Scratch == nil {
 		ctx.Scratch = scratch.New()
 	}
@@ -1529,7 +1618,7 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 			}
 			clear(byRule)
 		}
-		pool.Put(ctx)
+		scanner.releaseScanContext(ctx)
 	}()
 	// 每个起点都必须独立求值，块模式允许同一规则产生重叠命中。
 	blockedUntil := reserveInts(ctx.blockedUntil, len(scanner.rules))
@@ -2467,6 +2556,9 @@ type guardRunWindow struct {
 
 // process 处理一个宽度为 width 的掩码窗口。
 func (window *guardRunWindow) process(off, width int, mask uint64, edgeIn, edgeOut bool) {
+	if window.skipPairing(off, width, mask, edgeOut) {
+		return
+	}
 	beginBits := mask &^ (mask << 1)
 	if edgeIn {
 		beginBits &^= 1
@@ -2498,6 +2590,73 @@ func (window *guardRunWindow) process(off, width int, mask uint64, edgeIn, edgeO
 		}
 		window.emitRange(off+beginBit, off+endBit+1)
 	}
+}
+
+// skipPairing 在没有"长度达标的连续段"时跳过整段配对循环。
+//
+// 配对循环逐段枚举"段起点位/段终点位"，日志语料上绝大多数窗口只有单词长度的
+// 短段，逐段枚举的代价（实测占整次扫描约 21%）几乎全部花在必然会被
+// minLength 判据挡回的迭代上。这里先用一次常数级判定给出同样的结论：
+//
+//  1. 窗口内不存在完全落在窗口里的 minLength 连续成员（必要条件即可，
+//     跨窗口接力的部分由第 2 条覆盖）；
+//  2. 从窗口外接力进来的连续段即使在本窗口结束也够不到 minLength。
+//
+// 两条同时成立时，配对循环既不会展开任何连续段，也不会产出候选，只在
+// 接力状态上留下"窗口尾部是否还有未结束的连续段"这一个副作用，因此这里
+// 直接把它算出来。判定与配对循环逐窗口等价，随机差分测试
+// （TestGuardRunSkipPairingMatchesScalar）以标量实现为参照覆盖该等价性。
+func (window *guardRunWindow) skipPairing(off, width int, mask uint64, edgeOut bool) bool {
+	minLength := window.group.minLength
+	carry := 0
+	if window.runStart >= 0 {
+		carry = off - window.runStart
+	}
+	lead := bits.TrailingZeros64(^mask)
+	if lead > width {
+		lead = width
+	}
+	if carry+lead >= minLength {
+		return false
+	}
+	if hasGuardRun(mask, minLength) {
+		return false
+	}
+	trail := bits.LeadingZeros64(^(mask << uint(64-width)))
+	if trail > width {
+		trail = width
+	}
+	if trail == 0 || !edgeOut {
+		// 段在窗口内结束（或本窗口就是数据尾部）：接力状态清空。
+		window.runStart = -1
+		return true
+	}
+	if carry > 0 && lead == width {
+		// 整个窗口都属于同一条接力段，起点保持不变。
+		return true
+	}
+	window.runStart = off + width - trail
+	return true
+}
+
+// hasGuardRun 判断掩码中是否存在 minLength 个连续的置位（即窗口内完整落下的
+// minLength 长连续段）。判定用倍增位移完成：每步把已覆盖的连续长度从 covered
+// 增加到 covered+shift，循环结束时掩码的置位位恰好是"以该位开头有 minLength
+// 个连续置位"的位置。
+func hasGuardRun(mask uint64, minLength int) bool {
+	covered := 1
+	for covered < minLength {
+		shift := covered
+		if covered+shift > minLength {
+			shift = minLength - covered
+		}
+		mask &= mask >> uint(shift)
+		if mask == 0 {
+			return false
+		}
+		covered += shift
+	}
+	return mask != 0
 }
 
 // close 结束跨窗口接力的连续段。
@@ -2556,17 +2715,20 @@ func (group *guardRunGroup) appendStartsScalar(data []byte, starts []uint64, lim
 // 数量时改为按实际命中增长，避免稀疏语料按候选数量预留大块内存。
 const directMatchPrealloc = 1 << 16
 
-// 候选起点线性排序的启用门槛：起点计数表按语料长度线性增长，语料过大时
-// 直接退回比较排序，避免为排序申请成倍于语料的内存。
+// 候选起点线性排序的规模上限。
+//
+// 候选数低于 requiredCountingSortMin 时比较排序的常数更小，直接退回比较排序；
+// 高于 requiredCountingSortMaxKeys 时暂存区已经超过与候选起点缓冲同量级的内存
+// 预算，同样退回比较排序。计数表另受 requiredCountingSortMaxBuckets 限制，
+// 桶跨度按候选密度自适应放大，因此语料再长也不会让计数表跟着语料长度增长。
 const (
-	requiredCountingSortMin     = 8192
-	requiredCountingSortMaxKeys = 1 << 21
-	requiredCountingSortMaxData = 1 << 20
+	requiredCountingSortMin        = 8192
+	requiredCountingSortMaxKeys    = 1 << 22
+	requiredCountingSortMaxBuckets = 1 << 21
+	// requiredBucketSortCutoff 是桶内改用比较排序的规模门槛：候选数超过桶数
+	// 上限（平均每桶超过一两个候选）时，桶内插入排序的平方代价不再划算。
+	requiredBucketSortCutoff = 24
 )
-
-// requiredBucketMaxShift 限制候选分桶排序的桶跨度。桶跨度按候选密度自适应：
-// 目标是每个桶平均不超过两个候选，桶内再用插入排序恢复完整顺序。
-const requiredBucketMaxShift = 16
 
 // sortRequiredStarts 把候选键按 (起点, 规则下标) 升序整理。
 // 候选先按 "起点 >> shift" 分桶，桶内元素数量接近常数，再用插入排序恢复
@@ -2574,7 +2736,7 @@ const requiredBucketMaxShift = 16
 // 一轮直方图和一次全量搬运。任一门槛不满足时退回 slices.Sort。
 func (scanner *Scanner) sortRequiredStarts(ctx *scanContext, starts []uint64, dataLen int) {
 	keyCount := len(starts)
-	if keyCount < requiredCountingSortMin || keyCount > requiredCountingSortMaxKeys || dataLen > requiredCountingSortMaxData {
+	if keyCount < requiredCountingSortMin || keyCount > requiredCountingSortMaxKeys || dataLen <= 0 {
 		slices.Sort(starts)
 		return
 	}
@@ -2584,8 +2746,15 @@ func (scanner *Scanner) sortRequiredStarts(ctx *scanContext, starts []uint64, da
 		ctx.requiredSortScratch = ctx.requiredSortScratch[:keyCount]
 	}
 	scratch := ctx.requiredSortScratch
+	// 桶数目标先取候选数（平均每桶一到两个候选，桶内插入排序摊到常数代价），
+	// 再受计数表内存上限约束。语料越长桶跨度越大，桶数始终不超过目标值，
+	// 所以计数表规模只跟候选数走，不会随语料长度线性增长。
+	target := keyCount
+	if target > requiredCountingSortMaxBuckets {
+		target = requiredCountingSortMaxBuckets
+	}
 	shift := 0
-	for shift < requiredBucketMaxShift && dataLen>>(shift+1) > keyCount/2 {
+	for dataLen>>(shift+1) > target/2 {
 		shift++
 	}
 	buckets := dataLen>>shift + 2
@@ -2605,11 +2774,17 @@ func (scanner *Scanner) sortRequiredStarts(ctx *scanContext, starts []uint64, da
 		scratch[counts[bucket]] = key
 		counts[bucket]++
 	}
-	// 每个桶覆盖至多 2^shift 个相邻起点，桶内按完整键插入排序即可得到
-	// (起点, 规则下标) 升序；桶内元素数量接近常数，这一步是线性代价。
+	// 每个桶覆盖至多 2^shift 个相邻起点，桶内按完整键排序即可得到
+	// (起点, 规则下标) 升序。桶内元素通常在常数规模以内，插入排序的常数最小；
+	// 候选数超过桶数上限时平均桶长会变大，此时改用比较排序避免平方代价。
 	begin := 0
 	for index := range buckets {
 		end := int(counts[index])
+		if end-begin > requiredBucketSortCutoff {
+			slices.Sort(scratch[begin:end])
+			begin = end
+			continue
+		}
 		for current := begin + 1; current < end; current++ {
 			key := scratch[current]
 			position := current - 1
@@ -2636,7 +2811,9 @@ func sortByCount(counts []uint32) {
 
 // resetRequiredSortBuffer 清空线性排序缓冲，容量过大时直接丢弃。
 func resetRequiredSortBuffer[T any](buffer *[]T) {
-	const maxRetained = 1 << 21
+	// 保留上限与分桶排序的候选数上限对齐：扫描规模在门槛以内时缓冲跨扫描复用，
+	// 超过上限的缓冲立即丢弃，避免长期占住与输入同阶的大块内存。
+	const maxRetained = requiredCountingSortMaxKeys
 	if cap(*buffer) > maxRetained {
 		*buffer = nil
 		return
