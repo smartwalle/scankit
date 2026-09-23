@@ -62,6 +62,20 @@ type planVariant struct {
 	min   int
 	max   int
 	back  []byte
+	// class 表示文字的字节至少有一部分由字符类展开而来（而非字面量）。
+	class bool
+}
+
+// classOnlySingleByte 判断计划是否完全由字符类展开出的单字节候选组成。
+// 只要存在一个多字节候选、或存在一个来自字面量的候选，计划就不属于该形态，
+// 因为这两类候选都能给出与输入内容无关的选择性下界。
+func classOnlySingleByte(variants []planVariant) bool {
+	for _, variant := range variants {
+		if len(variant.value) != 1 || !variant.class {
+			return false
+		}
+	}
+	return len(variants) > 0
 }
 
 type plan struct {
@@ -106,32 +120,77 @@ func sequencePlan(elements []parser.Node) (plan, bool) {
 	var best plan
 	bestScore := math.Inf(-1)
 	found := false
+	// consider 登记一组候选文字，并在候选退化为"完全由字符类展开出的单字节"
+	// 形态时额外尝试左合并：把前序序列末尾必然出现的文字并入候选，升级为多字节
+	// 候选。类中可能包含 `e` 这类高频字节，单字节候选的命中密度与大块输入同阶，
+	// 合并后密度回落到与输入内容无关的水平；两个计划都参与打分，只有总分更高时
+	// 才会替换原候选，其余模式的提取结果保持不变。
+	consider := func(steps []literalStep, min, max int, back []byte, trail []literalStep, trailLen int) {
+		if len(steps) == 0 {
+			return
+		}
+		candidate := plan{variants: make([]planVariant, 0, len(steps))}
+		for _, step := range steps {
+			candidate.variants = append(candidate.variants, planVariant{value: step.value, min: min, max: max, back: back, class: step.class})
+		}
+		if score := planScore(candidate); score > bestScore {
+			best, bestScore, found = candidate, score, true
+		}
+		if !classOnlySingleByte(candidate.variants) {
+			return
+		}
+		if len(trail) == 0 || trailLen <= 0 || min < trailLen || len(trail)*len(steps) > maxVariants {
+			return
+		}
+		mergedMin, mergedMax := min-trailLen, max
+		if mergedMax >= 0 {
+			mergedMax -= trailLen
+		}
+		mergedSeen := make(map[string]struct{}, len(trail)*len(steps))
+		merged := plan{variants: make([]planVariant, 0, len(trail)*len(steps))}
+		for _, tail := range trail {
+			for _, step := range steps {
+				if len(tail.value)+len(step.value) > maxLiteralBytes {
+					return
+				}
+				value := make([]byte, 0, len(tail.value)+len(step.value))
+				value = append(value, tail.value...)
+				value = append(value, step.value...)
+				if _, dup := mergedSeen[string(value)]; dup {
+					continue
+				}
+				mergedSeen[string(value)] = struct{}{}
+				merged.variants = append(merged.variants, planVariant{
+					value: value,
+					min:   mergedMin,
+					max:   mergedMax,
+					back:  back,
+					class: tail.class || step.class,
+				})
+			}
+		}
+		if score := planScore(merged); score > bestScore {
+			best, bestScore, found = merged, score, true
+		}
+	}
 	prefixMin, prefixMax := 0, 0
 	for i := 0; i <= len(elements); i++ {
 		// 前缀无上界时只有在能靠 Back 集合把起点收缩到有限位置时才可用。
 		back := backByteSet(elements[:i])
 		if prefixMax >= 0 || back != nil {
+			trail, trailLen, trailOK := trailingUniform(elements[:i])
+			if !trailOK {
+				trail, trailLen = nil, 0
+			}
 			for _, variants := range expandSuffixSteps(elements[i:]) {
-				candidate := plan{variants: make([]planVariant, 0, len(variants))}
-				for _, value := range variants {
-					candidate.variants = append(candidate.variants, planVariant{value: value, min: prefixMin, max: prefixMax, back: back})
-				}
-				if score := planScore(candidate); score > bestScore {
-					best, bestScore, found = candidate, score, true
-				}
+				consider(variants, prefixMin, prefixMax, back, trail, trailLen)
 			}
 			// 后续元素无法完整展开时（例如 `[0-9]{8}-[0-9]{4}` 这类长重复），
 			// 逐单位拼接会提前中断；此处至少取该元素起点处必然出现的文字，
 			// 让 `-`、`:` 这类固定分隔符仍能作为高选择性候选。
 			if i < len(elements) {
-				if variants, ok := leadingLiterals(elements[i]); ok && len(variants) > 0 {
-					candidate := plan{variants: make([]planVariant, 0, len(variants))}
-					for _, value := range variants {
-						candidate.variants = append(candidate.variants, planVariant{value: value, min: prefixMin, max: prefixMax, back: back})
-					}
-					if score := planScore(candidate); score > bestScore {
-						best, bestScore, found = candidate, score, true
-					}
+				if steps, ok := leadingLiterals(elements[i]); ok && len(steps) > 0 {
+					consider(steps, prefixMin, prefixMax, back, trail, trailLen)
 				}
 			}
 		}
@@ -177,12 +236,20 @@ func planScore(candidate plan) float64 {
 	return float64(len(shortest.value)*8) - math.Log2(count) - 0.25*count - 0.5*math.Log2(float64(window))
 }
 
+// literalStep 是一个候选文字，并携带该文字是否由字符类展开而来。
+// 单字节且来自字符类的候选（如 `[eE]` 展开出的 `e`、`E`）不具备稳定
+// 选择性，调用方据此触发左合并把它升级为多字节候选。
+type literalStep struct {
+	value []byte
+	class bool
+}
+
 // expandSuffixSteps 返回序列后缀逐单位展开后的累积前缀文字集合。
 // 每个元素内部的固定次数重复会逐轮暴露，便于调用方在“更长的文字”与
 // “更多变体”之间取舍。元素未能完整展开时立即停止，避免把只成立在部分
 // 重复上的前缀与后续元素拼接成并不必然出现的文字。
-func expandSuffixSteps(elements []parser.Node) [][][]byte {
-	acc := [][][]byte{{{}}}
+func expandSuffixSteps(elements []parser.Node) [][]literalStep {
+	acc := [][]literalStep{{{}}}
 	for _, element := range elements {
 		steps, complete := expandPrefixSteps(element)
 		if len(steps) == 0 {
@@ -202,7 +269,7 @@ func expandSuffixSteps(elements []parser.Node) [][][]byte {
 			break
 		}
 	}
-	out := make([][][]byte, 0, len(acc))
+	out := make([][]literalStep, 0, len(acc))
 	for _, step := range acc {
 		cleaned := nonEmpty(step)
 		if len(cleaned) > 0 {
@@ -216,12 +283,12 @@ func expandSuffixSteps(elements []parser.Node) [][][]byte {
 // 以及这些步骤是否已覆盖节点的最小宽度。返回 nil 表示该节点无法展开为
 // 任何文字前缀；complete 为 false 表示最后一个步骤只是部分前缀，调用方
 // 只能把它当作候选文字使用，不能继续拼接后续元素。
-func expandPrefixSteps(n parser.Node) ([][][]byte, bool) {
+func expandPrefixSteps(n parser.Node) ([][]literalStep, bool) {
 	switch v := n.(type) {
 	case parser.Group:
 		return expandPrefixSteps(v.Child)
 	case parser.Sequence:
-		acc := [][][]byte{{{}}}
+		acc := [][]literalStep{{{}}}
 		for _, element := range v.Elements {
 			steps, complete := expandPrefixSteps(element)
 			if len(steps) == 0 {
@@ -244,26 +311,26 @@ func expandPrefixSteps(n parser.Node) ([][][]byte, bool) {
 		return expandRepeatSteps(v)
 	case parser.Literal:
 		if len(v.Value) == 0 {
-			return [][][]byte{{{}}}, true
+			return [][]literalStep{{{}}}, true
 		}
-		return [][][]byte{{v.Value}}, true
+		return [][]literalStep{{{value: v.Value}}}, true
 	case parser.Class:
 		bytes, ok := classBytes(v)
 		if !ok {
 			return nil, false
 		}
-		out := make([][]byte, 0, len(bytes))
+		out := make([]literalStep, 0, len(bytes))
 		for _, b := range bytes {
-			out = append(out, []byte{b})
+			out = append(out, literalStep{value: []byte{b}, class: true})
 		}
-		return [][][]byte{out}, true
+		return [][]literalStep{out}, true
 	case parser.Assertion, parser.ControlVerb, parser.Lookaround:
-		return [][][]byte{{{}}}, true
+		return [][]literalStep{{{}}}, true
 	case parser.Alternation:
 		if len(v.Options) == 0 {
 			return nil, false
 		}
-		optionSteps := make([][][][]byte, 0, len(v.Options))
+		optionSteps := make([][][]literalStep, 0, len(v.Options))
 		longest := 0
 		complete := true
 		for _, option := range v.Options {
@@ -279,9 +346,9 @@ func expandPrefixSteps(n parser.Node) ([][][]byte, bool) {
 				longest = len(steps)
 			}
 		}
-		out := make([][][]byte, 0, longest)
+		out := make([][]literalStep, 0, longest)
 		for step := 0; step < longest; step++ {
-			union := make([][]byte, 0)
+			union := make([]literalStep, 0)
 			for _, steps := range optionSteps {
 				index := step
 				if index >= len(steps) {
@@ -300,10 +367,10 @@ func expandPrefixSteps(n parser.Node) ([][][]byte, bool) {
 	}
 }
 
-func expandRepeatSteps(v parser.Repeat) ([][][]byte, bool) {
+func expandRepeatSteps(v parser.Repeat) ([][]literalStep, bool) {
 	switch {
 	case v.Min == 0 && v.Max == 0:
-		return [][][]byte{{{}}}, true
+		return [][]literalStep{{{}}}, true
 	case v.Min < 1 || v.Max < 0:
 		return nil, false
 	}
@@ -311,7 +378,7 @@ func expandRepeatSteps(v parser.Repeat) ([][][]byte, bool) {
 	if len(child) == 0 {
 		return nil, false
 	}
-	steps := [][][]byte{{{}}}
+	steps := [][]literalStep{{{}}}
 	reachedMin := true
 	for range v.Min {
 		product, ok := crossProduct(steps[len(steps)-1], child)
@@ -334,7 +401,7 @@ func expandRepeatSteps(v parser.Repeat) ([][][]byte, bool) {
 // sequencePlan 用它补上"后续元素无法完整展开"时的候选：`[0-9]{8}-[0-9]{4}` 这类
 // 长重复无法逐字节拼接，但分隔符 `-` 一定出现在固定偏移处，是比单字节类成员更
 // 高选择性的候选。
-func leadingLiterals(n parser.Node) ([][]byte, bool) {
+func leadingLiterals(n parser.Node) ([]literalStep, bool) {
 	switch v := n.(type) {
 	case parser.Group:
 		return leadingLiterals(v.Child)
@@ -342,15 +409,15 @@ func leadingLiterals(n parser.Node) ([][]byte, bool) {
 		if len(v.Value) == 0 {
 			return nil, false
 		}
-		return [][]byte{v.Value}, true
+		return []literalStep{{value: v.Value}}, true
 	case parser.Class:
 		bytes, ok := classBytes(v)
 		if !ok || len(bytes) == 0 || len(bytes) > maxVariants {
 			return nil, false
 		}
-		out := make([][]byte, 0, len(bytes))
+		out := make([]literalStep, 0, len(bytes))
 		for _, b := range bytes {
-			out = append(out, []byte{b})
+			out = append(out, literalStep{value: []byte{b}, class: true})
 		}
 		return out, true
 	case parser.Sequence:
@@ -370,13 +437,149 @@ func leadingLiterals(n parser.Node) ([][]byte, bool) {
 		if len(v.Options) == 0 {
 			return nil, false
 		}
-		out := make([][]byte, 0, len(v.Options))
+		out := make([]literalStep, 0, len(v.Options))
 		for _, option := range v.Options {
 			part, ok := leadingLiterals(option)
 			if !ok || len(out)+len(part) > maxVariants {
 				return nil, false
 			}
 			out = append(out, part...)
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+// maxTrailingBytes 限制左合并时从前序序列末尾截取的字节数。截取得越长，
+// 合并后的候选越具选择性，但与前缀候选的笛卡尔积也会同步放大。
+const maxTrailingBytes = 4
+
+// trailingUniform 返回元素序列末尾必然出现的候选文字集合，并要求集合内所有
+// 文字长度一致：只有长度一致才能把合并后的偏移窗口整体左移同一距离。返回
+// ok 为 false 表示序列为空、末尾无法保证任何文字，或候选长度不一致。
+func trailingUniform(elements []parser.Node) ([]literalStep, int, bool) {
+	if len(elements) == 0 {
+		return nil, 0, false
+	}
+	steps, ok := trailingLiterals(elements)
+	if !ok || len(steps) == 0 {
+		return nil, 0, false
+	}
+	// 末尾候选按分支取并集，同一文字可能被多条分支重复贡献；去重后变体数量
+	// 才反映真实候选规模，也避免重复变体压低打分。
+	steps = dedupLiteralSteps(steps)
+	length := len(steps[0].value)
+	for _, step := range steps {
+		if len(step.value) != length {
+			return nil, 0, false
+		}
+	}
+	return steps, length, true
+}
+
+// dedupLiteralSteps 按文字内容去重，保留首次出现的顺序。
+func dedupLiteralSteps(steps []literalStep) []literalStep {
+	if len(steps) < 2 {
+		return steps
+	}
+	seen := make(map[string]struct{}, len(steps))
+	out := steps[:0]
+	for _, step := range steps {
+		key := string(step.value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, step)
+	}
+	return out
+}
+
+// trailingLiterals 返回元素序列末尾必然出现的候选文字集合：每个文字都一定出现
+// 在序列最后消费的字节处，集合本身是"或"关系。
+//
+// 末尾可空元素会让末尾字节有两条来源——它自己非空匹配时的尾部，或者它空匹配时
+// 由更早元素决定的尾部；两条分支的候选都要并入集合，否则会漏掉其中一类匹配。
+// 序列整体可空且找不到任何必现字节时返回 ok 为 false。
+func trailingLiterals(elements []parser.Node) ([]literalStep, bool) {
+	var out []literalStep
+	for index := len(elements) - 1; index >= 0; index-- {
+		element := elements[index]
+		if zeroWidthNode(element) {
+			// 零宽结构不消费字节，也不影响末尾字节来自哪个元素。
+			continue
+		}
+		// 该元素非空匹配时贡献的末尾候选；空匹配时末尾字节由更早元素决定，
+		// 因此无论它是否可空都要先把这部分并进来。
+		if steps, ok := trailingLiteralsOfNode(element); ok && len(steps) > 0 {
+			out = append(out, steps...)
+			if len(out) > maxVariants {
+				return nil, false
+			}
+		}
+		if !parser.Nullable(element) {
+			return out, len(out) > 0
+		}
+	}
+	return out, len(out) > 0
+}
+
+// trailingLiteralsOfNode 返回单个节点在消费至少一个字节时的末尾候选文字集合。
+// 节点只能匹配空串时返回 ok 为 false。
+func trailingLiteralsOfNode(n parser.Node) ([]literalStep, bool) {
+	switch v := n.(type) {
+	case parser.Group:
+		return trailingLiteralsOfNode(v.Child)
+	case parser.Sequence:
+		return trailingLiterals(v.Elements)
+	case parser.Repeat:
+		// 可空子节点会让最后一次重复可能整个为空，末尾字节随之前移到更早的
+		// 迭代，静态推导无法穷举，直接放弃。
+		if parser.Nullable(v.Child) {
+			return nil, false
+		}
+		if v.Max == 0 {
+			return nil, false
+		}
+		return trailingLiteralsOfNode(v.Child)
+	case parser.Literal:
+		if len(v.Value) == 0 {
+			return nil, false
+		}
+		value := v.Value
+		if len(value) > maxTrailingBytes {
+			value = value[len(value)-maxTrailingBytes:]
+		}
+		return []literalStep{{value: value}}, true
+	case parser.Class:
+		bytes, ok := classBytes(v)
+		if !ok || len(bytes) == 0 || len(bytes) > maxVariants {
+			return nil, false
+		}
+		out := make([]literalStep, 0, len(bytes))
+		for _, b := range bytes {
+			out = append(out, literalStep{value: []byte{b}, class: true})
+		}
+		return out, true
+	case parser.Alternation:
+		if len(v.Options) == 0 {
+			return nil, false
+		}
+		out := make([]literalStep, 0, len(v.Options))
+		for _, option := range v.Options {
+			part, ok := trailingLiteralsOfNode(option)
+			if !ok || len(part) == 0 {
+				// 可空分支的末尾字节由更早元素决定，无法在节点内部封闭推导。
+				continue
+			}
+			if len(out)+len(part) > maxVariants {
+				return nil, false
+			}
+			out = append(out, part...)
+		}
+		if len(out) == 0 {
+			return nil, false
 		}
 		return out, true
 	default:
@@ -422,7 +625,7 @@ func fixedWidth(n parser.Node) bool {
 }
 
 // mustPrefix 返回节点最小宽度对应的完整前缀文字集合；节点无法完整展开时返回 nil。
-func mustPrefix(n parser.Node) [][]byte {
+func mustPrefix(n parser.Node) []literalStep {
 	steps, complete := expandPrefixSteps(n)
 	if len(steps) == 0 || !complete {
 		return nil
@@ -430,33 +633,33 @@ func mustPrefix(n parser.Node) [][]byte {
 	return steps[len(steps)-1]
 }
 
-func nonEmpty(variants [][]byte) [][]byte {
-	out := make([][]byte, 0, len(variants))
-	for _, value := range variants {
-		if len(value) > 0 {
-			out = append(out, value)
+func nonEmpty(variants []literalStep) []literalStep {
+	out := make([]literalStep, 0, len(variants))
+	for _, step := range variants {
+		if len(step.value) > 0 {
+			out = append(out, step)
 		}
 	}
 	return out
 }
 
-func crossProduct(left, right [][]byte) ([][]byte, bool) {
+func crossProduct(left, right []literalStep) ([]literalStep, bool) {
 	if len(left) == 0 || len(right) == 0 {
 		return nil, false
 	}
 	if len(left)*len(right) > maxVariants {
 		return nil, false
 	}
-	out := make([][]byte, 0, len(left)*len(right))
+	out := make([]literalStep, 0, len(left)*len(right))
 	for _, a := range left {
 		for _, b := range right {
-			if len(a)+len(b) > maxLiteralBytes {
+			if len(a.value)+len(b.value) > maxLiteralBytes {
 				return nil, false
 			}
-			value := make([]byte, 0, len(a)+len(b))
-			value = append(value, a...)
-			value = append(value, b...)
-			out = append(out, value)
+			value := make([]byte, 0, len(a.value)+len(b.value))
+			value = append(value, a.value...)
+			value = append(value, b.value...)
+			out = append(out, literalStep{value: value, class: a.class || b.class})
 		}
 	}
 	return out, true

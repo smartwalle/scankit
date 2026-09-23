@@ -110,6 +110,9 @@ type Scanner struct {
 	// confirmUncoveredRules 与 confirmAllRules。
 	startBytes    *startByteIndex
 	startBytesAll *startByteIndex
+	// hasCollapse 表示至少一条规则具备可复用的确认窗口，扫描期需要为
+	// collapseWindows 预留按规则下标的缓存。
+	hasCollapse   bool
 	usage         compiler.Usage
 	validationErr error
 	rosePlan      *rose.Program
@@ -142,6 +145,17 @@ type scanContext struct {
 	confirmStack []confirmFrame
 	// directMatches 复用 simpleReports 模式下的直接结果切片。
 	directMatches []Match
+	// collapseWindows 按规则下标缓存「起点无关窗口」：窗口内的候选起点共享
+	// 同一次确认程序求值结果，避免为同一次文字命中的每个起点重复执行确认。
+	collapseWindows []collapseWindow
+}
+
+// collapseWindow 是一条规则最近一次确认程序求值覆盖的起点区间及其结果。
+// to < from 表示缓存无效。
+type collapseWindow struct {
+	from int
+	to   int
+	end  int
 }
 
 // guardRun 是由前缀字节约束直接派生的候选起点来源：约束在 [offset, offset+length)
@@ -166,6 +180,11 @@ type guardRunGroup struct {
 	// runs 按窗口长度升序排列：连续段短于某条规则的窗口时，后面的规则窗口
 	// 只会更长，展开可以直接结束。
 	runs []guardRun
+	// minLength 是组内最短的约束窗口长度（runs[0].length）。连续段长度不足它
+	// 时整组都不可能成立，扫描期直接跳过该段，省掉一次展开调用。日志语料里
+	// 绝大多数连续段远短于窗口长度（时间戳被 '-'、':' 切成 2~4 位数字段），
+	// 「先比长度再展开」把这一部分开销从每次调用压到一次整数比较。
+	minLength int
 }
 
 // member 判断字节是否属于该组的约束集合。只有不足一个宽窗口的尾部和跨窗口边界
@@ -196,6 +215,44 @@ const guardRunPromoteCardinality = 24
 // 字节都必须落在集合内，命中密度随长度指数下降，长度足够时即使集合很宽也比逐字节
 // 候选文字稀疏：`[A-Za-z0-9+/]{20,}` 要连续 20 个 base64 字符才算候选。
 const guardRunPromoteLongWindow = 16
+
+// 扫描期缓冲的池内保留策略：容量不超过绝对上限即留在池中跨扫描复用。
+// 缓冲容量由输入内容决定，释放一次就得在下一次同等规模的扫描里重新 grow，
+// 累计分配可达数据量的数倍（§21.6）。因此判据只看绝对上限，不随本次输入长度
+// 缩放：按输入长度缩放会让"大输入 → 小输入 → 大输入"的交替负载每次都重新 grow，
+// 实测单次大扫描多分配 147 MB（§26.2）。绝对上限兜住异常大的缓冲，
+// sync.Pool 又会在 GC 时清空池，长期驻留由两者共同约束。
+const (
+	requiredStartsRetainLimit = 1 << 22
+	literalMatchesRetainLimit = 1 << 22
+	requiredHitsRetainLimit   = 1 << 22
+	directMatchesRetainLimit  = 1 << 22
+)
+
+// retainBuffer 是保留判据本身：容量不超过绝对上限即保留。
+func retainBuffer(capacity, limit int) bool {
+	return capacity <= limit
+}
+
+// retainRequiredStarts 判断候选起点缓冲能否留在池中跨扫描复用。
+func retainRequiredStarts(capacity int) bool {
+	return retainBuffer(capacity, requiredStartsRetainLimit)
+}
+
+// retainLiteralMatches 判断文字匹配缓冲能否留在池中跨扫描复用。
+func retainLiteralMatches(capacity int) bool {
+	return retainBuffer(capacity, literalMatchesRetainLimit)
+}
+
+// retainRequiredHits 判断候选文字命中缓冲能否留在池中跨扫描复用。
+func retainRequiredHits(capacity int) bool {
+	return retainBuffer(capacity, requiredHitsRetainLimit)
+}
+
+// retainDirectMatches 判断直接结果缓冲能否留在池中跨扫描复用。
+func retainDirectMatches(capacity int) bool {
+	return retainBuffer(capacity, directMatchesRetainLimit)
+}
 
 // requiredHit 是一次候选文字命中：编号来自 requiredLiterals 的序号加一。
 type requiredHit struct {
@@ -283,6 +340,20 @@ type compiledRule struct {
 	// confirmSkip 为 0 时从规则入口正常确认。
 	confirmEntry int32
 	confirmSkip  int
+	// collapseHead 非空表示确认程序入口是一条与候选窗口一一对应的集合重复。
+	// 此时同一次文字命中摊开的全部候选起点会让重复停在同一位置，重复之后的
+	// 程序与起点无关，确认结果可以在窗口内复用（见 collapseHead）。
+	collapseHead *collapseHead
+}
+
+// collapseHead 描述确认程序入口处的集合重复：重复集合等于候选窗口左侧的回退
+// 集合、上下界等于窗口上下界，且入口文字首字节不属于该集合。满足这些条件时，
+// 从窗口内任意起点出发，重复都会消费到同一个非集合字节（入口文字命中位置），
+// 之后的程序完全相同，因此同一次文字命中派生出的候选起点共享同一个确认结果。
+type collapseHead struct {
+	set *confirmByteSet
+	min int
+	max int
 }
 
 func newScanner(rules []compiledRule) *Scanner {
@@ -310,6 +381,7 @@ func newScanner(rules []compiledRule) *Scanner {
 						copyRules[i].confirmSkip = len(literal)
 					}
 				}
+				copyRules[i].collapseHead = newCollapseHead(copyRules[i])
 			}
 		}
 	}
@@ -369,6 +441,9 @@ func newScanner(rules []compiledRule) *Scanner {
 	// 无法提取必须文字的规则本来只能逐起点确认；当前缀字节约束能枚举起点时
 	// 改由约束驱动，省掉整块逐起点循环。改由约束枚举的规则不再登记候选文字，
 	// 避免同一规则同时走两条候选来源、在同一批命中上重复展开窗口。
+	for i := range copyRules {
+		scanner.hasCollapse = scanner.hasCollapse || copyRules[i].collapseHead != nil
+	}
 	scanner.guardRunCovered = guardRunCandidates(copyRules)
 	scanner.requiredLiterals, scanner.requiredFindInto, scanner.requiredCovered = buildRequiredIndex(copyRules, scanner.guardRunCovered)
 	scanner.fastLiteral = !scanner.hasCombo && len(copyRules) > 1 &&
@@ -526,17 +601,45 @@ func splitRequiredLiterals(literals []hwlm.Literal) (short, long []hwlm.Literal)
 
 // newSingleByteFinder 为长度为 1 的候选文字构建专用匹配器：命中判定只取决于当前
 // 字节，因此用一次 SIMD 字节集合扫描求出全部命中位置，再用 256 项查表换算成
-// 候选编号，省掉通用匹配器的分桶确认。
+// 候选编号，省掉通用匹配器的分桶确认。候选文字很少时改用逐文字 memchr，成本随
+// 文字数线性增长而常数远小于集合扫描；命中顺序不参与后续语义，两种策略可以互换。
 func newSingleByteFinder(literals []hwlm.Literal) func([]byte, []requiredHit) []requiredHit {
 	var table [256]uint32
 	var set [4]uint64
+	values := make([]byte, 0, len(literals))
 	for _, literal := range literals {
 		if len(literal.Value) == 0 {
 			continue
 		}
 		value := literal.Value[0]
+		if table[value] == 0 {
+			values = append(values, value)
+		}
 		table[value] = literal.ID
 		set[value>>6] |= uint64(1) << uint(value&63)
+	}
+	// 候选文字很少时逐文字调用 memchr 明显更省：字节集合扫描每个 64 字节窗口
+	// 都要付一次半字节查表与常数量化的固定成本，而 memchr 在稀疏字节上快近一个
+	// 数量级。实测 26 KB 日志语料上两个单字节文字分别约 1.2 µs 与 3.1 µs，
+	// 成本交点落在 4 个文字附近，因此只有超过阈值才走集合扫描。
+	if len(values) <= singleByteFinderMemchrLimit {
+		scanned := make([]singleByteScan, 0, len(values))
+		for _, value := range values {
+			scanned = append(scanned, singleByteScan{value: value, slot: int(table[value]) - 1})
+		}
+		return func(data []byte, dst []requiredHit) []requiredHit {
+			for _, literal := range scanned {
+				for off := 0; off < len(data); {
+					index := bytes.IndexByte(data[off:], literal.value)
+					if index < 0 {
+						break
+					}
+					dst = append(dst, requiredHit{slot: literal.slot, pos: off + index})
+					off += index + 1
+				}
+			}
+			return dst
+		}
 	}
 	tables := simd.NewByteSetTables([4][4]uint64{set})
 	return func(data []byte, dst []requiredHit) []requiredHit {
@@ -564,6 +667,15 @@ func newSingleByteFinder(literals []hwlm.Literal) func([]byte, []requiredHit) []
 	}
 }
 
+// singleByteFinderMemchrLimit 是改用逐文字 memchr 的单字节候选文字数量上限。
+const singleByteFinderMemchrLimit = 4
+
+// singleByteScan 保存一次 memchr 扫描所需的文字字节与候选编号。
+type singleByteScan struct {
+	value byte
+	slot  int
+}
+
 // newLiteralMatcherFinder 为全部长度不小于 2 的候选文字选择具体匹配后端。
 func newLiteralMatcherFinder(literals []hwlm.Literal) func([]byte, []requiredHit) []requiredHit {
 	switch hwlm.Select(literals) {
@@ -578,7 +690,7 @@ func newLiteralMatcherFinder(literals []hwlm.Literal) func([]byte, []requiredHit
 			for index := range matches {
 				dst = append(dst, requiredHit{slot: int(matches[index].ID) - 1, pos: matches[index].From})
 			}
-			if cap(matches) > 1<<20 {
+			if !retainLiteralMatches(cap(matches)) {
 				*buf = nil
 			}
 			pool.Put(buf)
@@ -595,7 +707,7 @@ func newLiteralMatcherFinder(literals []hwlm.Literal) func([]byte, []requiredHit
 			for index := range matches {
 				dst = append(dst, requiredHit{slot: int(matches[index].ID) - 1, pos: matches[index].From})
 			}
-			if cap(matches) > 1<<20 {
+			if !retainLiteralMatches(cap(matches)) {
 				*buf = nil
 			}
 			pool.Put(buf)
@@ -612,7 +724,7 @@ func newLiteralMatcherFinder(literals []hwlm.Literal) func([]byte, []requiredHit
 			for index := range matches {
 				dst = append(dst, requiredHit{slot: int(matches[index].ID) - 1, pos: matches[index].From})
 			}
-			if cap(matches) > 1<<20 {
+			if !retainLiteralMatches(cap(matches)) {
 				*buf = nil
 			}
 			pool.Put(buf)
@@ -646,7 +758,7 @@ func newLiteralCandidateFinder(literals []hwlm.Literal) (string, func([]byte) []
 			for _, match := range matches {
 				out = append(out, literalCandidate{ID: match.ID, From: match.From, To: match.To})
 			}
-			if cap(matches) > 1<<20 {
+			if !retainLiteralMatches(cap(matches)) {
 				*mp = nil
 			}
 			matchPool.Put(mp)
@@ -667,7 +779,7 @@ func newLiteralCandidateFinder(literals []hwlm.Literal) (string, func([]byte) []
 			for _, match := range matches {
 				out = append(out, literalCandidate{ID: match.ID, From: match.From, To: match.To})
 			}
-			if cap(matches) > 1<<20 {
+			if !retainLiteralMatches(cap(matches)) {
 				*mp = nil
 			}
 			matchPool.Put(mp)
@@ -688,7 +800,7 @@ func newLiteralCandidateFinder(literals []hwlm.Literal) (string, func([]byte) []
 			for _, match := range matches {
 				out = append(out, literalCandidate{ID: match.ID, From: match.From, To: match.To})
 			}
-			if cap(matches) > 1<<20 {
+			if !retainLiteralMatches(cap(matches)) {
 				*mp = nil
 			}
 			matchPool.Put(mp)
@@ -1384,15 +1496,20 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 		ctx.comboTriggers = ctx.comboTriggers[:0]
 		ctx.literalCandidates = ctx.literalCandidates[:0]
 		ctx.ruleMatchBuf = ctx.ruleMatchBuf[:0]
-		if cap(ctx.requiredHits) > 1<<20 {
-			ctx.requiredHits = nil
-		} else {
+		// 命中缓冲与候选起点同源：固定阈值在密集输入下会变成"每次扫描都释放"。
+		// 命中缓冲与候选起点同源，同样按绝对上限保留：固定阈值在密集输入下
+		// 会退化成"每次扫描都释放、下次重新 grow"。
+		if retainRequiredHits(cap(ctx.requiredHits)) {
 			ctx.requiredHits = ctx.requiredHits[:0]
-		}
-		if cap(ctx.requiredStarts) > 1<<20 {
-			ctx.requiredStarts = nil
 		} else {
+			ctx.requiredHits = nil
+		}
+		// 命中密集的大块输入会把候选起点撑到百万级，固定阈值会让每次扫描都从
+		// cap=0 重新 grow，累计分配约为数据量的 5 倍；这里按绝对上限保留，见 §26。
+		if retainRequiredStarts(cap(ctx.requiredStarts)) {
 			ctx.requiredStarts = ctx.requiredStarts[:0]
+		} else {
+			ctx.requiredStarts = nil
 		}
 		// 线性排序缓冲按下标复用，超限时释放，避免长期占住大块内存。
 		resetRequiredSortBuffer(&ctx.requiredSortScratch)
@@ -1419,6 +1536,10 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 	fired := reserveBools(ctx.fired, len(scanner.rules))
 	ctx.blockedUntil = blockedUntil
 	ctx.fired = fired
+	if scanner.hasCollapse {
+		windows := reserveCollapseWindows(ctx.collapseWindows, len(scanner.rules))
+		ctx.collapseWindows = windows
+	}
 	comboTriggers := ctx.comboTriggers[:0]
 	// SOM_LEFTMOST 对同一结束位置只保留最左起点，避免 AST 回溯产生重复事件。
 	var somSeen map[uint32]map[int]struct{}
@@ -1752,6 +1873,7 @@ func groupGuardRuns(runs []guardRun) []guardRunGroup {
 		slices.SortFunc(groups[index].runs, func(left, right guardRun) int {
 			return left.length - right.length
 		})
+		groups[index].minLength = groups[index].runs[0].length
 	}
 	return groups
 }
@@ -1784,6 +1906,69 @@ func guardImpliedByBack(guard *prefixGuard, back []byte, minOffset int) bool {
 		}
 	}
 	return true
+}
+
+// newCollapseHead 推导「同一次文字命中摊开的候选起点共享确认结果」所需的集合
+// 重复描述。条件不成立时返回 nil，确认程序照常逐起点执行。
+func newCollapseHead(rule compiledRule) *collapseHead {
+	confirm := rule.confirm
+	// confirmSkip > 0 时求值从入口文字之后开始，窗口推导不适用。
+	if confirm == nil || rule.confirmSkip > 0 || len(rule.required) != 1 || rule.guard == nil {
+		return nil
+	}
+	variant := rule.required[0]
+	// 前缀约束必须完全由窗口左侧的回退扫描保证，否则窗口内不同起点的前缀
+	// 成立情况可能不同，最左起点失败而更靠右的起点命中。
+	if !guardImpliedByBack(rule.guard, variant.Back, variant.MinOffset) {
+		return nil
+	}
+	entry := confirm.entry
+	if entry < 0 || int(entry) >= len(confirm.instrs) {
+		return nil
+	}
+	instr := confirm.instrs[entry]
+	if instr.op != confirmOpSetRepeat {
+		return nil
+	}
+	repeat := confirm.repeats[instr.index]
+	if repeat.min < 0 || repeat.max < 0 {
+		return nil
+	}
+	// 重复必须与候选窗口一一对应：窗口就是重复的所有合法消费长度。
+	if int(repeat.min) != variant.MinOffset || int(repeat.max) != variant.MaxOffset {
+		return nil
+	}
+	set := &confirm.sets[repeat.set]
+	head := variant.Value[0]
+	if set.match(head) {
+		// 入口文字首字节属于重复集合时重复不会停在命中位置，窗口不再成立。
+		return nil
+	}
+	// 回退集合必须与重复集合逐字节一致：窗口内的候选起点都由回退扫描保证
+	// 首字节落在重复集合内，此时重复消费长度才恰好等于命中位置减起点。
+	for value := range 256 {
+		member := byte(0)
+		if set.match(byte(value)) {
+			member = 1
+		}
+		if member != variant.Back[value] {
+			return nil
+		}
+	}
+	return &collapseHead{set: set, min: int(repeat.min), max: int(repeat.max)}
+}
+
+// runEnd 返回从 start 起连续属于重复集合的第一个位置。连续段长于重复上界时重复
+// 会截断在上界处，尾程序起点随候选起点变化，因此返回 -1 表示该窗口不可复用。
+func (head *collapseHead) runEnd(data []byte, start int) int {
+	pos := start
+	for pos < len(data) && pos-start < head.max && head.set.match(data[pos]) {
+		pos++
+	}
+	if pos < len(data) && pos-start == head.max && head.set.match(data[pos]) {
+		return -1
+	}
+	return pos
 }
 
 // requiredIndexCovered 判断规则的候选起点是否已由候选索引（必须文字或前缀
@@ -1879,12 +2064,18 @@ func (st *blockScanState) verify(ri int, start int) bool {
 	if rule.confirm != nil && rule.ext == nil {
 		var end int
 		var ok bool
-		// 候选由必须文字索引派生时，起点处的入口文字已由匹配器确认，
-		// 可以直接从入口文字之后的指令开始求值。
-		if rule.confirmSkip > 0 && st.requiredStartDriven && st.scanner.literalIndexCovered(ri) {
-			end, ok = rule.confirm.run(st.data, rule.confirmEntry, start+rule.confirmSkip, rule.flags, st.ctx.confirmFrames())
+		if head := rule.collapseHead; head != nil {
+			memo := &st.ctx.collapseWindows[ri]
+			if start >= memo.from && start <= memo.to {
+				// 同一窗口内的候选起点由同一个集合重复派生，重复必然停在同一个
+				// 入口文字命中位置，之后的程序与起点无关，直接复用求值结果。
+				end, ok = memo.end, true
+			} else {
+				end, ok = st.confirmEnd(ri, start)
+				st.recordCollapseWindow(head, ri, start, end, ok)
+			}
 		} else {
-			end, ok = rule.confirm.preferredEnd(st.data, start, rule.flags, st.ctx.confirmFrames())
+			end, ok = st.confirmEnd(ri, start)
 		}
 		if ok {
 			// simpleReports 已排除组合、SOM、静默与单次语义，且扩展参数规则
@@ -1910,6 +2101,45 @@ func (st *blockScanState) verify(ri int, start int) bool {
 	ends := matchRuleIntoArena(rule, st.data, start, st.ctx.ruleMatchBuf[:0], arena)
 	st.ctx.ruleMatchBuf = ends
 	return st.record(ri, start, ends)
+}
+
+// confirmEnd 运行规则的确认程序并返回偏好结束偏移。
+func (st *blockScanState) confirmEnd(ri int, start int) (int, bool) {
+	rule := &st.scanner.rules[ri]
+	// 候选由必须文字索引派生时，起点处的入口文字已由匹配器确认，
+	// 可以直接从入口文字之后的指令开始求值。
+	if rule.confirmSkip > 0 && st.requiredStartDriven && st.scanner.literalIndexCovered(ri) {
+		return rule.confirm.run(st.data, rule.confirmEntry, start+rule.confirmSkip, rule.flags, st.ctx.confirmFrames())
+	}
+	return rule.confirm.preferredEnd(st.data, start, rule.flags, st.ctx.confirmFrames())
+}
+
+// recordCollapseWindow 把一次「未命中」的确认程序求值结果登记为可复用窗口。
+//
+// 只在程序于预算内正常返回且没有命中（ok 为 true、end 为负）时登记：超限回退通用
+// 求值的结果依赖起点，不能跨起点复用；而命中时 record 会把 blockedUntil 推到匹配
+// 结束位置，同一窗口里更靠右的起点在候选取值阶段就被重叠抑制，缓存不会带来任何
+// 收益，登记反而要多付一次连续段扫描。窗口右界由集合重复的结束位置决定：起点落在
+// [start, stop-min] 内时重复消费长度仍满足上下界，尾程序起点保持不变。
+func (st *blockScanState) recordCollapseWindow(head *collapseHead, ri int, start int, end int, ok bool) {
+	memo := &st.ctx.collapseWindows[ri]
+	if !ok || end >= 0 {
+		memo.to = -1
+		return
+	}
+	stop := head.runEnd(st.data, start)
+	if stop < 0 {
+		memo.to = -1
+		return
+	}
+	to := stop - head.min
+	if to < start {
+		memo.to = -1
+		return
+	}
+	memo.from = start
+	memo.to = to
+	memo.end = end
 }
 
 // record 处理已确认的结束偏移：约束过滤、报告写入与重叠抑制。
@@ -1982,7 +2212,13 @@ func (st *blockScanState) record(ri int, start int, ends []int) bool {
 func (st *blockScanState) finish(matches []Match) ([]Match, error) {
 	if st.scanner.simpleReports {
 		out := append(matches, st.direct...)
-		st.ctx.directMatches = st.direct[:0]
+		// 直接结果缓冲与候选起点一致，按绝对上限保留；无上限保留会让后续小输入
+		// 长期背着大块内存。
+		if retainDirectMatches(cap(st.direct)) {
+			st.ctx.directMatches = st.direct[:0]
+		} else {
+			st.ctx.directMatches = nil
+		}
 		return out, nil
 	}
 	if st.scanner.hasCombo {
@@ -2256,6 +2492,10 @@ func (window *guardRunWindow) process(off, width int, mask uint64, edgeIn, edgeO
 		}
 		endBit := bits.TrailingZeros64(endBits)
 		endBits &^= uint64(1) << uint(endBit)
+		// 段长不足组内最短窗口时没有任何起点成立，直接跳过展开调用。
+		if endBit-beginBit+1 < window.group.minLength {
+			continue
+		}
 		window.emitRange(off+beginBit, off+endBit+1)
 	}
 }
@@ -2530,6 +2770,19 @@ func reserveInts(values []int, size int) []int {
 	}
 	values = values[:size]
 	clear(values)
+	return values
+}
+
+// reserveCollapseWindows 复用确认窗口缓存，并把全部条目标记为无效。
+func reserveCollapseWindows(values []collapseWindow, size int) []collapseWindow {
+	if cap(values) < size {
+		values = make([]collapseWindow, size)
+	} else {
+		values = values[:size]
+	}
+	for index := range values {
+		values[index] = collapseWindow{from: 0, to: -1}
+	}
 	return values
 }
 

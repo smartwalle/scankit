@@ -20,7 +20,7 @@ func TestPrefixGuardSets(t *testing.T) {
 		{name: "word boundary", pattern: `\b[0-9]{10}\b`, length: 10, allow: "0123456789", reject: "012345678a"},
 		{name: "fixed prefix", pattern: `https?://[a-z]+`, length: 4, allow: "http://host", reject: "htxp://host"},
 		{name: "lookahead", pattern: `(?=abc)abc`, length: 3, allow: "abc", reject: "abd"},
-		{name: "unbounded class prefix", pattern: `[A-Za-z0-9._/-]+\.go`, length: 1, allow: "a.go", reject: " a.go"},
+		{name: "unbounded class prefix", pattern: `[A-Za-z0-9._/-]+\.go`, length: 1, allow: "a_test.go", reject: " a_test.go"},
 		{name: "empty body", pattern: `a*`, flags: FlagAllowEmpty, length: 0},
 		{name: "optional head", pattern: `a?b`, length: 0},
 		{name: "alternate heads", pattern: `(?:ab|cd)e`, length: 0},

@@ -33,3 +33,10 @@ func nativeByteSetMask(v *generic.Vector, tables *[32]byte) uint16
 //
 //go:noescape
 func nativeByteSetMask32(window []byte, tables *[32]byte) uint32
+
+// nativeByteSetMask64 使用 NEON 半字节查表判定 64 字节窗口内每个字节是否属于预编译集合。
+// 与 32 字节版本逐位一致，但在一次调用内处理四个 128 位半区，省掉宽窗口扫描里第二次
+// 调用的查找表装载与常数量化。
+//
+//go:noescape
+func nativeByteSetMask64(window []byte, tables *[32]byte) uint64

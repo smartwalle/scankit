@@ -204,3 +204,72 @@ func dumpVariants(required Required) string {
 	}
 	return strings.Join(parts, ",")
 }
+
+// TestFromASTMergesCaseClassWithTrailingToken 验证落在字符类上的弱候选会与前序
+// 元素末尾必然出现的字节合并成多字节候选：科学计数法规则里的 `[eE]` 单独展开只
+// 能得到单字节 `e`/`E`，在自然文本上命中密度极高；合并前一个必现的数字后得到
+// `0e`…`9E` 这 20 个双字节候选，命中密度回到与输入内容无关的水平。
+func TestFromASTMergesCaseClassWithTrailingToken(t *testing.T) {
+	required := mustRequired(t, `[+-]?[0-9]+(\.[0-9]+)?[eE][+-]?[0-9]+`)
+	if len(required.Variants) != 20 {
+		t.Fatalf("变体数量=%d，期望 20: %s", len(required.Variants), dumpVariants(required))
+	}
+	seen := make(map[string]struct{}, len(required.Variants))
+	for index, variant := range required.Variants {
+		if len(variant.Value) != 2 {
+			t.Fatalf("第 %d 个候选文字=%q，期望双字节", index, variant.Value)
+		}
+		if variant.Value[0] < '0' || variant.Value[0] > '9' {
+			t.Fatalf("第 %d 个候选文字=%q，首字节应为数字", index, variant.Value)
+		}
+		if variant.Value[1] != 'e' && variant.Value[1] != 'E' {
+			t.Fatalf("第 %d 个候选文字=%q，次字节应为 e 或 E", index, variant.Value)
+		}
+		if variant.MaxOffset >= variant.MinOffset {
+			t.Fatalf("第 %d 个候选文字窗口=[%d,%d]，期望无上界", index, variant.MinOffset, variant.MaxOffset)
+		}
+		if variant.Back == nil {
+			t.Fatalf("第 %d 个候选文字缺少左侧字节集合", index)
+		}
+		seen[string(variant.Value)] = struct{}{}
+	}
+	if len(seen) != 20 {
+		t.Fatalf("去重后的候选数量=%d，期望 20", len(seen))
+	}
+}
+
+// TestTrailingLiteralsUnionsNullableBranches 验证左合并候选在跨越可空元素时按
+// 分支取并集：`a(?:b)?[0-9]` 中数字前的字节可能是 `a`（可空分支为空），也可能是
+// `b`（可空分支非空）。只保留其中一支会让另一类匹配在候选索引里漏检。
+func TestTrailingLiteralsUnionsNullableBranches(t *testing.T) {
+	root, err := parser.Parse(`a(?:b)?[0-9]`)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	sequence, ok := root.(parser.Sequence)
+	if !ok {
+		t.Fatalf("根节点类型=%T，期望序列", root)
+	}
+	steps, length, ok := trailingUniform(sequence.Elements[:2])
+	if !ok {
+		t.Fatal("可空前缀应能推导出末尾候选")
+	}
+	if length != 1 {
+		t.Fatalf("末尾候选长度=%d，期望 1", length)
+	}
+	seen := make(map[string]struct{}, len(steps))
+	for _, step := range steps {
+		if len(step.value) != 1 {
+			t.Fatalf("末尾候选=%q，期望单字节", step.value)
+		}
+		seen[string(step.value)] = struct{}{}
+	}
+	for _, want := range []string{"a", "b"} {
+		if _, ok := seen[want]; !ok {
+			t.Fatalf("末尾候选缺少 %q: %v", want, seen)
+		}
+	}
+	if len(seen) != 2 {
+		t.Fatalf("末尾候选数量=%d，期望 2: %v", len(seen), seen)
+	}
+}

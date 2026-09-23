@@ -27,8 +27,8 @@ func (b Backend) WindowMask(data []byte, off int, tables *simd.ByteSetTables, la
 
 // WindowMask64 使用 NEON 半字节查表在 64 字节宽窗口内生成候选起点掩码。
 //
-// NEON 寄存器宽度固定为 128 位，因此宽窗口由两次已验证的 32 字节内核调用拼接而成：
-// 低、高两个 32 字节半区各自产出 32 位位置掩码后合并为 64 位，再由
+// NEON 寄存器宽度固定为 128 位，原生内核在一次调用内把 64 字节窗口拆成四个半区，
+// 复用同一份半字节查找表与量化常量后拼成 64 位位置掩码，再由
 // simd.ComposeWindowMask64 完成 lane 对齐与窗口末端退让，语义与 WindowMask 完全一致。
 func (b Backend) WindowMask64(data []byte, off int, tables *simd.ByteSetTables, lanes int) (uint64, bool) {
 	if tables == nil || off < 0 || off > len(data) || len(data)-off < simd.WideWidth {
@@ -39,8 +39,7 @@ func (b Backend) WindowMask64(data []byte, off int, tables *simd.ByteSetTables, 
 	}
 	lanes = simd.ClampLanes(lanes)
 	window := data[off : off+simd.WideWidth]
-	first := uint64(nativeByteSetMask32(window[:simd.SuperWidth], &tables[0])) |
-		uint64(nativeByteSetMask32(window[simd.SuperWidth:], &tables[0]))<<32
+	first := nativeByteSetMask64(window, &tables[0])
 	// 组合结果必然包含首 lane 掩码的按位与，因此首 lane 为空时窗口内
 	// 不可能有候选，直接省去其余 lane 的原生调用。稀疏语料下大多数窗口
 	// 都走该分支，是候选扫描的主要开销削减点。
@@ -53,9 +52,7 @@ func (b Backend) WindowMask64(data []byte, off int, tables *simd.ByteSetTables, 
 	strict := first
 	laneMasks := [4]uint64{first}
 	for lane := 1; lane < lanes; lane++ {
-		lo := nativeByteSetMask32(window[:simd.SuperWidth], &tables[lane])
-		hi := nativeByteSetMask32(window[simd.SuperWidth:], &tables[lane])
-		mask := uint64(lo) | uint64(hi)<<32
+		mask := nativeByteSetMask64(window, &tables[lane])
 		laneMasks[lane] = mask
 		strict &= mask >> uint(lane)
 		if strict == 0 {

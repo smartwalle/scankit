@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand/v2"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -433,6 +434,9 @@ func TestGuardRunStartsMatchesScalar(t *testing.T) {
 			{ruleIndex: 1, set: digitSet, offset: 2, length: 8},
 			{ruleIndex: 2, set: digitSet, offset: 5, length: 17},
 		},
+		// minLength 与 groupGuardRuns 的构造保持一致（runs 已按长度升序），
+		// 这样差分用例同时覆盖"段长不足最短窗口直接跳过"的分支。
+		minLength: 4,
 	}
 	backend := dispatch.DefaultBackend()
 	const limit = 1 << 20
@@ -587,4 +591,330 @@ func TestRequiredIndexGuardRunMergesWithStartByteIndex(t *testing.T) {
 		[]byte("nothing to confirm here"),
 	}
 	assertScanAgreesWithReference(t, scanner, cases)
+}
+
+// TestRequiredIndexScientificNotationAgreesWithPerStartScan 验证科学计数法规则
+// 的候选文字升级为多字节后，候选驱动扫描的命中集合仍与逐起点确认逐位一致。
+// 触发背景见 docs/technical-solutions/scankit-block-mode/问题与排查计划.md §20。
+func TestRequiredIndexScientificNotationAgreesWithPerStartScan(t *testing.T) {
+	scanner, err := Compile([]Expression{
+		{Id: 1, Pattern: `[+-]?[0-9]+(\.[0-9]+)?[eE][+-]?[0-9]+`},
+		{Id: 2, Pattern: `[0-9]+x[0-9]+`},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scanner.requiredFindInto == nil {
+		t.Fatal("科学计数法规则应建立必须文字候选索引")
+	}
+	if !scanner.requiredCovered[0] {
+		t.Fatal("科学计数法规则应被必须文字候选索引覆盖")
+	}
+	for index := range scanner.requiredLiterals {
+		for _, entry := range scanner.requiredLiterals[index].entries {
+			if entry.back == nil {
+				t.Fatalf("第 %d 个候选条目缺少左侧字节集合", index)
+			}
+		}
+	}
+	assertScanAgreesWithReference(t, scanner, [][]byte{
+		[]byte("value=1e5 end"),
+		[]byte("value=+1.5E-3 end"),
+		[]byte("value=-2.0e+10 end"),
+		[]byte("value=12e10 and 34E-7 end"),
+		[]byte("email a@b.com noise e e e e e"),
+		[]byte("no digits here, only letters e E"),
+		[]byte("size 1024x768 and 640X480"),
+	})
+}
+
+// TestRetainBufferPolicy 验证扫描期缓冲的池内保留判据。四个缓冲（候选起点、
+// 文字命中、直接结果、文字匹配）共用同一条判据：容量不超过各自的绝对上限即保留。
+// "大输入之后的小输入"必须保留 —— 释放它会让下一次大输入整块重新 grow（实测单次
+// 多分配 147 MB）；超过上限才释放，避免异常大的缓冲长期驻留。
+// 背景见 docs/technical-solutions/scankit-block-mode/问题与排查计划.md §21.7 P1、§26。
+func TestRetainBufferPolicy(t *testing.T) {
+	retainers := []struct {
+		name  string
+		limit int
+		fn    func(int) bool
+	}{
+		{name: "requiredStarts", limit: requiredStartsRetainLimit, fn: retainRequiredStarts},
+		{name: "literalMatches", limit: literalMatchesRetainLimit, fn: retainLiteralMatches},
+		{name: "requiredHits", limit: requiredHitsRetainLimit, fn: retainRequiredHits},
+		{name: "directMatches", limit: directMatchesRetainLimit, fn: retainDirectMatches},
+	}
+	for _, retainer := range retainers {
+		t.Run(retainer.name, func(t *testing.T) {
+			cases := []struct {
+				name     string
+				capacity int
+				retain   bool
+			}{
+				// 10MB 密集输入把候选起点撑到 2,581,504 条目：旧固定阈值
+				// （>1<<20 即释放）会让每次扫描都从 0 重新 grow。
+				{name: "below-limit", capacity: 2_581_504, retain: true},
+				{name: "old-threshold", capacity: 1 << 20, retain: true},
+				{name: "at-limit", capacity: retainer.limit, retain: true},
+				{name: "over-limit", capacity: retainer.limit + 1, retain: false},
+				{name: "empty", capacity: 0, retain: true},
+			}
+			for _, testCase := range cases {
+				if got := retainer.fn(testCase.capacity); got != testCase.retain {
+					t.Fatalf("%s: %s(capacity=%d)=%v，期望 %v",
+						retainer.name, testCase.name, testCase.capacity, got, testCase.retain)
+				}
+			}
+		})
+	}
+}
+
+// disableRequiredCollapse 复制扫描器并关闭「窗口内复用确认结果」优化，作为
+// 逐起点确认的对照实现。
+func disableRequiredCollapse(scanner *Scanner) *Scanner {
+	clone := *scanner
+	clone.rules = append([]compiledRule(nil), scanner.rules...)
+	for index := range clone.rules {
+		clone.rules[index].collapseHead = nil
+	}
+	clone.hasCollapse = false
+	return &clone
+}
+
+// TestRequiredIndexCollapseSharesWindow 验证「起点无关窗口」优化：同一次文字命中
+// 摊开出的候选起点共享一次确认程序求值，而报告结果必须与逐起点确认逐位一致。
+func TestRequiredIndexCollapseSharesWindow(t *testing.T) {
+	pattern := "[A-Za-z0-9.!#$%&'*+/?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\\b"
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: pattern}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scanner.rules) != 1 || scanner.rules[0].collapseHead == nil {
+		t.Fatal("类重复前缀 + 左侧回退集合的规则应识别出起点无关窗口")
+	}
+	if !scanner.hasCollapse {
+		t.Fatal("存在可复用窗口的扫描器应预留确认窗口缓存")
+	}
+	head := scanner.rules[0].collapseHead
+
+	// 单窗口、必失败：局部部分 "user" 让一次 "@" 命中摊开 4 个候选起点，
+	// 域名 "example..invalid" 使全部起点都确认失败，因此不存在重叠抑制，
+	// 求值次数可以精确断言。
+	windowData := []byte("email=user@example..invalid")
+	ctx := &scanContext{}
+	starts, ok := scanner.requiredScanStarts(ctx, windowData)
+	if !ok {
+		t.Fatal("候选起点枚举不应超限")
+	}
+	if len(starts) != 4 {
+		t.Fatalf("候选起点数 = %d，期望一次命中摊开 4 个起点", len(starts))
+	}
+
+	// 按候选起点顺序模拟确认：落在窗口内的起点复用首起点的求值结果。
+	state := &blockScanState{scanner: scanner, data: windowData, ctx: ctx}
+	state.ctx.collapseWindows = reserveCollapseWindows(nil, len(scanner.rules))
+	evaluated, reused := 0, 0
+	for _, key := range starts {
+		start := int(key >> 32)
+		memo := &state.ctx.collapseWindows[0]
+		if start >= memo.from && start <= memo.to {
+			reused++
+			continue
+		}
+		end, ok := state.confirmEnd(0, start)
+		state.recordCollapseWindow(head, 0, start, end, ok)
+		evaluated++
+	}
+	if evaluated != 1 {
+		t.Fatalf("单窗口应只求值 1 次，实际 %d 次（候选 %d 个）", evaluated, len(starts))
+	}
+	if reused != len(starts)-1 {
+		t.Fatalf("复用次数 = %d，期望 %d", reused, len(starts)-1)
+	}
+
+	// 复用必须逐位等价：与关闭优化的扫描器、以及逐起点参考实现对齐。
+	expanded := disableRequiredCollapse(scanner)
+	corpus := [][]byte{
+		windowData,
+		[]byte("email=user@example..invalid and more"),
+		[]byte("no at sign here"),
+		[]byte("@"),
+		[]byte("a@b.c"),
+		[]byte(".@b.c"),
+		[]byte("user@example..invalid"),
+		[]byte("user.name+tag@sub.domain.co.uk tail"),
+		[]byte(strings.Repeat("y", 64) + "@a.bc"),
+		[]byte(strings.Repeat("y", 65) + "@a.bc"),
+		[]byte(strings.Repeat("y", 130) + "@a.bc"),
+		[]byte("x@a-b.c and y@d.e"),
+		[]byte("multi a@b.co b@c.co c@d.co"),
+		[]byte("trailing user@example.com."),
+		[]byte("中文邮箱 user@example.com 结束"),
+		[]byte(":e ..@909bZ.zbz.9-!!@9zA." + strings.Repeat("q", 63) + ".0az9.9Z"),
+	}
+	for _, data := range corpus {
+		want, err := expanded.Scan(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := scanner.Scan(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("语料 %q 复用前后命中不一致:\n got=%v\nwant=%v", data, got, want)
+		}
+	}
+	assertScanAgreesWithReference(t, scanner, corpus)
+}
+
+// TestRequiredIndexCollapseMatchesRegexp 用随机生成的类邮箱结构把窗口收缩后的
+// 扫描结果与 Go 正则实现对齐，覆盖局部部分长度、标签数量与非法字符的边界组合。
+func TestRequiredIndexCollapseMatchesRegexp(t *testing.T) {
+	pattern := "[A-Za-z0-9.!#$%&'*+/?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\\b"
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: pattern}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference := regexp.MustCompile(pattern)
+	rng := rand.New(rand.NewPCG(7, 11))
+	pick := func(alphabet string, limit int) string {
+		length := rng.IntN(limit)
+		buf := make([]byte, length)
+		for index := range buf {
+			buf[index] = alphabet[rng.IntN(len(alphabet))]
+		}
+		return string(buf)
+	}
+	filler := " \t=,:;中文\nlevel=INFO service=payment "
+	hits := 0
+	for round := 0; round < 4000; round++ {
+		var builder strings.Builder
+		for part := rng.IntN(3) + 1; part > 0; part-- {
+			builder.WriteString(pick(filler, 4))
+			// 局部部分：可能为空、超长，或含非法字符。
+			switch rng.IntN(6) {
+			case 0:
+				builder.WriteString("")
+			case 1:
+				builder.WriteString(strings.Repeat("z", 65))
+			case 2:
+				builder.WriteString("..")
+			default:
+				builder.WriteString(pick("abzAZ09.-_+!~", 12))
+			}
+			builder.WriteString("@")
+			// 域名：1~3 个标签，标签长度覆盖 0、1、超长与尾随连字符。
+			for label := rng.IntN(3) + 1; label > 0; label-- {
+				switch rng.IntN(8) {
+				case 0:
+					builder.WriteString(".")
+				case 1:
+					builder.WriteString(strings.Repeat("q", 63))
+				case 2:
+					builder.WriteString("-")
+				default:
+					builder.WriteString(pick("abzAZ09-", 6))
+				}
+				builder.WriteString(".")
+			}
+			builder.WriteString(pick("abzAZ09", 4))
+		}
+		data := []byte(builder.String())
+		want := make([]Match, 0)
+		for _, index := range reference.FindAllIndex(data, -1) {
+			want = append(want, Match{Id: 1, From: uint64(index[0]), To: uint64(index[1])})
+		}
+		got, err := scanner.Scan(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("随机语料 %q 命中不一致:\n got=%v\nwant=%v", data, got, want)
+		}
+		hits += len(want)
+	}
+	if hits == 0 {
+		t.Fatal("随机语料没有产出任何命中，未能覆盖命中路径")
+	}
+	t.Logf("随机语料累计命中=%d", hits)
+}
+
+// TestGuardRunStartsRandomizedMatchesScalar 用确定性随机语料与随机约束组做差分：
+// 段长在最短窗口上下、窗口边界前后、跨多个宽窗口的长段、以及无命中窗口
+// 等情形都必须与逐字节回退实现给出完全相同的候选起点集合。
+func TestGuardRunStartsRandomizedMatchesScalar(t *testing.T) {
+	rng := rand.New(rand.NewPCG(0x9e3779b97f4a7c15, 0xbf58476d1ce4e5b9))
+	backend := dispatch.DefaultBackend()
+	const limit = 1 << 20
+
+	for round := 0; round < 3000; round++ {
+		// 随机字节集合：从 256 个取值里抽 1~10 个，覆盖极稀疏与较稠密两类掩码。
+		var set [4]uint64
+		for picked := rng.IntN(10) + 1; picked > 0; picked-- {
+			value := byte(rng.IntN(256))
+			set[value>>6] |= uint64(1) << uint(value&63)
+		}
+		// 随机约束组：1~3 条规则，窗口长度覆盖 1、宽窗口附近与超过宽窗口。
+		runCount := rng.IntN(3) + 1
+		runs := make([]guardRun, 0, runCount)
+		minLength := 0
+		for index := 0; index < runCount; index++ {
+			length := []int{1, 2, 3, 4, 8, 9, 16, 17, 63, 64, 65}[rng.IntN(11)]
+			runs = append(runs, guardRun{
+				ruleIndex: index,
+				set:       set,
+				offset:    rng.IntN(4),
+				length:    length,
+			})
+			if minLength == 0 || length < minLength {
+				minLength = length
+			}
+		}
+		slices.SortStableFunc(runs, func(a, b guardRun) int { return a.length - b.length })
+		group := guardRunGroup{
+			set:       set,
+			tables:    simd.NewByteSetTables([4][4]uint64{set}),
+			runs:      runs,
+			minLength: minLength,
+		}
+		// 语料长度特意覆盖 0、单个宽窗口内、宽窗口边界与多个宽窗口。
+		size := []int{0, 1, 3, 16, 33, 63, 64, 65, 127, 128, 129, 191, 192, 193, 257}[rng.IntN(15)]
+		data := make([]byte, size)
+		for index := range data {
+			if rng.IntN(3) == 0 {
+				// 提高集合成员占比，制造长度落在最短窗口上下的连续段。
+				for {
+					value := byte(rng.IntN(256))
+					if set[value>>6]&(uint64(1)<<(value&63)) != 0 {
+						data[index] = value
+						break
+					}
+				}
+				continue
+			}
+			data[index] = byte(rng.IntN(256))
+		}
+
+		want, ok := group.appendStartsScalar(data, nil, limit)
+		if !ok {
+			t.Fatalf("round=%d 参照实现意外溢出", round)
+		}
+		got, ok := group.appendStarts(backend, data, nil, limit)
+		if !ok {
+			t.Fatalf("round=%d 宽窗口实现意外溢出", round)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("round=%d size=%d minLength=%d runs=%+v data=%q 候选数量不一致 got=%d want=%d",
+				round, size, minLength, runs, data, len(got), len(want))
+		}
+		slices.Sort(got)
+		slices.Sort(want)
+		for index := range got {
+			if got[index] != want[index] {
+				t.Fatalf("round=%d size=%d minLength=%d runs=%+v data=%q 第 %d 个候选不一致 got=%v want=%v",
+					round, size, minLength, runs, data, index, got[index], want[index])
+			}
+		}
+	}
 }
