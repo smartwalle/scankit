@@ -1,8 +1,12 @@
 // Package parser 实现 scankit 的正则前端 AST。
 package parser
 
-import "reflect"
+import (
+	"reflect"
+	"slices"
+)
 
+// Node 是 AST 节点的公共接口，只由本包的节点类型实现。
 type Node interface{ node() }
 
 // Kind 是 AST 节点的稳定分类。
@@ -42,6 +46,7 @@ func Summarize(root Node) Summary {
 	return s
 }
 
+// KindUnknown 表示未知节点，其余常量与 NodeKind 的返回值一一对应。
 const (
 	KindUnknown Kind = iota
 	KindLiteral
@@ -126,12 +131,14 @@ func Children(n Node, fn func(Node)) {
 		fn(v.Right)
 	case CombinationNot:
 		fn(v.Child)
+	default:
 	}
 }
 
 // Equal 判断两个 AST 的节点和值是否一致。
 func Equal(a, b Node) bool { return reflect.DeepEqual(a, b) }
 
+// IsEmpty 判断节点是否可能在零字节消耗下匹配成功；nil 节点不视为空。
 func IsEmpty(n Node) bool {
 	switch v := n.(type) {
 	case Sequence:
@@ -171,6 +178,7 @@ func IsEmpty(n Node) bool {
 // CanMatchEmpty 是 IsEmpty 的语义别名。
 func CanMatchEmpty(n Node) bool { return Nullable(n) }
 
+// CaptureCount 返回 AST 中捕获组的最大编号，没有捕获组时返回 0。
 func CaptureCount(root Node) int {
 	count := 0
 	Walk(root, func(n Node) bool {
@@ -187,27 +195,27 @@ func HasCapture(root Node) bool { return CaptureCount(root) > 0 }
 
 // MaxLiteralLength 返回 AST 中最长文字节点的字节长度。
 func MaxLiteralLength(root Node) int {
-	max := 0
+	maxLength := 0
 	Walk(root, func(n Node) bool {
-		if literal, ok := n.(Literal); ok && len(literal.Value) > max {
-			max = len(literal.Value)
+		if literal, ok := n.(Literal); ok && len(literal.Value) > maxLength {
+			maxLength = len(literal.Value)
 		}
 		return true
 	})
-	return max
+	return maxLength
 }
 
 // MinLiteralLength 返回 AST 中非空文字节点的最短字节长度。
 func MinLiteralLength(root Node) int {
-	min := 0
+	minLength := 0
 	found := false
 	Walk(root, func(node Node) bool {
-		if literal, ok := node.(Literal); ok && len(literal.Value) > 0 && (!found || len(literal.Value) < min) {
-			min, found = len(literal.Value), true
+		if literal, ok := node.(Literal); ok && len(literal.Value) > 0 && (!found || len(literal.Value) < minLength) {
+			minLength, found = len(literal.Value), true
 		}
 		return true
 	})
-	return min
+	return minLength
 }
 
 // HasAssertion 判断 AST 是否包含断言或边界节点。
@@ -217,18 +225,18 @@ func HasAssertion(root Node) bool {
 
 // MaxRepeatCount 返回重复节点的最大上界；无限重复以 -1 表示。
 func MaxRepeatCount(root Node) int {
-	max := 0
+	maxCount := 0
 	Walk(root, func(node Node) bool {
 		if repeat, ok := node.(Repeat); ok {
 			if repeat.Max == -1 {
-				max = -1
-			} else if max >= 0 && repeat.Max > max {
-				max = repeat.Max
+				maxCount = -1
+			} else if maxCount >= 0 && repeat.Max > maxCount {
+				maxCount = repeat.Max
 			}
 		}
 		return true
 	})
-	return max
+	return maxCount
 }
 
 // RequiresBacktracking 判断是否存在需要保存运行上下文的能力。
@@ -275,6 +283,7 @@ func FirstLiterals(root Node) [][]byte {
 			if v.Min > 0 || Nullable(v.Child) {
 				walk(v.Child)
 			}
+		default:
 		}
 	}
 	walk(root)
@@ -340,6 +349,7 @@ func FirstBytes(root Node) []byte {
 			}
 		case Repeat:
 			walk(v.Child)
+		default:
 		}
 	}
 	walk(root)
@@ -378,6 +388,7 @@ func RequiresStatefulRuntime(root Node) bool {
 				required = true
 				return false
 			}
+		default:
 		}
 		return true
 	})
@@ -420,6 +431,7 @@ func ReferenceIDs(root Node) []int {
 			index = value.Index
 		case Conditional:
 			index = value.Index
+		default:
 		}
 		if index > 0 {
 			if _, ok := seen[index]; !ok {
@@ -432,6 +444,7 @@ func ReferenceIDs(root Node) []int {
 	return out
 }
 
+// Nullable 判断节点是否可能匹配空串。
 func Nullable(n Node) bool {
 	switch v := n.(type) {
 	case nil, Assertion, ControlVerb:
@@ -450,12 +463,7 @@ func Nullable(n Node) bool {
 		}
 		return true
 	case Alternation:
-		for _, c := range v.Options {
-			if Nullable(c) {
-				return true
-			}
-		}
-		return false
+		return slices.ContainsFunc(v.Options, Nullable)
 	case Repeat:
 		return v.Min == 0 || Nullable(v.Child)
 	case Conditional:
@@ -467,6 +475,7 @@ func Nullable(n Node) bool {
 	}
 }
 
+// Clone 深拷贝 AST；文字和字符类的切片被复制，值类型节点按值返回。
 func Clone(root Node) Node {
 	switch v := root.(type) {
 	case Literal:
@@ -497,26 +506,30 @@ func Clone(root Node) Node {
 		return root
 	}
 }
+
+// Depth 返回 AST 的最大节点深度，根节点深度为 0。
 func Depth(root Node) int {
-	max := 0
+	maxDepth := 0
 	WalkDepth(root, 0, func(d int) {
-		if d > max {
-			max = d
+		if d > maxDepth {
+			maxDepth = d
 		}
 	})
-	return max
+	return maxDepth
 }
 
 // Width 返回节点的固定宽度；非固定宽度时 ok 为 false。
 func Width(root Node) (int, bool) {
-	min, max, ok := FixedWidth(root)
-	return min, ok && min == max
+	minWidth, maxWidth, ok := FixedWidth(root)
+	return minWidth, ok && minWidth == maxWidth
 }
 
-// WidthRange 返回节点的最小和最大宽度；无界时 max 为 -1。
-func WidthRange(root Node) (min, max int, ok bool) {
+// WidthRange 返回节点的最小和最大宽度；无界时 maxWidth 为 -1。
+func WidthRange(root Node) (minWidth, maxWidth int, ok bool) {
 	return widthRange(root)
 }
+
+// WalkDepth 从 depth 层开始深度优先遍历 AST，并对每个节点回调其深度。
 func WalkDepth(root Node, depth int, fn func(int)) {
 	if root == nil || fn == nil {
 		return
@@ -542,6 +555,7 @@ func WalkDepth(root Node, depth int, fn func(int)) {
 		children = []Node{v.Left, v.Right}
 	case CombinationNot:
 		children = []Node{v.Child}
+	default:
 	}
 	for _, child := range children {
 		WalkDepth(child, depth+1, fn)
@@ -569,10 +583,12 @@ func cloneComposite(v any) Node {
 		return CombinationOperator{Op: n.Op, Left: Clone(n.Left), Right: Clone(n.Right)}
 	case CombinationNot:
 		return CombinationNot{Child: Clone(n.Child)}
+	default:
 	}
 	return nil
 }
 
+// Literal 表示需要逐字节精确匹配的文字节点。
 type Literal struct{ Value []byte }
 
 func (Literal) node() {}
@@ -582,6 +598,7 @@ type Any struct{}
 
 func (Any) node() {}
 
+// Class 表示单字节字符类，Ranges 为闭区间集合，Negated 表示取反。
 type Class struct {
 	Ranges  []Range
 	Negated bool
@@ -590,6 +607,7 @@ type Class struct {
 
 func (Class) node() {}
 
+// UnicodeClass 表示按 Unicode 属性名匹配的字符类。
 type UnicodeClass struct {
 	Name    string
 	Negated bool
@@ -597,11 +615,13 @@ type UnicodeClass struct {
 
 func (UnicodeClass) node() {}
 
+// Range 表示闭区间的单字节范围。
 type Range struct{ Lo, Hi byte }
 
 // ClassKind 标识由简写字符类生成的运行时分类。
 type ClassKind uint8
 
+// ClassNormal 表示普通字符类，其余常量对应 \d、\w、\s 等简写类。
 const (
 	ClassNormal ClassKind = iota
 	ClassDigit
@@ -611,14 +631,17 @@ const (
 	ClassVerticalSpace
 )
 
+// Sequence 表示按顺序依次匹配的子表达式集合。
 type Sequence struct{ Elements []Node }
 
 func (Sequence) node() {}
 
+// Alternation 表示任选其一的子表达式集合。
 type Alternation struct{ Options []Node }
 
 func (Alternation) node() {}
 
+// Repeat 表示子表达式的重复匹配，Max 为 -1 时表示无上界。
 type Repeat struct {
 	Child    Node
 	Min, Max int
@@ -627,12 +650,15 @@ type Repeat struct {
 
 func (Repeat) node() {}
 
+// Assertion 表示零宽断言节点。
 type Assertion struct{ Kind AssertionKind }
 
 func (Assertion) node() {}
 
+// AssertionKind 标识零宽断言的种类。
 type AssertionKind uint8
 
+// Begin 表示行首断言，其余常量对应其他零宽断言。
 const (
 	Begin AssertionKind = iota + 1
 	End
@@ -646,6 +672,7 @@ const (
 // GroupFlag 表示可在分组内局部启用或关闭的模式修饰符。
 type GroupFlag uint8
 
+// GroupFlagCaseless 表示忽略大小写，其余常量对应 (?ismx) 的局部修饰符。
 const (
 	GroupFlagCaseless GroupFlag = 1 << iota
 	GroupFlagDotAll
@@ -653,6 +680,7 @@ const (
 	GroupFlagExtended
 )
 
+// Group 表示分组节点，Capture 为捕获组编号，0 表示非捕获组。
 type Group struct {
 	Child      Node
 	Atomic     bool
@@ -666,10 +694,12 @@ func (g Group) HasScopedFlags() bool { return g.SetFlags != 0 || g.ClearFlags !=
 
 func (Group) node() {}
 
+// Backreference 表示反向引用，Index 为被引用的捕获组编号。
 type Backreference struct{ Index int }
 
 func (Backreference) node() {}
 
+// ControlVerb 表示 (*VERB) 形式的控制动词。
 type ControlVerb struct{ Name string }
 
 func (ControlVerb) node() {}
@@ -682,6 +712,7 @@ type Conditional struct {
 
 func (Conditional) node() {}
 
+// Lookaround 表示先行或后行环视节点。
 type Lookaround struct {
 	Child Node
 	Kind  LookaroundKind
@@ -689,8 +720,10 @@ type Lookaround struct {
 
 func (Lookaround) node() {}
 
+// LookaroundKind 标识环视的方向和符号。
 type LookaroundKind uint8
 
+// Lookahead 表示正向先行断言，其余常量对应其他环视类型。
 const (
 	Lookahead LookaroundKind = iota + 1
 	NegativeLookahead
@@ -698,6 +731,7 @@ const (
 	NegativeLookbehind
 )
 
+// ParseError 描述解析失败的位置和原因。
 type ParseError struct {
 	Position int
 	Message  string

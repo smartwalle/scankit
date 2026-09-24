@@ -25,11 +25,11 @@ func TestScanIntegratesRoseOnlyForFullyConvertibleRules(t *testing.T) {
 		}
 	}
 
-	complex, err := Compile([]Expression{{Id: 3, Pattern: `(?<=a)b`}})
+	lookbehind, err := Compile([]Expression{{Id: 3, Pattern: `(?<=a)b`}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := complex.Scan([]byte("ab xb"))
+	got, err := lookbehind.Scan([]byte("ab xb"))
 	if err != nil || len(got) != 1 || got[0] != (Match{Id: 3, From: 1, To: 2}) {
 		t.Fatalf("不可转换规则未安全回退: err=%v matches=%v", err, got)
 	}

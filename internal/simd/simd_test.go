@@ -14,5 +14,5 @@ func TestDefaultBackend(t *testing.T) {
 }
 func FuzzBackend(f *testing.F) {
 	f.Add([]byte("abc"), 0)
-	f.Fuzz(func(t *testing.T, data []byte, off int) { b := Default(); _ = b.PartialLoad(data, off) })
+	f.Fuzz(func(_ *testing.T, data []byte, off int) { b := Default(); _ = b.PartialLoad(data, off) })
 }

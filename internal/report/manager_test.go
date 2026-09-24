@@ -50,7 +50,7 @@ func TestManagerZeroValueAndLength(t *testing.T) {
 	if m.Add(Event{ID: 1, From: 2, To: 1}) {
 		t.Fatal()
 	}
-	if m.Add(Event{ID: 1, From: 1, To: 3}) != true || m.Len() != 1 {
+	if !m.Add(Event{ID: 1, From: 1, To: 3}) || m.Len() != 1 {
 		t.Fatal()
 	}
 	if (Event{From: 3, To: 1}).Length() != 0 {

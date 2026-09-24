@@ -3,6 +3,7 @@ package compiler
 import (
 	"fmt"
 	"math"
+	"slices"
 
 	"github.com/smartwalle/scankit/internal/nfagraph"
 	"github.com/smartwalle/scankit/internal/parser"
@@ -44,6 +45,7 @@ type ExpressionInfo struct {
 	BailoutReason   string
 }
 
+// Width 返回表达式的最大匹配宽度。
 func (i ExpressionInfo) Width() uint64 { return i.MaxLength }
 
 // MinimumWidth 返回表达式最小匹配长度。
@@ -98,9 +100,9 @@ func (i ExpressionInfo) RequiresStatefulRuntime() bool { return i.Stateful }
 
 // DeriveExpressionInfo 计算保守的长度和能力元数据。
 func DeriveExpressionInfo(id uint32, flags uint32, extFlags uint64, root parser.Node, graph *nfagraph.Graph) ExpressionInfo {
-	min, max := nodeLength(root, flags)
+	minLength, maxLength := nodeLength(root, flags)
 	atEOD, onlyAtEOD := eodProperties(root)
-	return ExpressionInfo{ID: id, Flags: flags, ExtFlags: extFlags, AST: root, Graph: graph, MinLength: min, MaxLength: max, CanMatchEmpty: min == 0, UnorderedMatches: parser.HasAssertion(root), MatchesAtEOD: atEOD, MatchesOnlyAtEOD: onlyAtEOD, UTF8: flags&(1<<5) != 0, UCP: flags&(1<<6) != 0, SOMLeftmost: flags&(1<<8) != 0, Prefilter: flags&(1<<7) != 0, Combination: flags&(1<<9) != 0, LBR: containsLookaround(root), Captures: uint32(parser.CaptureCount(root)), Backreference: parser.HasKind(root, parser.KindBackreference), Conditional: parser.HasKind(root, parser.KindConditional), Stateful: parser.RequiresStatefulRuntime(root)}
+	return ExpressionInfo{ID: id, Flags: flags, ExtFlags: extFlags, AST: root, Graph: graph, MinLength: minLength, MaxLength: maxLength, CanMatchEmpty: minLength == 0, UnorderedMatches: parser.HasAssertion(root), MatchesAtEOD: atEOD, MatchesOnlyAtEOD: onlyAtEOD, UTF8: flags&(1<<5) != 0, UCP: flags&(1<<6) != 0, SOMLeftmost: flags&(1<<8) != 0, Prefilter: flags&(1<<7) != 0, Combination: flags&(1<<9) != 0, LBR: containsLookaround(root), Captures: uint32(parser.CaptureCount(root)), Backreference: parser.HasKind(root, parser.KindBackreference), Conditional: parser.HasKind(root, parser.KindConditional), Stateful: parser.RequiresStatefulRuntime(root)}
 }
 
 func eodProperties(root parser.Node) (matchesAtEOD, onlyAtEOD bool) {
@@ -162,6 +164,8 @@ func eodProperties(root parser.Node) (matchesAtEOD, onlyAtEOD bool) {
 	}
 	return matchesAtEOD, onlyAtEOD && matchesAtEOD
 }
+
+// Validate 检查表达式元数据是否自洽，例如状态化能力与捕获组是否匹配。
 func (i ExpressionInfo) Validate() error {
 	if i.AST == nil {
 		return fmt.Errorf("missing AST")
@@ -192,7 +196,7 @@ func (i ExpressionInfo) Validate() error {
 	if i.LBR && !i.Stateful {
 		return fmt.Errorf("lookaround metadata requires stateful execution")
 	}
-	if i.BailoutReason != "" && i.GraphFallback == false && i.Graph == nil && !i.Combination {
+	if i.BailoutReason != "" && !i.GraphFallback && i.Graph == nil && !i.Combination {
 		return fmt.Errorf("bailout metadata requires fallback or combination")
 	}
 	return nil
@@ -266,40 +270,40 @@ func nodeLength(n parser.Node, flags uint32) (uint64, uint64) {
 	case parser.Backreference:
 		return 0, math.MaxUint64
 	case parser.Sequence:
-		var min, max uint64
+		var minLength, maxLength uint64
 		for _, c := range v.Elements {
 			a, b := nodeLength(c, flags)
-			min = satAdd(min, a)
-			if max == math.MaxUint64 || b == math.MaxUint64 {
-				max = math.MaxUint64
+			minLength = satAdd(minLength, a)
+			if maxLength == math.MaxUint64 || b == math.MaxUint64 {
+				maxLength = math.MaxUint64
 			} else {
-				max = satAdd(max, b)
+				maxLength = satAdd(maxLength, b)
 			}
 		}
-		return min, max
+		return minLength, maxLength
 	case parser.Alternation:
 		if len(v.Options) == 0 {
 			return 0, 0
 		}
-		min := uint64(math.MaxUint64)
-		var max uint64
+		minLength := uint64(math.MaxUint64)
+		var maxLength uint64
 		for _, c := range v.Options {
 			a, b := nodeLength(c, flags)
-			if a < min {
-				min = a
+			if a < minLength {
+				minLength = a
 			}
-			if b > max {
-				max = b
+			if b > maxLength {
+				maxLength = b
 			}
 		}
-		return min, max
+		return minLength, maxLength
 	case parser.Repeat:
 		a, b := nodeLength(v.Child, flags)
-		min := satMul(a, uint64(v.Min))
+		minLength := satMul(a, uint64(v.Min))
 		if v.Max < 0 || b == math.MaxUint64 {
-			return min, math.MaxUint64
+			return minLength, math.MaxUint64
 		}
-		return min, satMul(b, uint64(v.Max))
+		return minLength, satMul(b, uint64(v.Max))
 	default:
 		return 0, math.MaxUint64
 	}
@@ -329,19 +333,16 @@ func containsLookaround(n parser.Node) bool {
 	case parser.Group:
 		return containsLookaround(v.Child)
 	case parser.Sequence:
-		for _, c := range v.Elements {
-			if containsLookaround(c) {
-				return true
-			}
+		if slices.ContainsFunc(v.Elements, containsLookaround) {
+			return true
 		}
 	case parser.Alternation:
-		for _, c := range v.Options {
-			if containsLookaround(c) {
-				return true
-			}
+		if slices.ContainsFunc(v.Options, containsLookaround) {
+			return true
 		}
 	case parser.Repeat:
 		return containsLookaround(v.Child)
+	default:
 	}
 	return false
 }

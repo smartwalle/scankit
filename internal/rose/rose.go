@@ -5,6 +5,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math/bits"
+	"slices"
+	"sort"
+	"unicode"
+	"unicode/utf8"
+
 	"github.com/smartwalle/scankit/internal/dispatch"
 	"github.com/smartwalle/scankit/internal/fdr"
 	"github.com/smartwalle/scankit/internal/hwlm"
@@ -12,12 +18,9 @@ import (
 	"github.com/smartwalle/scankit/internal/parser"
 	"github.com/smartwalle/scankit/internal/report"
 	"github.com/smartwalle/scankit/internal/simd"
-	"math/bits"
-	"sort"
-	"unicode"
-	"unicode/utf8"
 )
 
+// Role 描述一条 Rose 角色：以固定文字为触发条件，并携带偏移与确认约束。
 type Role struct {
 	ID              uint32
 	Literal         []byte
@@ -31,6 +34,7 @@ type Role struct {
 	Confirm         bool
 }
 
+// Length 返回角色触发文字的字节长度。
 func (r Role) Length() int { return len(r.Literal) }
 
 // roleCostLengthCap 是角色代价对文字长度的封顶值，避免超长文字压过其他约束。
@@ -55,10 +59,7 @@ type RoleCost struct {
 
 // Cost 返回角色的扫描代价分量快照。
 func (r Role) Cost() RoleCost {
-	length := len(r.Literal)
-	if length > roleCostLengthCap {
-		length = roleCostLengthCap
-	}
+	length := min(len(r.Literal), roleCostLengthCap)
 	return RoleCost{
 		LiteralLength: length,
 		Anchored:      r.Anchored,
@@ -127,8 +128,11 @@ func containsASCIILetter(literal []byte) bool {
 	}
 	return false
 }
+
+// Clone 返回角色副本，并复制触发文字。
 func (r Role) Clone() Role { r.Literal = append([]byte(nil), r.Literal...); return r }
 
+// MatchAt 判断角色触发文字是否在 off 处命中，必要时按角色配置折叠大小写。
 func (r Role) MatchAt(data []byte, off int) bool {
 	if len(r.Literal) == 0 || off < 0 || off+len(r.Literal) > len(data) {
 		return false
@@ -206,6 +210,7 @@ func roleEnd(offset uint64, length int) (uint64, bool) {
 	return offset + uint64(length), true
 }
 
+// Program 是角色集合与指令序列构成的 Rose 程序。
 type Program struct {
 	Roles        []Role
 	Instructions []Instruction
@@ -227,6 +232,7 @@ type Program struct {
 // InstructionKind 表示角色状态执行时的动作类型。
 type InstructionKind uint8
 
+// InstructionReport 表示产生报告指令，其余常量对应其他指令类别。
 const (
 	InstructionReport InstructionKind = iota + 1
 	InstructionActivate
@@ -244,6 +250,7 @@ type Instruction struct {
 	IncludeSOM  bool
 }
 
+// Validate 检查指令类别、角色编号以及跳转目标是否合法。
 func (i Instruction) Validate(p *Program) error {
 	if i.RoleID == 0 || i.Kind < InstructionReport || i.Kind > InstructionTransition {
 		return fmt.Errorf("invalid rose instruction")
@@ -266,7 +273,10 @@ func (i Instruction) Validate(p *Program) error {
 	return nil
 }
 
+// Empty 判断程序是否没有任何角色。
 func (p *Program) Empty() bool { return p == nil || len(p.Roles) == 0 }
+
+// RolesCopy 返回角色列表的深拷贝。
 func (p *Program) RolesCopy() []Role {
 	if p == nil {
 		return nil
@@ -278,6 +288,7 @@ func (p *Program) RolesCopy() []Role {
 	return out
 }
 
+// FindMatches 返回 data 中全部角色命中状态，按稳定顺序排列。
 func (p *Program) FindMatches(data []byte) []State {
 	return p.FindMatchesInto(data, nil)
 }
@@ -368,8 +379,7 @@ func (p *Program) FindMatchesLimit(data []byte, limit int) []State {
 		if p.miracleReady {
 			// 每个角色单独限量会在合并排序前丢失更早的候选，
 			// 这里先收集完整候选，再统一去重、排序和截断。
-			out := make([]State, 0, limit*len(p.miracles))
-			out = p.findMiracleMulti(data, 0, len(data), 0)
+			out := p.findMiracleMulti(data, 0, len(data), 0)
 			if len(out) > limit {
 				out = out[:limit]
 			}
@@ -556,14 +566,8 @@ func (p *Program) FindMatchesEndRange(data []byte, from, to int) []State {
 	seen := make(map[[2]uint64]struct{})
 	for _, role := range p.Roles {
 		length := len(role.Literal)
-		start := from - length
-		if start < 0 {
-			start = 0
-		}
-		last := to - length - 1
-		if last >= len(data)-length {
-			last = len(data) - length
-		}
+		start := max(from-length, 0)
+		last := min(to-length-1, len(data)-length)
 		for off := start; off <= last; off++ {
 			if !role.Eligible(data, off) {
 				continue
@@ -618,10 +622,11 @@ func (p *Program) MatchReportIDs(states []State) []uint32 {
 	for id := range seen {
 		out = append(out, id)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 
+// New 基于角色列表构建程序，并复制输入切片。
 func New(roles []Role) *Program {
 	out := make([]Role, len(roles))
 	copy(out, roles)
@@ -841,6 +846,8 @@ func (p *Program) Normalize() {
 	p.byReport = nil
 	p.rebuildInstructionIndex()
 }
+
+// Clone 深拷贝程序，结果与原程序不共享角色与指令。
 func (p *Program) Clone() *Program {
 	if p == nil {
 		return nil
@@ -853,6 +860,8 @@ func (p *Program) Clone() *Program {
 	}
 	return out
 }
+
+// RoleCount 返回角色数量，nil 程序返回 0。
 func (p *Program) RoleCount() int {
 	if p == nil {
 		return 0
@@ -886,6 +895,8 @@ func (p *Program) LiteralLengths() map[uint32]int {
 	}
 	return out
 }
+
+// FindRole 按编号查找角色，未找到时 ok 为 false。
 func (p *Program) FindRole(id uint32) (Role, bool) {
 	r, ok := p.findRole(id)
 	if !ok {
@@ -1006,9 +1017,11 @@ func (p *Program) ReportIDs() []uint32 {
 	for id := range seen {
 		out = append(out, id)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
+
+// Build 将 NFA 图降低为 Rose 程序，g 为 nil 时返回错误。
 func Build(g *nfagraph.Graph) (*Program, error) {
 	if g == nil {
 		return nil, fmt.Errorf("nil graph")
@@ -1056,6 +1069,8 @@ func Build(g *nfagraph.Graph) (*Program, error) {
 	p.Normalize()
 	return p, nil
 }
+
+// Validate 检查角色与指令序列是否自洽。
 func (p *Program) Validate() error {
 	if p == nil {
 		return fmt.Errorf("nil program")
@@ -1080,6 +1095,8 @@ func (p *Program) Validate() error {
 	}
 	return nil
 }
+
+// Dump 将程序序列化为带版本号的 JSON 负载。
 func (p *Program) Dump() ([]byte, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
@@ -1090,6 +1107,8 @@ func (p *Program) Dump() ([]byte, error) {
 		Instructions []Instruction `json:"instructions,omitempty"`
 	}{2, p.Roles, p.Instructions})
 }
+
+// Load 从 JSON 负载恢复 Rose 程序。
 func Load(data []byte) (*Program, error) {
 	if len(data) > 64<<20 {
 		return nil, fmt.Errorf("rose payload exceeds size limit")
@@ -1115,6 +1134,7 @@ func Load(data []byte) (*Program, error) {
 	return p, nil
 }
 
+// State 是调度器中的角色命中状态。
 type State struct {
 	RoleID   uint32
 	Offset   uint64
@@ -1148,8 +1168,10 @@ func (s State) Validate() error {
 	return nil
 }
 
+// Queue 是按优先级和编号排序的状态队列，零值即可使用。
 type Queue struct{ items []State }
 
+// Push 追加状态并维持优先级顺序，非法状态会被忽略。
 func (q *Queue) Push(s State) {
 	if q != nil && s.Validate() == nil {
 		q.items = append(q.items, s)
@@ -1245,6 +1267,8 @@ func (q *Queue) PopLimit(limit int) []State {
 	}
 	return out
 }
+
+// Pop 取出优先级最高的状态，队列为空时返回 false。
 func (q *Queue) Pop() (State, bool) {
 	if q == nil || len(q.items) == 0 {
 		return State{}, false
@@ -1255,25 +1279,35 @@ func (q *Queue) Pop() (State, bool) {
 	q.items = q.items[:len(q.items)-1]
 	return s, true
 }
+
+// Len 返回队列中的状态数量，nil 队列返回 0。
 func (q *Queue) Len() int {
 	if q == nil {
 		return 0
 	}
 	return len(q.items)
 }
+
+// Cap 返回底层存储容量，用于观测复用效果。
 func (q *Queue) Cap() int {
 	if q == nil {
 		return 0
 	}
 	return cap(q.items)
 }
+
+// Empty 判断队列中是否还有待处理状态。
 func (q *Queue) Empty() bool { return q == nil || len(q.items) == 0 }
+
+// Peek 返回优先级最高的状态但不移出队列。
 func (q *Queue) Peek() (State, bool) {
 	if q == nil || len(q.items) == 0 {
 		return State{}, false
 	}
 	return q.items[0], true
 }
+
+// Reset 清空队列并保留已分配的存储。
 func (q *Queue) Reset() {
 	if q != nil {
 		q.items = q.items[:0]
@@ -1288,6 +1322,7 @@ func (q *Queue) States() []State {
 	return append([]State(nil), q.items...)
 }
 
+// Scheduler 按程序指令推进状态，并按稳定顺序汇聚报告事件。
 type Scheduler struct {
 	Program *Program
 	Queue   Queue
@@ -1298,6 +1333,7 @@ type Scheduler struct {
 	active     map[[2]uint64]State
 }
 
+// Reset 清空队列、活跃状态和报告，便于复用同一调度器。
 func (s *Scheduler) Reset() {
 	if s != nil {
 		s.Queue.Reset()
@@ -1307,6 +1343,8 @@ func (s *Scheduler) Reset() {
 		clear(s.active)
 	}
 }
+
+// SetMaxReports 设置单次运行保留的报告上限，零值表示不限制。
 func (s *Scheduler) SetMaxReports(n int) {
 	if s != nil && s.Reports != nil {
 		s.Reports.SetMaxEvents(n)
@@ -1358,9 +1396,12 @@ func (s *Scheduler) runStepLimit() int {
 	return roles * 4096
 }
 
+// NewScheduler 创建绑定程序的调度器，program 可为 nil。
 func NewScheduler(program *Program) *Scheduler {
 	return &Scheduler{Program: program, Reports: report.New(), active: make(map[[2]uint64]State)}
 }
+
+// Activate 将状态放入待处理队列，非法状态会被忽略。
 func (s *Scheduler) Activate(state State) {
 	if s == nil || state.Validate() != nil {
 		return
@@ -1426,6 +1467,8 @@ func (q *Queue) RemoveRoleOffset(roleID uint32, offset uint64) bool {
 }
 
 func stateKey(state State) [2]uint64 { return [2]uint64{uint64(state.RoleID), state.Offset} }
+
+// QueueLen 返回待处理状态数量，nil 调度器返回 0。
 func (s *Scheduler) QueueLen() int {
 	if s == nil {
 		return 0
@@ -1632,6 +1675,7 @@ func (s *Scheduler) RunProgram(includeSOM bool) []report.Event {
 				if ok {
 					s.ActivateChecked(State{RoleID: instruction.TargetID, Offset: offset, Priority: state.Priority})
 				}
+			default:
 			}
 		}
 		return events
@@ -1652,6 +1696,8 @@ func applyOffsetDelta(offset uint64, delta int64) (uint64, bool) {
 	}
 	return offset - value, true
 }
+
+// Run 逐个执行队列中的状态，并用 onState 的结果汇总报告事件。
 func (s *Scheduler) Run(onState func(State) []report.Event) []report.Event {
 	if s == nil {
 		return nil

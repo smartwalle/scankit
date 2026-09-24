@@ -19,7 +19,7 @@ func TestNativeInRangeVectorMatchesScalar(t *testing.T) {
 	for i := range v {
 		v[i] = byte(i * 17)
 	}
-	for lo := 0; lo < 256; lo++ {
+	for lo := range 256 {
 		for hi := lo; hi < 256; hi++ {
 			if got, want := backend.InRangeMask(v, byte(lo), byte(hi)), reference.InRangeMask(v, byte(lo), byte(hi)); got != want {
 				t.Fatalf("固定向量 lo=%d hi=%d got=%016b want=%016b", lo, hi, got, want)
@@ -27,7 +27,7 @@ func TestNativeInRangeVectorMatchesScalar(t *testing.T) {
 		}
 	}
 	rng := rand.New(rand.NewSource(20240920))
-	for i := 0; i < 20000; i++ {
+	for range 20000 {
 		for j := range v {
 			v[j] = byte(rng.Intn(256))
 		}

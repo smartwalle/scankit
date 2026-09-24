@@ -3,7 +3,10 @@ package simd
 
 import "github.com/smartwalle/scankit/internal/simd/generic"
 
+// Vector 是一个向量的字节别名，可移植后端固定使用 16 字节宽度。
 type Vector = generic.Vector
+
+// Backend 定义向量后端需要提供的加载、掩码和位运算契约。
 type Backend interface {
 	Load([]byte, int) (Vector, bool)
 	PartialLoad([]byte, int) Vector
@@ -36,32 +39,74 @@ type Backend interface {
 	AnyLess(Vector, Vector) bool
 }
 
+// GenericBackend 是纯 Go 标量参考实现，可在任意平台编译。
 type GenericBackend struct{}
 
-func (GenericBackend) Load(d []byte, o int) (Vector, bool)   { return generic.Load(d, o) }
-func (GenericBackend) PartialLoad(d []byte, o int) Vector    { return generic.PartialLoad(d, o) }
-func (GenericBackend) SafeLoad(d []byte, o int) Vector       { return generic.SafeLoad(d, o) }
-func (GenericBackend) Store(d []byte, o int, v Vector) bool  { return generic.Store(d, o, v) }
-func (GenericBackend) EqualMask(a, b Vector) uint16          { return generic.EqualMask(a, b) }
+// Load 从 data 的 offset 处加载完整向量，数据不足时返回 false。
+func (GenericBackend) Load(d []byte, o int) (Vector, bool) { return generic.Load(d, o) }
+
+// PartialLoad 从 offset 处加载最多一个向量的数据，缺失字节补零。
+func (GenericBackend) PartialLoad(d []byte, o int) Vector { return generic.PartialLoad(d, o) }
+
+// SafeLoad 与 PartialLoad 等价，永不越界。
+func (GenericBackend) SafeLoad(d []byte, o int) Vector { return generic.SafeLoad(d, o) }
+
+// Store 将向量写入 dst 的 offset 处，空间不足时不写入并返回 false。
+func (GenericBackend) Store(d []byte, o int, v Vector) bool { return generic.Store(d, o, v) }
+
+// EqualMask 返回两个向量逐字节相等的掩码。
+func (GenericBackend) EqualMask(a, b Vector) uint16 { return generic.EqualMask(a, b) }
+
+// EqualByteMask 返回向量与单字节相等的逐字节掩码。
 func (GenericBackend) EqualByteMask(a Vector, c byte) uint16 { return generic.EqualByteMask(a, c) }
+
+// EqualByteMaskFold 返回按 ASCII 折叠大小写后比较的逐字节掩码。
 func (GenericBackend) EqualByteMaskFold(a Vector, c byte) uint16 {
 	return generic.EqualByteMaskFold(a, c)
 }
+
+// ByteSetMask 返回向量中各字节是否命中 256 位字节集的掩码。
 func (GenericBackend) ByteSetMask(a Vector, set [4]uint64) uint16 {
 	return generic.ByteSetMask(a, set)
 }
+
+// InRangeMask 返回落在闭区间 [lo, hi] 内的字节掩码。
 func (GenericBackend) InRangeMask(a Vector, lo, hi byte) uint16 {
 	return generic.InRangeMask(a, lo, hi)
 }
-func (GenericBackend) GreaterMask(a, b Vector) uint16         { return generic.GreaterMask(a, b) }
-func (GenericBackend) LessMask(a, b Vector) uint16            { return generic.LessMask(a, b) }
-func (GenericBackend) Not(a Vector) Vector                    { return generic.Not(a) }
-func (GenericBackend) AndNot(a, b Vector) Vector              { return generic.AndNot(a, b) }
+
+// GreaterMask 返回逐字节无符号大于比较的掩码。
+func (GenericBackend) GreaterMask(a, b Vector) uint16 { return generic.GreaterMask(a, b) }
+
+// LessMask 返回逐字节无符号小于比较的掩码。
+func (GenericBackend) LessMask(a, b Vector) uint16 { return generic.LessMask(a, b) }
+
+// Not 返回逐字节取反的向量。
+func (GenericBackend) Not(a Vector) Vector { return generic.Not(a) }
+
+// AndNot 返回 a 按位与非 b 的向量。
+func (GenericBackend) AndNot(a, b Vector) Vector { return generic.AndNot(a, b) }
+
+// Select 按掩码逐字节选择 yes 或 no 的取值。
 func (GenericBackend) Select(m uint16, yes, no Vector) Vector { return generic.Select(m, yes, no) }
-func (GenericBackend) And(a, b Vector) Vector                 { return generic.And(a, b) }
-func (GenericBackend) Or(a, b Vector) Vector                  { return generic.Or(a, b) }
-func (GenericBackend) Xor(a, b Vector) Vector                 { return generic.Xor(a, b) }
-func (GenericBackend) Permute(a, b Vector) Vector             { return generic.Permute(a, b) }
-func (GenericBackend) AnyGreater(a, b Vector) bool            { return generic.AnyGreater(a, b) }
-func (GenericBackend) AnyLess(a, b Vector) bool               { return generic.AnyLess(a, b) }
-func Default() Backend                                        { return GenericBackend{} }
+
+// And 返回逐字节按位与的向量。
+func (GenericBackend) And(a, b Vector) Vector { return generic.And(a, b) }
+
+// Or 返回逐字节按位或的向量。
+func (GenericBackend) Or(a, b Vector) Vector { return generic.Or(a, b) }
+
+// Xor 返回逐字节按位异或的向量。
+func (GenericBackend) Xor(a, b Vector) Vector { return generic.Xor(a, b) }
+
+// Permute 按 index 的低 4 位重排 a 的字节。
+func (GenericBackend) Permute(a, b Vector) Vector { return generic.Permute(a, b) }
+
+// AnyGreater 判断是否存在 a 大于 b 的字节位置。
+func (GenericBackend) AnyGreater(a, b Vector) bool { return generic.AnyGreater(a, b) }
+
+// AnyLess 判断是否存在 a 小于 b 的字节位置。
+func (GenericBackend) AnyLess(a, b Vector) bool { return generic.AnyLess(a, b) }
+
+// Default 返回可移植的标量后端，作为缺少原生内核时的兜底实现。
+func Default() Backend { return GenericBackend{} }

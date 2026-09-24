@@ -284,7 +284,7 @@ func BenchmarkEditClassConfirmation(b *testing.B) {
 	data := []byte("axd")
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, _ = matchEditAtoms(atoms, data, 0, 1, 0)
 	}
 }

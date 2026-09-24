@@ -249,6 +249,7 @@ func (m *Matcher) Clone() *Matcher {
 	return New(m.Literals())
 }
 
+// Len 返回匹配器中的文字数量。
 func (m *Matcher) Len() int {
 	if m == nil {
 		return 0

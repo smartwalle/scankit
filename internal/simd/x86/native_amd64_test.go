@@ -25,18 +25,18 @@ func x86ByteSetSets() [][4]uint64 {
 		{},
 		{^uint64(0), ^uint64(0), ^uint64(0), ^uint64(0)},
 	}
-	for h := 0; h < 16; h++ {
+	for h := range 16 {
 		var set [4]uint64
 		set[h>>2] |= uint64(0xFFFF) << (uint(h&3) * 16)
 		sets = append(sets, set)
 	}
-	for b := 0; b < 256; b++ {
+	for b := range 256 {
 		var set [4]uint64
 		set[b/64] = 1 << uint(b%64)
 		sets = append(sets, set)
 	}
 	rng := rand.New(rand.NewSource(7))
-	for i := 0; i < 128; i++ {
+	for range 128 {
 		var set [4]uint64
 		for w := range set {
 			set[w] = rng.Uint64()
@@ -50,8 +50,8 @@ func x86ByteSetSets() [][4]uint64 {
 func TestNativeByteSetMaskMatchesGeneric(t *testing.T) {
 	for _, raw := range x86ByteSetSets() {
 		set := simd.NewByteSet(raw)
-		for b := 0; b < 256; b++ {
-			for lane := 0; lane < generic.Width; lane++ {
+		for b := range 256 {
+			for lane := range generic.Width {
 				var v generic.Vector
 				v[lane] = byte(b)
 				want := generic.ByteSetMask(v, raw)
@@ -67,7 +67,7 @@ func TestNativeByteSetMaskMatchesGeneric(t *testing.T) {
 func TestNativeByteSetMaskRandomVectors(t *testing.T) {
 	rng := rand.New(rand.NewSource(11))
 	sets := x86ByteSetSets()
-	for i := 0; i < 20000; i++ {
+	for range 20000 {
 		raw := sets[rng.Intn(len(sets))]
 		set := simd.NewByteSet(raw)
 		var v generic.Vector
@@ -83,9 +83,9 @@ func TestNativeByteSetMaskRandomVectors(t *testing.T) {
 
 // TestNativeInRangeMaskMatchesGeneric 覆盖全部 256x256 区间组合与端点位。
 func TestNativeInRangeMaskMatchesGeneric(t *testing.T) {
-	for lo := 0; lo < 256; lo++ {
-		for hi := 0; hi < 256; hi++ {
-			for lane := 0; lane < generic.Width; lane++ {
+	for lo := range 256 {
+		for hi := range 256 {
+			for lane := range generic.Width {
 				for b := 0; b < 256; b += 17 {
 					var v generic.Vector
 					for j := range v {
@@ -109,7 +109,7 @@ func TestX86BackendNativeMasksMatchGeneric(t *testing.T) {
 		t.Skipf("host lacks SSE4, effective tier=%v", tier)
 	}
 	rng := rand.New(rand.NewSource(5))
-	for i := 0; i < 5000; i++ {
+	for range 5000 {
 		var v generic.Vector
 		for j := range v {
 			v[j] = byte(rng.Intn(256))
@@ -172,7 +172,7 @@ func BenchmarkNativeMasks(b *testing.B) {
 func TestNativeByteSetMask32CoversAllValues(t *testing.T) {
 	for _, raw := range x86ByteSetSets() {
 		set := simd.NewByteSet(raw)
-		for b := 0; b < 256; b++ {
+		for b := range 256 {
 			window := make([]byte, simd.SuperWidth)
 			for i := range window {
 				window[i] = byte(b)
@@ -191,11 +191,11 @@ func TestNativeByteSetMask32CoversAllValues(t *testing.T) {
 // TestNativeByteSetMask32PinsBitOrder 使用单字节集合逐位置验证掩码位序：
 // 第 i 位必须对应窗口内第 i 个字节，跨两个 128 位半区不发生错位。
 func TestNativeByteSetMask32PinsBitOrder(t *testing.T) {
-	for b := 0; b < 256; b++ {
+	for b := range 256 {
 		var raw [4]uint64
 		raw[b/64] = 1 << uint(b%64)
 		set := simd.NewByteSet(raw)
-		for lane := 0; lane < simd.SuperWidth; lane++ {
+		for lane := range simd.SuperWidth {
 			window := make([]byte, simd.SuperWidth)
 			for i := range window {
 				window[i] = byte(b + 1)
@@ -213,7 +213,7 @@ func TestNativeByteSetMask32PinsBitOrder(t *testing.T) {
 func TestNativeByteSetMask32RandomWindows(t *testing.T) {
 	rng := rand.New(rand.NewSource(13))
 	sets := x86ByteSetSets()
-	for i := 0; i < 20000; i++ {
+	for range 20000 {
 		raw := sets[rng.Intn(len(sets))]
 		set := simd.NewByteSet(raw)
 		window := make([]byte, simd.SuperWidth)
@@ -245,7 +245,7 @@ func BenchmarkNativeByteSetMask32(b *testing.B) {
 	}
 	b.ReportAllocs()
 	var acc uint32
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		acc |= nativeByteSetMask32(window, tables)
 	}
 	if acc == 0 {
@@ -260,7 +260,7 @@ func TestNativeByteSetMask32AVX2CoversAllValues(t *testing.T) {
 	}
 	for _, raw := range x86ByteSetSets() {
 		set := simd.NewByteSet(raw)
-		for b := 0; b < 256; b++ {
+		for b := range 256 {
 			window := make([]byte, simd.SuperWidth)
 			for i := range window {
 				window[i] = byte(b)
@@ -281,11 +281,11 @@ func TestNativeByteSetMask32AVX2PinsBitOrder(t *testing.T) {
 	if !avx2Executable() {
 		t.Skip("当前环境未声明 AVX2 能力")
 	}
-	for b := 0; b < 256; b++ {
+	for b := range 256 {
 		var raw [4]uint64
 		raw[b/64] = 1 << uint(b%64)
 		set := simd.NewByteSet(raw)
-		for lane := 0; lane < simd.SuperWidth; lane++ {
+		for lane := range simd.SuperWidth {
 			window := make([]byte, simd.SuperWidth)
 			for i := range window {
 				window[i] = byte(b - 1)
@@ -306,7 +306,7 @@ func TestNativeByteSetMask32AVX2MatchesSSE(t *testing.T) {
 	}
 	rng := rand.New(rand.NewSource(23))
 	sets := x86ByteSetSets()
-	for i := 0; i < 20000; i++ {
+	for range 20000 {
 		raw := sets[rng.Intn(len(sets))]
 		set := simd.NewByteSet(raw)
 		window := make([]byte, simd.SuperWidth)
@@ -333,7 +333,7 @@ func TestBackendWindowMaskAVX2MatchesScalar(t *testing.T) {
 	for i := range data {
 		data[i] = byte(rng.Intn(256))
 	}
-	for iter := 0; iter < 64; iter++ {
+	for iter := range 64 {
 		var laneSets [4][4]uint64
 		for lane := range laneSets {
 			for word := range laneSets[lane] {
@@ -341,7 +341,7 @@ func TestBackendWindowMaskAVX2MatchesScalar(t *testing.T) {
 					laneSets[lane][word] = rng.Uint64()
 					continue
 				}
-				for n := 0; n < 4; n++ {
+				for range 4 {
 					value := rng.Intn(256)
 					laneSets[lane][value/64] |= 1 << uint(value%64)
 				}
@@ -378,7 +378,7 @@ func BenchmarkNativeByteSetMask32AVX2(b *testing.B) {
 	}
 	b.ReportAllocs()
 	var acc uint32
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		acc |= nativeByteSetMask32AVX2(window, tables)
 	}
 	if acc == 0 {
@@ -424,7 +424,7 @@ func wideKernelCases() []struct {
 		raw    [4]uint64
 	}, 0, 256+len(sets))
 	// 每个窗口内所有字节相同，逐值确认命中/未命中判定与 64 位位序。
-	for b := 0; b < 256; b++ {
+	for b := range 256 {
 		window := make([]byte, simd.WideWidth)
 		for i := range window {
 			window[i] = byte(b)
@@ -448,7 +448,7 @@ func wideKernelCases() []struct {
 			raw    [4]uint64
 		}{window, raw})
 	}
-	for b := 0; b < 256; b++ {
+	for b := range 256 {
 		window := make([]byte, simd.WideWidth)
 		for i := range window {
 			window[i] = byte(b + 1)
@@ -535,7 +535,7 @@ func TestBackendWindowMask64AVX2MatchesScalar(t *testing.T) {
 	for i := range data {
 		data[i] = byte(rng.Intn(256))
 	}
-	for iter := 0; iter < 64; iter++ {
+	for iter := range 64 {
 		var laneSets [4][4]uint64
 		for lane := range laneSets {
 			for word := range laneSets[lane] {
@@ -543,7 +543,7 @@ func TestBackendWindowMask64AVX2MatchesScalar(t *testing.T) {
 					laneSets[lane][word] = rng.Uint64()
 					continue
 				}
-				for n := 0; n < 4; n++ {
+				for range 4 {
 					value := rng.Intn(256)
 					laneSets[lane][value/64] |= 1 << uint(value%64)
 				}
@@ -579,7 +579,7 @@ func TestBackendWindowMask64AVX512MatchesScalar(t *testing.T) {
 			continue
 		}
 		backend := Backend{tier: tier, resolved: tier}
-		for iter := 0; iter < 64; iter++ {
+		for iter := range 64 {
 			var laneSets [4][4]uint64
 			for lane := range laneSets {
 				for word := range laneSets[lane] {

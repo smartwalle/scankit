@@ -42,13 +42,13 @@ func Replace(data []byte, matches []Match, fn ReplaceFunc) []byte {
 // Mask 使用 fn 原地修改 data 中的匹配片段。重叠片段按与 Replace 相同的规则处理。
 //
 // matched 与 data 共享底层数组，长度固定。
-// Mask 会原地重排 matches，并返回 data；调用方需要保留原始数据时必须传入副本。
-func Mask(data []byte, matches []Match, fn MaskFunc) []byte {
+// Mask 会原地重排 matches，并把修改直接写回 data；调用方需要保留原始数据时必须传入副本。
+func Mask(data []byte, matches []Match, fn MaskFunc) {
 	if len(matches) == 0 {
-		return data
+		return
 	}
 	if fn == nil {
-		return data
+		return
 	}
 	matches = resolveOverlappingMatches(matches)
 	for _, match := range matches {
@@ -57,7 +57,6 @@ func Mask(data []byte, matches []Match, fn MaskFunc) []byte {
 		}
 		fn(match, data[match.From:match.To])
 	}
-	return data
 }
 
 // resolveOverlappingMatches 原地排序 matches，并保留优先级最高的不重叠片段。

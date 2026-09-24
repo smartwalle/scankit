@@ -62,17 +62,16 @@ func BenchmarkPIIRedaction(b *testing.B) {
 					b.Run("EngineMask", func(b *testing.B) {
 						data := make([]byte, len(fixture.data))
 						copy(data, fixture.data)
-						if _, err := fixture.engine.Mask(data, maskPIIValue); err != nil {
+						if err := fixture.engine.Mask(data, maskPIIValue); err != nil {
 							b.Fatal(err)
 						}
 						startPIIBenchmarkTimer(b, fixture)
 						for range b.N {
 							copy(data, fixture.data)
-							result, err := fixture.engine.Mask(data, maskPIIValue)
-							if err != nil {
+							if err := fixture.engine.Mask(data, maskPIIValue); err != nil {
 								b.Fatal(err)
 							}
-							piiBenchmarkBytesSink = result
+							piiBenchmarkBytesSink = data
 						}
 					})
 
@@ -203,7 +202,7 @@ func newPIIBenchmarkFixture(b testing.TB, scenario piiBenchmarkScenario, density
 		b.Fatal(err)
 	}
 	maskedInput := append([]byte(nil), data...)
-	if _, err := engine.Mask(maskedInput, maskPIIValue); err != nil {
+	if err := engine.Mask(maskedInput, maskPIIValue); err != nil {
 		b.Fatal(err)
 	}
 	if !bytes.Equal(maskedInput, fixture.masked) {
@@ -227,13 +226,13 @@ func newPIIBenchmarkLog(scenario piiBenchmarkScenario, density piiBenchmarkDensi
 		}
 		switch index % 4 {
 		case 0:
-			builder.WriteString(`{"ts":"2026-08-25T10:30:00+08:00","level":"INFO","service":"payment","用户":"张三","message":"支付完成 payment completed","context":"` + payload + `"}` + "\n")
+			fmt.Fprintf(&builder, "{\"ts\":\"2026-08-25T10:30:00+08:00\",\"level\":\"INFO\",\"service\":\"payment\",\"用户\":\"张三\",\"message\":\"支付完成 payment completed\",\"context\":\"%s\"}\n", payload)
 		case 1:
-			builder.WriteString("ts=2026-08-25T10:30:00+08:00 level=WARN service=order " + payload + " 服务=订单中心 user=alice message=库存不足 inventory retry\n")
+			fmt.Fprintf(&builder, "ts=2026-08-25T10:30:00+08:00 level=WARN service=order %s 服务=订单中心 user=alice message=库存不足 inventory retry\n", payload)
 		case 2:
-			builder.WriteString("10.12.0." + fmt.Sprint(index%255) + " - - [25/Aug/2026:10:30:00 +0800] \"POST /api/v1/pay HTTP/1.1\" 200 421 query=order upstream=payment " + payload + " note=支付成功\n")
+			fmt.Fprintf(&builder, "10.12.0.%d - - [25/Aug/2026:10:30:00 +0800] \"POST /api/v1/pay HTTP/1.1\" 200 421 query=order upstream=payment %s note=支付成功\n", index%255, payload)
 		default:
-			builder.WriteString("ERROR service=inventory 服务=库存中心 trace=req-" + fmt.Sprint(index) + " message=同步失败 sync failed\nstack=inventory.reserve:42 cause=timeout " + payload + "\n")
+			fmt.Fprintf(&builder, "ERROR service=inventory 服务=库存中心 trace=req-%d message=同步失败 sync failed\nstack=inventory.reserve:42 cause=timeout %s\n", index, payload)
 		}
 	}
 	return []byte(builder.String())
@@ -303,6 +302,7 @@ func piiBenchmarkField(scenario string, index int, valid bool) string {
 			return "credit_card=2111111111111111"
 		case "SensitiveToken":
 			return "sensitive_token=0"
+		default:
 		}
 	}
 	switch scenario {
@@ -380,30 +380,28 @@ func TestPIIRedactionStable(t *testing.T) {
 			// --- EngineMask ---
 			data := make([]byte, len(fixture.data))
 			copy(data, fixture.data)
-			for i := 0; i < 10; i++ {
+			for range 10 {
 				copy(data, fixture.data)
-				if _, err := fixture.engine.Mask(data, maskPIIValue); err != nil {
+				if err := fixture.engine.Mask(data, maskPIIValue); err != nil {
 					t.Fatal(err)
 				}
 			}
 			engineAllocs := testing.AllocsPerRun(200, func() {
 				copy(data, fixture.data)
-				result, err := fixture.engine.Mask(data, maskPIIValue)
-				if err != nil {
+				if err := fixture.engine.Mask(data, maskPIIValue); err != nil {
 					t.Fatal(err)
 				}
-				piiBenchmarkBytesSink = result
+				piiBenchmarkBytesSink = data
 			})
 			engineRes := testing.Benchmark(func(b *testing.B) {
 				data := make([]byte, len(fixture.data))
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					copy(data, fixture.data)
-					result, err := fixture.engine.Mask(data, maskPIIValue)
-					if err != nil {
+					if err := fixture.engine.Mask(data, maskPIIValue); err != nil {
 						b.Fatal(err)
 					}
-					piiBenchmarkBytesSink = result
+					piiBenchmarkBytesSink = data
 				}
 			})
 			nsPerOp := float64(engineRes.NsPerOp())
@@ -413,7 +411,7 @@ func TestPIIRedactionStable(t *testing.T) {
 				engineRes.AllocedBytesPerOp(), engineAllocs, len(fixture.matches))
 
 			// --- GoRegexpReplace ---
-			for i := 0; i < 10; i++ {
+			for range 10 {
 				piiBenchmarkBytesSink = fixture.goRegexp.ReplaceAllFunc(fixture.data, fixture.maskRegexpMatch)
 			}
 			regexpAllocs := testing.AllocsPerRun(200, func() {

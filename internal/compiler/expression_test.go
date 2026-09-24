@@ -1,9 +1,10 @@
 package compiler
 
 import (
+	"testing"
+
 	"github.com/smartwalle/scankit/internal/nfagraph"
 	"github.com/smartwalle/scankit/internal/parser"
-	"testing"
 )
 
 func TestExpressionInfo(t *testing.T) {

@@ -9,7 +9,7 @@ import (
 func sampleStates() []State {
 	rng := rand.New(rand.NewSource(20240920))
 	out := make([]State, 0, 512)
-	for i := 0; i < 512; i++ {
+	for range 512 {
 		out = append(out, State{
 			RoleID:   uint32(rng.Intn(7) + 1),
 			Offset:   uint64(rng.Intn(64)),
@@ -152,7 +152,7 @@ func TestSchedulerBulkActivationKeepsExistingLowerPriority(t *testing.T) {
 // 输入按偏移逆序给出，逐个 Push 的插入排序退化为 O(n²)。
 func BenchmarkQueuePushAll(b *testing.B) {
 	states := make([]State, 0, 4096)
-	for i := 0; i < 4096; i++ {
+	for i := range 4096 {
 		states = append(states, State{RoleID: 1, Offset: uint64(4096 - i)})
 	}
 	b.Run("bulk", func(b *testing.B) {
@@ -176,14 +176,13 @@ func BenchmarkQueuePushAll(b *testing.B) {
 // BenchmarkSchedulerActivateMatches 对比批量激活与逐个激活的扫描开销。
 func BenchmarkSchedulerActivateMatches(b *testing.B) {
 	roles := make([]Role, 0, 64)
-	for i := 0; i < 64; i++ {
+	for i := range 64 {
 		roles = append(roles, Role{ID: uint32(i + 1), ReportID: uint32(i + 1), Literal: []byte("abcdefgh")})
 	}
 	p := New(roles)
 	data := make([]byte, 4096)
 	for i := range data {
 		copy(data[i:], "abcdefgh")
-		i += 7
 	}
 	b.Run("bulk", func(b *testing.B) {
 		s := NewScheduler(p)

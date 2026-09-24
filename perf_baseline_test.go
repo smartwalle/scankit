@@ -118,12 +118,9 @@ func TestFixedCorpusDeterministicMetrics(t *testing.T) {
 // 重复只放大测量区间，不改变命中模式与选择路径。
 func fixedBenchCorpus() []byte {
 	block := conformanceMatrixCorpus()
-	repeats := (64 << 10) / len(block)
-	if repeats < 1 {
-		repeats = 1
-	}
+	repeats := max((64<<10)/len(block), 1)
 	out := make([]byte, 0, repeats*len(block))
-	for i := 0; i < repeats; i++ {
+	for range repeats {
 		out = append(out, block...)
 	}
 	return out

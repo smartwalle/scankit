@@ -4,11 +4,11 @@ package fuzzy
 import "bytes"
 
 // overLimit 返回表示“超过上限”的距离值，并避免上限为整型最大值时溢出。
-func overLimit(max int) int {
-	if max == int(^uint(0)>>1) {
-		return max
+func overLimit(limit int) int {
+	if limit == int(^uint(0)>>1) {
+		return limit
 	}
-	return max + 1
+	return limit + 1
 }
 
 // HammingDistance 返回不同位置数量；长度不一致时返回 -1。
@@ -26,7 +26,10 @@ func HammingDistance(a, b []byte) int {
 }
 
 // WithinHamming 判断等长字节串的差异是否不超过上限。
-func WithinHamming(a, b []byte, max int) bool { d := HammingDistance(a, b); return d >= 0 && d <= max }
+func WithinHamming(a, b []byte, maxDistance int) bool {
+	d := HammingDistance(a, b)
+	return d >= 0 && d <= maxDistance
+}
 
 // HammingDistanceFoldASCII 返回忽略 ASCII 大小写后的汉明距离。
 func HammingDistanceFoldASCII(a, b []byte) int {
@@ -43,28 +46,28 @@ func HammingDistanceFoldASCII(a, b []byte) int {
 }
 
 // WithinHammingFoldASCII 判断忽略 ASCII 大小写后的汉明距离是否不超过上限。
-func WithinHammingFoldASCII(a, b []byte, max int) bool {
+func WithinHammingFoldASCII(a, b []byte, maxDistance int) bool {
 	distance := HammingDistanceFoldASCII(a, b)
-	return distance >= 0 && distance <= max
+	return distance >= 0 && distance <= maxDistance
 }
 
 // EditDistance 计算编辑距离，并在超过上限时提前终止。
-func EditDistance(a, b []byte, max int) int {
-	if max < 0 {
-		return overLimit(max)
+func EditDistance(a, b []byte, maxDistance int) int {
+	if maxDistance < 0 {
+		return overLimit(maxDistance)
 	}
 	if bytes.Equal(a, b) {
 		return 0
 	}
-	if max == 0 {
+	if maxDistance == 0 {
 		return 1
 	}
 	delta := len(a) - len(b)
 	if delta < 0 {
 		delta = -delta
 	}
-	if delta > max {
-		return overLimit(max)
+	if delta > maxDistance {
+		return overLimit(maxDistance)
 	}
 	prev := make([]int, len(b)+1)
 	cur := make([]int, len(b)+1)
@@ -90,8 +93,8 @@ func EditDistance(a, b []byte, max int) int {
 				rowMin = x
 			}
 		}
-		if rowMin > max {
-			return overLimit(max)
+		if rowMin > maxDistance {
+			return overLimit(maxDistance)
 		}
 		prev, cur = cur, prev
 	}
@@ -99,24 +102,24 @@ func EditDistance(a, b []byte, max int) int {
 }
 
 // EditDistanceBanded 使用带宽限制计算编辑距离，适合较小阈值场景。
-func EditDistanceBanded(a, b []byte, max int) int {
-	if max < 0 {
-		return overLimit(max)
+func EditDistanceBanded(a, b []byte, maxDistance int) int {
+	if maxDistance < 0 {
+		return overLimit(maxDistance)
 	}
 	if bytes.Equal(a, b) {
 		return 0
 	}
-	if max == 0 {
+	if maxDistance == 0 {
 		return 1
 	}
 	if len(a) > len(b) {
 		a, b = b, a
 	}
-	if len(b)-len(a) > max {
-		return overLimit(max)
+	if len(b)-len(a) > maxDistance {
+		return overLimit(maxDistance)
 	}
-	if max >= len(b) {
-		return EditDistance(a, b, max)
+	if maxDistance >= len(b) {
+		return EditDistance(a, b, maxDistance)
 	}
 	const inf = int(^uint(0) >> 1)
 	prev := make([]int, len(b)+1)
@@ -128,7 +131,7 @@ func EditDistanceBanded(a, b []byte, max int) int {
 		for j := range cur {
 			cur[j] = inf
 		}
-		lo, hi := i-max, i+max
+		lo, hi := i-maxDistance, i+maxDistance
 		if lo < 1 {
 			lo = 1
 		}
@@ -155,27 +158,29 @@ func EditDistanceBanded(a, b []byte, max int) int {
 				rowMin = v
 			}
 		}
-		if rowMin > max {
-			return overLimit(max)
+		if rowMin > maxDistance {
+			return overLimit(maxDistance)
 		}
 		prev, cur = cur, prev
 	}
-	if prev[len(b)] > max {
-		return overLimit(max)
+	if prev[len(b)] > maxDistance {
+		return overLimit(maxDistance)
 	}
 	return prev[len(b)]
 }
-func WithinEdit(a, b []byte, max int) bool {
-	if max < 0 {
+
+// WithinEdit 判断两个字节串的编辑距离是否不超过 maxDistance。
+func WithinEdit(a, b []byte, maxDistance int) bool {
+	if maxDistance < 0 {
 		return false
 	}
-	return EditDistanceBanded(a, b, max) <= max
+	return EditDistanceBanded(a, b, maxDistance) <= maxDistance
 }
 
 // EditDistanceFoldASCII 计算忽略 ASCII 大小写后的有界编辑距离。
-func EditDistanceFoldASCII(a, b []byte, max int) int {
-	if max < 0 {
-		return overLimit(max)
+func EditDistanceFoldASCII(a, b []byte, maxDistance int) int {
+	if maxDistance < 0 {
+		return overLimit(maxDistance)
 	}
 	if len(a) == len(b) {
 		equal := true
@@ -189,15 +194,15 @@ func EditDistanceFoldASCII(a, b []byte, max int) int {
 			return 0
 		}
 	}
-	if max == 0 {
+	if maxDistance == 0 {
 		return 1
 	}
 	delta := len(a) - len(b)
 	if delta < 0 {
 		delta = -delta
 	}
-	if delta > max {
-		return overLimit(max)
+	if delta > maxDistance {
+		return overLimit(maxDistance)
 	}
 	prev := make([]int, len(b)+1)
 	cur := make([]int, len(b)+1)
@@ -223,8 +228,8 @@ func EditDistanceFoldASCII(a, b []byte, max int) int {
 				rowMin = cost
 			}
 		}
-		if rowMin > max {
-			return overLimit(max)
+		if rowMin > maxDistance {
+			return overLimit(maxDistance)
 		}
 		prev, cur = cur, prev
 	}
@@ -232,16 +237,16 @@ func EditDistanceFoldASCII(a, b []byte, max int) int {
 }
 
 // WithinEditFoldASCII 判断忽略 ASCII 大小写后的编辑距离是否不超过上限。
-func WithinEditFoldASCII(a, b []byte, max int) bool {
-	if max < 0 {
+func WithinEditFoldASCII(a, b []byte, maxDistance int) bool {
+	if maxDistance < 0 {
 		return false
 	}
-	return editDistanceBandedFoldASCII(a, b, max) <= max
+	return editDistanceBandedFoldASCII(a, b, maxDistance) <= maxDistance
 }
 
-func editDistanceBandedFoldASCII(a, b []byte, max int) int {
-	if max < 0 {
-		return overLimit(max)
+func editDistanceBandedFoldASCII(a, b []byte, maxDistance int) int {
+	if maxDistance < 0 {
+		return overLimit(maxDistance)
 	}
 	if len(a) == len(b) {
 		equal := true
@@ -255,17 +260,17 @@ func editDistanceBandedFoldASCII(a, b []byte, max int) int {
 			return 0
 		}
 	}
-	if max == 0 {
+	if maxDistance == 0 {
 		return 1
 	}
 	if len(a) > len(b) {
 		a, b = b, a
 	}
-	if len(b)-len(a) > max {
-		return overLimit(max)
+	if len(b)-len(a) > maxDistance {
+		return overLimit(maxDistance)
 	}
-	if max >= len(b) {
-		return EditDistanceFoldASCII(a, b, max)
+	if maxDistance >= len(b) {
+		return EditDistanceFoldASCII(a, b, maxDistance)
 	}
 	const inf = int(^uint(0) >> 1)
 	prev := make([]int, len(b)+1)
@@ -277,7 +282,7 @@ func editDistanceBandedFoldASCII(a, b []byte, max int) int {
 		for j := range cur {
 			cur[j] = inf
 		}
-		lo, hi := i-max, i+max
+		lo, hi := i-maxDistance, i+maxDistance
 		if lo < 1 {
 			lo = 1
 		}
@@ -304,13 +309,13 @@ func editDistanceBandedFoldASCII(a, b []byte, max int) int {
 				rowMin = v
 			}
 		}
-		if rowMin > max {
-			return overLimit(max)
+		if rowMin > maxDistance {
+			return overLimit(maxDistance)
 		}
 		prev, cur = cur, prev
 	}
-	if prev[len(b)] > max {
-		return overLimit(max)
+	if prev[len(b)] > maxDistance {
+		return overLimit(maxDistance)
 	}
 	return prev[len(b)]
 }
@@ -321,7 +326,11 @@ func foldASCII(value byte) byte {
 	}
 	return value
 }
-func Similar(a, b []byte, max int) bool { return WithinEdit(a, b, max) }
+
+// Similar 判断两个字节串是否在 maxDistance 编辑距离内。
+func Similar(a, b []byte, maxDistance int) bool { return WithinEdit(a, b, maxDistance) }
+
+// Equal 判断两个字节串是否逐字节相等。
 func Equal(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
@@ -333,23 +342,30 @@ func Equal(a, b []byte) bool {
 	}
 	return true
 }
-func EditDistanceLimited(a, b []byte, max int) (int, bool) {
+
+// EditDistanceLimited 返回编辑距离，并判断是否不超过 maxDistance。
+func EditDistanceLimited(a, b []byte, maxDistance int) (int, bool) {
 	// 受限接口直接使用带宽动态规划，避免在小阈值下遍历无关矩阵。
-	d := EditDistanceBanded(a, b, max)
-	return d, d <= max
+	d := EditDistanceBanded(a, b, maxDistance)
+	return d, d <= maxDistance
 }
-func WithinDistance(a, b []byte, max int) bool { return max >= 0 && WithinEdit(a, b, max) }
+
+// WithinDistance 在 maxDistance 非负时判断编辑距离是否在范围内。
+func WithinDistance(a, b []byte, maxDistance int) bool {
+	return maxDistance >= 0 && WithinEdit(a, b, maxDistance)
+}
+
+// DistanceRatio 返回按较长串长度归一的相似度，取值区间为 [0, 1]。
 func DistanceRatio(a, b []byte) float64 {
 	if len(a) == 0 && len(b) == 0 {
 		return 1
 	}
 	d := EditDistance(a, b, maxDistanceForLengths(len(a), len(b)))
-	m := len(a)
-	if len(b) > m {
-		m = len(b)
-	}
+	m := max(len(b), len(a))
 	return 1 - float64(d)/float64(m)
 }
+
+// MaxDistance 返回两个字节串的精确编辑距离。
 func MaxDistance(a, b []byte) int { return EditDistance(a, b, maxDistanceForLengths(len(a), len(b))) }
 
 func maxDistanceForLengths(a, b int) int {
@@ -370,8 +386,8 @@ func WithinRatio(a, b []byte, threshold float64) bool { return DistanceRatio(a, 
 func ValidRatio(threshold float64) bool { return threshold >= 0 && threshold <= 1 }
 
 // BestPrefix 返回与目标具有最小编辑距离的候选前缀长度和距离。
-func BestPrefix(pattern, data []byte, max int) (length, distance int, ok bool) {
-	if max < 0 {
+func BestPrefix(pattern, data []byte, maxDistance int) (length, distance int, ok bool) {
+	if maxDistance < 0 {
 		return 0, 0, false
 	}
 	// 按数据前缀逐列推进，避免对每个前缀重复构造完整 DP 矩阵。
@@ -401,12 +417,12 @@ func BestPrefix(pattern, data []byte, max int) (length, distance int, ok bool) {
 		}
 		prev, cur = cur, prev
 	}
-	return bestLength, best, best <= max
+	return bestLength, best, best <= maxDistance
 }
 
 // BestPrefixFoldASCII 返回忽略 ASCII 大小写时最优前缀。
-func BestPrefixFoldASCII(pattern, data []byte, max int) (length, distance int, ok bool) {
-	if max < 0 {
+func BestPrefixFoldASCII(pattern, data []byte, maxDistance int) (length, distance int, ok bool) {
+	if maxDistance < 0 {
 		return 0, 0, false
 	}
 	prev := make([]int, len(pattern)+1)
@@ -435,7 +451,7 @@ func BestPrefixFoldASCII(pattern, data []byte, max int) (length, distance int, o
 		}
 		prev, cur = cur, prev
 	}
-	return bestLength, best, best <= max
+	return bestLength, best, best <= maxDistance
 }
 
 // BestPrefixRange 在候选前缀长度范围内查找最小编辑距离。
@@ -552,13 +568,13 @@ func BestHammingFoldASCII(pattern, data []byte) (offset, distance int, ok bool) 
 }
 
 // FindWithinHamming 返回所有汉明距离不超过上限的窗口起点。
-func FindWithinHamming(pattern, data []byte, max int) []int {
-	if max < 0 || len(pattern) == 0 || len(pattern) > len(data) {
+func FindWithinHamming(pattern, data []byte, maxDistance int) []int {
+	if maxDistance < 0 || len(pattern) == 0 || len(pattern) > len(data) {
 		return nil
 	}
 	out := make([]int, 0)
 	for off := 0; off+len(pattern) <= len(data); off++ {
-		if WithinHamming(pattern, data[off:off+len(pattern)], max) {
+		if WithinHamming(pattern, data[off:off+len(pattern)], maxDistance) {
 			out = append(out, off)
 		}
 	}
@@ -566,8 +582,8 @@ func FindWithinHamming(pattern, data []byte, max int) []int {
 }
 
 // FindWithinEditPrefix 返回与模式编辑距离受限的所有数据前缀长度。
-func FindWithinEditPrefix(pattern, data []byte, max int) []int {
-	if max < 0 {
+func FindWithinEditPrefix(pattern, data []byte, maxDistance int) []int {
+	if maxDistance < 0 {
 		return nil
 	}
 	// 沿数据前缀逐列更新 DP，避免对每个前缀重复构造完整矩阵。
@@ -577,7 +593,7 @@ func FindWithinEditPrefix(pattern, data []byte, max int) []int {
 		prev[j] = j
 	}
 	out := make([]int, 0)
-	if prev[len(pattern)] <= max {
+	if prev[len(pattern)] <= maxDistance {
 		out = append(out, 0)
 	}
 	for i, value := range data {
@@ -587,16 +603,10 @@ func FindWithinEditPrefix(pattern, data []byte, max int) []int {
 			if pattern[j-1] != value {
 				cost = 1
 			}
-			v := prev[j-1] + cost
-			if prev[j]+1 < v {
-				v = prev[j] + 1
-			}
-			if cur[j-1]+1 < v {
-				v = cur[j-1] + 1
-			}
+			v := min(cur[j-1]+1, min(prev[j]+1, prev[j-1]+cost))
 			cur[j] = v
 		}
-		if cur[len(pattern)] <= max {
+		if cur[len(pattern)] <= maxDistance {
 			out = append(out, i+1)
 		}
 		prev, cur = cur, prev
@@ -605,12 +615,12 @@ func FindWithinEditPrefix(pattern, data []byte, max int) []int {
 }
 
 // EditDistanceInto 使用调用方提供的工作缓冲计算编辑距离。
-func EditDistanceInto(a, b []byte, max int, scratch []int) (int, bool) {
-	if max < 0 {
-		return overLimit(max), false
+func EditDistanceInto(a, b []byte, maxDistance int, scratch []int) (int, bool) {
+	if maxDistance < 0 {
+		return overLimit(maxDistance), false
 	}
 	if len(scratch) < len(b)+1 {
-		return EditDistance(a, b, max), false
+		return EditDistance(a, b, maxDistance), false
 	}
 	for j := 0; j <= len(b); j++ {
 		scratch[j] = j
@@ -637,8 +647,8 @@ func EditDistanceInto(a, b []byte, max int, scratch []int) (int, bool) {
 				rowMin = cost
 			}
 		}
-		if rowMin > max {
-			return overLimit(max), true
+		if rowMin > maxDistance {
+			return overLimit(maxDistance), true
 		}
 	}
 	return scratch[len(b)], true

@@ -107,12 +107,12 @@ func TestRepeatRangeAndReverseQueries(t *testing.T) {
 
 func TestRepeatMetadataQueries(t *testing.T) {
 	p, _ := New([]byte("xy"), 0, -1, false)
-	if p.Width() != 2 || p.CanMatchEmpty() == false {
+	if p.Width() != 2 || !p.CanMatchEmpty() {
 		t.Fatal("重复元数据错误")
 	}
-	min, max := p.Bounds()
-	if min != 0 || max != -1 {
-		t.Fatalf("边界=%d,%d", min, max)
+	minCount, maxCount := p.Bounds()
+	if minCount != 0 || maxCount != -1 {
+		t.Fatalf("边界=%d,%d", minCount, maxCount)
 	}
 }
 
@@ -162,11 +162,11 @@ func TestRepeatFindFromAndTo(t *testing.T) {
 func FuzzRepeatQueriesAreBounded(f *testing.F) {
 	f.Add([]byte("aaaa"), 1, 3)
 	f.Add([]byte(""), 0, -1)
-	f.Fuzz(func(t *testing.T, data []byte, min, max int) {
-		if min < 0 || min > 8 || max < -1 || max > 8 || max >= 0 && max < min {
+	f.Fuzz(func(t *testing.T, data []byte, minCount, maxCount int) {
+		if minCount < 0 || minCount > 8 || maxCount < -1 || maxCount > 8 || maxCount >= 0 && maxCount < minCount {
 			return
 		}
-		p, err := New([]byte("a"), min, max, true)
+		p, err := New([]byte("a"), minCount, maxCount, true)
 		if err != nil {
 			return
 		}

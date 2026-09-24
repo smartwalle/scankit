@@ -1,3 +1,4 @@
+// Package smallwrite 提供小写入模式的前缀表匹配程序。
 package smallwrite
 
 import (
@@ -6,6 +7,7 @@ import (
 	"fmt"
 )
 
+// Program 是小写入匹配程序，Bytes 为模式字节，MaxInput 限制可处理输入长度。
 type Program struct {
 	Bytes    []byte `json:"bytes"`
 	MaxInput int    `json:"max_input"`
@@ -41,11 +43,11 @@ func Load(data []byte) (*Program, error) {
 	}
 	var p Program
 	if err := json.Unmarshal(data, &p); err != nil {
-		var bytes []byte
-		if legacyErr := json.Unmarshal(data, &bytes); legacyErr != nil {
+		var legacy []byte
+		if legacyErr := json.Unmarshal(data, &legacy); legacyErr != nil {
 			return nil, err
 		}
-		return New(bytes), nil
+		return New(legacy), nil
 	}
 	if p.MaxInput < 0 {
 		return nil, fmt.Errorf("invalid max input")
@@ -53,9 +55,13 @@ func Load(data []byte) (*Program, error) {
 	return NewWithLimit(p.Bytes, p.MaxInput), nil
 }
 
+// Empty 判断程序是否缺少模式字节。
 func (p *Program) Empty() bool { return p == nil || len(p.Bytes) == 0 }
 
+// New 创建按模式长度限制输入的匹配程序。
 func New(data []byte) *Program { return NewWithLimit(data, len(data)) }
+
+// NewWithLimit 创建带输入长度预算的匹配程序，数据会被复制。
 func NewWithLimit(data []byte, maxInput int) *Program {
 	if maxInput < 0 {
 		maxInput = 0
@@ -64,6 +70,8 @@ func NewWithLimit(data []byte, maxInput int) *Program {
 	p.rebuildPrefix()
 	return p
 }
+
+// Eligible 判断输入长度是否满足程序预算。
 func (p *Program) Eligible(input []byte) bool {
 	return p != nil && (p.MaxInput == 0 || len(input) <= p.MaxInput)
 }
@@ -216,6 +224,8 @@ func (p *Program) FindEndRange(input []byte, from, to int) []int {
 	}
 	return out
 }
+
+// Run 返回输入中全部命中的结束偏移。
 func (p *Program) Run(input []byte) []byte {
 	if p == nil {
 		return nil
@@ -230,24 +240,32 @@ func (p *Program) RunChecked(input []byte) ([]byte, bool) {
 	}
 	return p.Run(input), true
 }
+
+// RunInto 复用 dst 返回输入中全部命中的结束偏移。
 func (p *Program) RunInto(dst, input []byte) []byte {
 	if p == nil {
 		return dst
 	}
 	return append(dst, input...)
 }
+
+// Size 返回模式字节长度。
 func (p *Program) Size() int {
 	if p == nil {
 		return 0
 	}
 	return len(p.Bytes)
 }
+
+// Clone 深拷贝程序，结果与原程序不共享模式字节。
 func (p *Program) Clone() *Program {
 	if p == nil {
 		return nil
 	}
 	return NewWithLimit(p.Bytes, p.MaxInput)
 }
+
+// BytesCopy 返回模式字节的副本。
 func (p *Program) BytesCopy() []byte {
 	if p == nil {
 		return nil

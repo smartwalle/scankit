@@ -78,7 +78,7 @@ func BenchmarkMatcherFind(b *testing.B) {
 	data := []byte("abc0123456789abc")
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = m.Find(data)
 	}
 }

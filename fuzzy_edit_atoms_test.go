@@ -10,4 +10,4 @@ func TestMatchEditAtomsRetainsDeletionDistanceWhenInputIsShort(t *testing.T) {
 	}
 }
 
-func bytePtr(v byte) *byte { return &v }
+func bytePtr(v byte) *byte { return new(v) }

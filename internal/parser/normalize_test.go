@@ -29,7 +29,7 @@ func TestNormalizeClassRangesAndAlternation(t *testing.T) {
 }
 func FuzzNormalize(f *testing.F) {
 	f.Add("abc|def")
-	f.Fuzz(func(t *testing.T, p string) {
+	f.Fuzz(func(_ *testing.T, p string) {
 		r, e := Parse(p)
 		if e != nil {
 			return

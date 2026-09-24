@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"math/bits"
 	"slices"
-	"sort"
 
 	"github.com/smartwalle/scankit/internal/dispatch"
 	"github.com/smartwalle/scankit/internal/hwlm"
@@ -81,7 +80,7 @@ func freeze(b *builder, label []byte) *node {
 	for key := range b.next {
 		keys = append(keys, key)
 	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	slices.Sort(keys)
 	n := &node{label: label, labelLen: len(label), terminal: b.terminal}
 	if len(label) > 0 && len(label) <= 8 {
 		for index, value := range label {
@@ -444,6 +443,7 @@ func (m *Matcher) Clone() *Matcher {
 	return New(m.Literals())
 }
 
+// Len 返回匹配器中的文字数量。
 func (m *Matcher) Len() int {
 	if m == nil {
 		return 0

@@ -1,5 +1,6 @@
 package parser
 
+// Walk 深度优先遍历 AST，fn 返回 false 时跳过该节点的子树。
 func Walk(root Node, fn func(Node) bool) {
 	if root == nil || fn == nil || !fn(root) {
 		return
@@ -29,6 +30,9 @@ func Walk(root Node, fn func(Node) bool) {
 		Walk(v.Right, fn)
 	case CombinationNot:
 		Walk(v.Child, fn)
+	default:
 	}
 }
+
+// NodeCount 返回 AST 中的节点总数。
 func NodeCount(root Node) int { n := 0; Walk(root, func(Node) bool { n++; return true }); return n }

@@ -49,7 +49,7 @@ func TestMiracleCandidatesMatchMatcherEngine(t *testing.T) {
 		if !program.miracleReady || program.matcher != nil {
 			t.Fatalf("角色集 %d 未走候选路径: ready=%v matcher=%v", setIndex, program.miracleReady, program.matcher != nil)
 		}
-		for trial := 0; trial < 2000; trial++ {
+		for trial := range 2000 {
 			alphabet := alphabets[rng.Intn(len(alphabets))]
 			length := rng.Intn(200)
 			data := make([]byte, length)

@@ -13,7 +13,7 @@ func TestQueuePeek(t *testing.T) {
 	}
 }
 
-func TestNilQueuePushIsSafe(t *testing.T) {
+func TestNilQueuePushIsSafe(_ *testing.T) {
 	var q *Queue[int]
 	q.Push(1)
 }

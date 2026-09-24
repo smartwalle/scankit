@@ -1,9 +1,10 @@
 package engine
 
 import (
+	"testing"
+
 	"github.com/smartwalle/scankit/internal/nfagraph"
 	"github.com/smartwalle/scankit/internal/parser"
-	"testing"
 )
 
 func TestBuildBackends(t *testing.T) {

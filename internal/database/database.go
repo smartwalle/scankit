@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"runtime"
 )
 
+// Version 是当前数据库序列化格式的版本号。
 const Version = 1
 
 const (
@@ -17,6 +19,7 @@ const (
 	maxDatabasePrograms = 1 << 20
 )
 
+// Database 是不可变的编译程序集合，附带版本、架构和资源需求元数据。
 type Database[T any] struct {
 	Programs     []T    `json:"programs"`
 	Version      int    `json:"version"`
@@ -25,10 +28,12 @@ type Database[T any] struct {
 	Digest       string `json:"digest,omitempty"`
 }
 
+// New 创建绑定当前架构的数据库，并复制程序集合。
 func New[T any](programs []T) *Database[T] {
 	return &Database[T]{Programs: append([]T(nil), programs...), Version: Version, Architecture: runtime.GOARCH}
 }
 
+// Validate 检查版本、架构、程序数量和摘要是否合法。
 func (d *Database[T]) Validate() error {
 	if d == nil {
 		return fmt.Errorf("nil database")
@@ -64,6 +69,7 @@ func (d *Database[T]) ValidatePrograms(check func(T) error) error {
 	return nil
 }
 
+// Marshal 序列化数据库并写入内容摘要。
 func (d *Database[T]) Marshal() ([]byte, error) {
 	if err := d.Validate(); err != nil {
 		return nil, err
@@ -117,6 +123,8 @@ func (d *Database[T]) ValidateDigest() error {
 	}
 	return nil
 }
+
+// Unmarshal 从 JSON 负载恢复数据库，并校验版本与摘要。
 func Unmarshal[T any](data []byte) (*Database[T], error) {
 	if len(data) > maxDatabaseBytes {
 		return nil, fmt.Errorf("database payload exceeds size limit")
@@ -127,7 +135,7 @@ func Unmarshal[T any](data []byte) (*Database[T], error) {
 	if err := decoder.Decode(&d); err != nil {
 		return nil, err
 	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		if err == nil {
 			return nil, fmt.Errorf("database payload contains multiple values")
 		}
@@ -151,12 +159,16 @@ func Unmarshal[T any](data []byte) (*Database[T], error) {
 	}
 	return &d, nil
 }
+
+// Len 返回程序数量，nil 数据库返回 0。
 func (d *Database[T]) Len() int {
 	if d == nil {
 		return 0
 	}
 	return len(d.Programs)
 }
+
+// Clone 复制数据库，程序集合使用新的底层数组。
 func (d *Database[T]) Clone() *Database[T] {
 	if d == nil {
 		return nil
@@ -165,12 +177,16 @@ func (d *Database[T]) Clone() *Database[T] {
 	out.Programs = append([]T(nil), d.Programs...)
 	return &out
 }
+
+// ScratchRequirement 返回编译期声明的单次扫描存储需求。
 func (d *Database[T]) ScratchRequirement() uint64 {
 	if d == nil {
 		return 0
 	}
 	return d.ScratchBytes
 }
+
+// ArchitectureCompatible 判断数据库架构是否与当前运行时一致，空架构视为通配。
 func (d *Database[T]) ArchitectureCompatible() bool {
 	return d != nil && (d.Architecture == "" || d.Architecture == runtime.GOARCH)
 }
@@ -187,8 +203,8 @@ func (d *Database[T]) CompatibleWith(other *Database[T]) bool {
 func (d *Database[T]) ProgramCount() int { return d.Len() }
 
 // ScratchSufficient 判断提供的 scratch 容量是否满足数据库声明。
-func (d *Database[T]) ScratchSufficient(bytes uint64) bool {
-	return d != nil && bytes >= d.ScratchBytes
+func (d *Database[T]) ScratchSufficient(size uint64) bool {
+	return d != nil && size >= d.ScratchBytes
 }
 
 // ArchitectureValue 返回数据库目标架构。
@@ -238,9 +254,11 @@ func (d *Database[T]) RefreshDigest() (string, error) {
 	}
 	return d.Digest, nil
 }
-func (d *Database[T]) SetScratchRequirement(bytes uint64) {
+
+// SetScratchRequirement 更新存储需求并清除旧摘要。
+func (d *Database[T]) SetScratchRequirement(size uint64) {
 	if d != nil {
-		d.ScratchBytes = bytes
+		d.ScratchBytes = size
 		d.Digest = ""
 	}
 }
@@ -269,6 +287,8 @@ func (d *Database[T]) SetPrograms(programs []T) {
 	d.Programs = append(d.Programs[:0], programs...)
 	d.Digest = ""
 }
+
+// ProgramsCopy 返回程序集合的浅拷贝。
 func (d *Database[T]) ProgramsCopy() []T {
 	if d == nil {
 		return nil
@@ -283,13 +303,19 @@ func (d *Database[T]) ClearPrograms() {
 		d.Digest = ""
 	}
 }
+
+// Empty 判断数据库是否不含任何程序。
 func (d *Database[T]) Empty() bool { return d == nil || len(d.Programs) == 0 }
+
+// VersionValue 返回数据库记录的版本号。
 func (d *Database[T]) VersionValue() int {
 	if d == nil {
 		return 0
 	}
 	return d.Version
 }
+
+// IsCurrent 判断数据库版本是否为当前格式版本。
 func (d *Database[T]) IsCurrent() bool { return d != nil && d.Version == Version }
 
 // DigestValue 返回当前序列化摘要；未序列化或已修改时为空。

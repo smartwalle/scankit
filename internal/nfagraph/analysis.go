@@ -2,6 +2,7 @@ package nfagraph
 
 import (
 	"reflect"
+	"slices"
 	"sort"
 
 	"github.com/smartwalle/scankit/internal/graph"
@@ -90,7 +91,7 @@ func AcceptReachable(g *Graph) []graph.Vertex {
 			out = append(out, id)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 
@@ -309,7 +310,7 @@ func EquivalentNodePairs(g *Graph) [][2]graph.Vertex {
 	}
 	ids := g.Flow.Vertices()
 	out := make([][2]graph.Vertex, 0)
-	for i := 0; i < len(ids); i++ {
+	for i := range ids {
 		for j := i + 1; j < len(ids); j++ {
 			a, b := g.Nodes[ids[i]], g.Nodes[ids[j]]
 			if a == nil || b == nil {

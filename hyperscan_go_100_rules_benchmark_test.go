@@ -455,16 +455,15 @@ func BenchmarkHyperscanGo100Rules(b *testing.B) {
 			fixture := newHyperscan100RulesFixture(b, size)
 
 			b.Run("EngineMask", func(b *testing.B) {
-				if _, err := fixture.engine.Mask(fixture.data, writeHyperscan100RulesMask); err != nil {
+				if err := fixture.engine.Mask(fixture.data, writeHyperscan100RulesMask); err != nil {
 					b.Fatal(err)
 				}
 				startHyperscan100RulesTimer(b, fixture)
 				for range b.N {
-					result, err := fixture.engine.Mask(fixture.data, writeHyperscan100RulesMask)
-					if err != nil {
+					if err := fixture.engine.Mask(fixture.data, writeHyperscan100RulesMask); err != nil {
 						b.Fatal(err)
 					}
-					hyperscan100RulesBytesSink = result
+					hyperscan100RulesBytesSink = fixture.data
 				}
 			})
 
@@ -538,11 +537,10 @@ func newHyperscan100RulesFixture(b testing.TB, size int) hyperscan100RulesFixtur
 		return fixture.maskBytes[:len(match)]
 	}
 
-	masked, err := engine.Mask(data, writeHyperscan100RulesMask)
-	if err != nil {
+	if err := engine.Mask(data, writeHyperscan100RulesMask); err != nil {
 		b.Fatal(err)
 	}
-	fixture.masked = masked
+	fixture.masked = data
 
 	replaced := goRegexp.ReplaceAllFunc(data, fixture.maskRegexpMatch)
 	if len(replaced) != len(fixture.masked) {
@@ -602,7 +600,7 @@ func writeHyperscan100RulesNoiseLine(buf *strings.Builder, rng *rand.Rand) {
 	buf.WriteString(verbs[rng.IntN(len(verbs))])
 	buf.WriteByte('-')
 	suffixLen := 4 + rng.IntN(8)
-	for i := 0; i < suffixLen; i++ {
+	for range suffixLen {
 		buf.WriteByte('a' + byte(rng.IntN(26)))
 	}
 	buf.WriteByte('\n')
@@ -655,30 +653,28 @@ func TestHyperscanGo100RulesStable(t *testing.T) {
 		// --- EngineMask ---
 		data := make([]byte, len(fixture.data))
 		copy(data, fixture.data)
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			copy(data, fixture.data)
-			if _, err := fixture.engine.Mask(data, writeHyperscan100RulesMask); err != nil {
+			if err := fixture.engine.Mask(data, writeHyperscan100RulesMask); err != nil {
 				t.Fatal(err)
 			}
 		}
 		engineAllocs := testing.AllocsPerRun(200, func() {
 			copy(data, fixture.data)
-			result, err := fixture.engine.Mask(data, writeHyperscan100RulesMask)
-			if err != nil {
+			if err := fixture.engine.Mask(data, writeHyperscan100RulesMask); err != nil {
 				t.Fatal(err)
 			}
-			hyperscan100RulesBytesSink = result
+			hyperscan100RulesBytesSink = data
 		})
 		engineRes := testing.Benchmark(func(b *testing.B) {
 			data := make([]byte, len(fixture.data))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				copy(data, fixture.data)
-				result, err := fixture.engine.Mask(data, writeHyperscan100RulesMask)
-				if err != nil {
+				if err := fixture.engine.Mask(data, writeHyperscan100RulesMask); err != nil {
 					b.Fatal(err)
 				}
-				hyperscan100RulesBytesSink = result
+				hyperscan100RulesBytesSink = data
 			}
 		})
 		nsPerOp := float64(engineRes.NsPerOp())
@@ -687,7 +683,7 @@ func TestHyperscanGo100RulesStable(t *testing.T) {
 			size, nsPerOp, mbPerS, engineRes.AllocedBytesPerOp(), engineAllocs, fixture.matches)
 
 		// --- GoRegexpReplace ---
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			hyperscan100RulesBytesSink = fixture.goRegexp.ReplaceAllFunc(fixture.data, fixture.maskRegexpMatch)
 		}
 		regexpAllocs := testing.AllocsPerRun(200, func() {

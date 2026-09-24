@@ -4,13 +4,16 @@ package som
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
+	"slices"
 )
 
+// Slot 是跟踪器中的一个槽位，Valid 为 false 时表示尚未写入。
 type Slot struct {
 	Value uint64
 	Valid bool
 }
+
+// Tracker 为每个规则分配一个槽位，记录块扫描中的匹配起点。
 type Tracker struct{ slots []Slot }
 
 // Dump 序列化当前起点跟踪状态。
@@ -61,6 +64,7 @@ func (t *Tracker) Equal(other *Tracker) bool {
 	return true
 }
 
+// Clone 返回槽位快照的副本。
 func (t *Tracker) Clone() *Tracker {
 	if t == nil {
 		return nil
@@ -68,12 +72,15 @@ func (t *Tracker) Clone() *Tracker {
 	return &Tracker{slots: append([]Slot(nil), t.slots...)}
 }
 
+// New 创建包含 n 个槽位的跟踪器，负数按 0 处理。
 func New(n int) *Tracker {
 	if n < 0 {
 		n = 0
 	}
 	return &Tracker{slots: make([]Slot, n)}
 }
+
+// Set 写入槽位取值，槽位越界时忽略。
 func (t *Tracker) Set(slot int, value uint64) {
 	if t != nil && slot >= 0 && slot < len(t.slots) {
 		t.slots[slot] = Slot{value, true}
@@ -102,12 +109,18 @@ func (t *Tracker) Ensure(slot int) bool {
 	}
 	return true
 }
+
+// Clear 重置单个槽位，槽位越界时忽略。
 func (t *Tracker) Clear(slot int) {
 	if t != nil && slot >= 0 && slot < len(t.slots) {
 		t.slots[slot] = Slot{}
 	}
 }
+
+// Valid 判断槽位是否已写入有效取值。
 func (t *Tracker) Valid(slot int) bool { _, ok := t.Get(slot); return ok }
+
+// Values 按槽位顺序返回值快照，未生效的槽位填 0。
 func (t *Tracker) Values() []uint64 {
 	if t == nil {
 		return nil
@@ -120,17 +133,23 @@ func (t *Tracker) Values() []uint64 {
 	}
 	return out
 }
+
+// SlotsCopy 返回槽位快照的副本，便于并发读取。
 func (t *Tracker) SlotsCopy() []Slot {
 	if t == nil {
 		return nil
 	}
 	return append([]Slot(nil), t.slots...)
 }
+
+// ClearAll 清空全部槽位。
 func (t *Tracker) ClearAll() {
 	if t != nil {
 		t.Reset()
 	}
 }
+
+// Get 返回槽位取值，槽位越界或未写入时 ok 为 false。
 func (t *Tracker) Get(slot int) (uint64, bool) {
 	if t == nil || slot < 0 || slot >= len(t.slots) {
 		return 0, false
@@ -138,12 +157,15 @@ func (t *Tracker) Get(slot int) (uint64, bool) {
 	s := t.slots[slot]
 	return s.Value, s.Valid
 }
+
+// Reset 将全部槽位恢复为未写入状态。
 func (t *Tracker) Reset() {
 	for i := range t.slots {
 		t.slots[i] = Slot{}
 	}
 }
 
+// Propagate 将 src 的取值按“取更早”的规则传播到 dst。
 func (t *Tracker) Propagate(dst, src int) {
 	if t == nil {
 		return
@@ -152,6 +174,8 @@ func (t *Tracker) Propagate(dst, src int) {
 		t.Earliest(dst, v)
 	}
 }
+
+// Earliest 仅在 value 更早时更新槽位。
 func (t *Tracker) Earliest(slot int, value uint64) {
 	if t == nil {
 		return
@@ -170,18 +194,24 @@ func (t *Tracker) Latest(slot int, value uint64) {
 		t.Set(slot, value)
 	}
 }
+
+// Len 返回槽位总数。
 func (t *Tracker) Len() int {
 	if t == nil {
 		return 0
 	}
 	return len(t.slots)
 }
+
+// Snapshot 返回槽位快照的副本。
 func (t *Tracker) Snapshot() []Slot {
 	if t == nil {
 		return nil
 	}
 	return append([]Slot(nil), t.slots...)
 }
+
+// ValidCount 返回已写入有效取值的槽位数量。
 func (t *Tracker) ValidCount() int {
 	if t == nil {
 		return 0
@@ -263,7 +293,7 @@ func (t *Tracker) ValidValues() []uint64 {
 			out = append(out, slot.Value)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 

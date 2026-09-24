@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/bits"
+	"slices"
 	"sort"
 	"sync"
 
@@ -17,13 +18,13 @@ import (
 	"github.com/smartwalle/scankit/internal/simd"
 )
 
+// ErrStateLimit 表示状态数量超出预算，同组其余变量分别对应边、内存、图与执行限制错误。
 var (
 	ErrStateLimit     = fmt.Errorf("nfa state limit exceeded")
 	ErrEdgeLimit      = fmt.Errorf("nfa edge limit exceeded")
 	ErrMemoryLimit    = fmt.Errorf("nfa memory limit exceeded")
 	ErrInvalidGraph   = fmt.Errorf("invalid nfa graph")
 	ErrUnsupported    = fmt.Errorf("unsupported nfa graph")
-	ErrLayout         = fmt.Errorf("invalid nfa execution layout")
 	ErrExecutionLimit = fmt.Errorf("nfa execution limit exceeded")
 )
 
@@ -34,8 +35,10 @@ const (
 	maxLayoutMemory  = uint64(1 << 24)
 )
 
+// EngineKind 标识 NFA 使用的专用引擎布局。
 type EngineKind uint8
 
+// EngineCastle 表示 Castle 布局，其余常量对应当前支持的其他专用引擎。
 const (
 	EngineCastle EngineKind = iota + 1
 	EngineGough
@@ -51,6 +54,7 @@ const (
 	EngineLBR
 )
 
+// Engine 封装一种 NFA 专用引擎布局及其运行时预算检查。
 type Engine struct {
 	Kind      EngineKind
 	Program   *Program
@@ -100,7 +104,7 @@ func newTruffleProgram(core *nibbleNFAProgram) *truffleProgram {
 	for high := range p.highSource {
 		p.highSource[high] = make([]uint64, words)
 	}
-	for value := 0; value < 256; value++ {
+	for value := range 256 {
 		high := value >> 4
 		for i, word := range core.sourceMask[value] {
 			p.highSource[high][i] |= word
@@ -126,7 +130,7 @@ func (p *truffleProgram) validate() bool {
 	if p == nil || p.core == nil || p.core.mode != 1 || !nibbleRuntimeShapeOK(p.core) || p.firstMask != p.core.firstMask {
 		return false
 	}
-	for high := 0; high < 16; high++ {
+	for high := range 16 {
 		if len(p.highSource[high]) != (len(p.core.states)+63)/64 {
 			return false
 		}
@@ -366,7 +370,7 @@ func compileNibbleNFAWithMode(g *nfagraph.Graph, mode uint8) *nibbleNFAProgram {
 		if state.kind == nfagraph.KindClass {
 			reach = nfagraph.CharReachFromClass(state.class.Class)
 		}
-		for value := 0; value < 256; value++ {
+		for value := range 256 {
 			matched := (state.kind == nfagraph.KindLiteral && state.lit == byte(value) || state.kind == nfagraph.KindClass && reach.Contains(byte(value))) && len(state.next) > 0
 			if matched {
 				p.sourceMask[value][i/64] |= 1 << uint(i%64)
@@ -517,7 +521,7 @@ func (p *nibbleNFAProgram) validate() error {
 		if !containsInt(p.closures[i], i) {
 			return fmt.Errorf("nibble closure misses source state")
 		}
-		for value := 0; value < 256; value++ {
+		for value := range 256 {
 			expected := (state.kind == nfagraph.KindLiteral && state.lit == byte(value) || state.kind == nfagraph.KindClass && castleMatches(state.class, byte(value))) && len(state.next) > 0
 			index, bit := byte(value)&0x0f, byte(value)>>4
 			if p.mode == 1 {
@@ -572,7 +576,7 @@ func firstMaskFromNibble(p *nibbleNFAProgram) [4]uint64 {
 		if id < 0 || id >= len(p.states) {
 			continue
 		}
-		for b := 0; b < 256; b++ {
+		for b := range 256 {
 			if len(p.next(id, byte(b))) > 0 {
 				mask[b/64] |= 1 << uint(b%64)
 			}
@@ -635,26 +639,6 @@ func (p *nibbleNFAProgram) EdgeCount() int {
 		n += len(state.eps) + len(state.next)
 	}
 	return n
-}
-
-func (p *nibbleNFAProgram) closureSet(seed []int) []int {
-	if p == nil || len(seed) == 0 {
-		return nil
-	}
-	seen := make([]bool, len(p.states))
-	out := make([]int, 0, len(seed))
-	for _, id := range seed {
-		if id < 0 || id >= len(p.closures) {
-			continue
-		}
-		for _, item := range p.closures[id] {
-			if !seen[item] {
-				seen[item] = true
-				out = append(out, item)
-			}
-		}
-	}
-	return out
 }
 
 func (p *nibbleNFAProgram) next(id int, value byte) []int {
@@ -1039,12 +1023,14 @@ func (p *rangeNFAProgram) validate() error {
 				return fmt.Errorf("range transitions overlap or are unsorted")
 			}
 		}
-		for value := 0; value < 256; value++ {
+		for value := range 256 {
 			expected := false
-			if state.kind == nfagraph.KindLiteral {
+			switch state.kind {
+			case nfagraph.KindLiteral:
 				expected = state.lit == byte(value) && len(state.next) > 0
-			} else if state.kind == nfagraph.KindClass {
+			case nfagraph.KindClass:
 				expected = castleMatches(state.class, byte(value)) && len(state.next) > 0
+			default:
 			}
 			rowExpected := false
 			for _, tr := range row {
@@ -1179,14 +1165,15 @@ func compileRangeNFA(g *nfagraph.Graph) *rangeNFAProgram {
 		p.accept[i] = state.kind == nfagraph.KindAccept
 		p.nextClosure[i] = mergeClosureTargets(closures, state.next)
 		values := make([][]int, 256)
-		if state.kind == nfagraph.KindLiteral {
+		switch state.kind {
+		case nfagraph.KindLiteral:
 			values[state.lit] = state.next
 			if len(state.next) > 0 {
 				p.masks[i][state.lit/64] |= 1 << uint(state.lit%64)
 			}
-		} else if state.kind == nfagraph.KindClass {
+		case nfagraph.KindClass:
 			reach := nfagraph.CharReachFromClass(state.class.Class)
-			for b := 0; b < 256; b++ {
+			for b := range 256 {
 				if reach.Contains(byte(b)) {
 					values[b] = state.next
 					if len(state.next) > 0 {
@@ -1194,6 +1181,7 @@ func compileRangeNFA(g *nfagraph.Graph) *rangeNFAProgram {
 					}
 				}
 			}
+		default:
 		}
 		for b := 0; b < len(values); {
 			if len(values[b]) == 0 {
@@ -1322,24 +1310,6 @@ func (p *rangeNFAProgram) EdgeCount() int {
 		}
 	}
 	return n
-}
-func (p *rangeNFAProgram) closureSet(seed []int) []int {
-	if p == nil || len(seed) == 0 {
-		return nil
-	}
-	seen := make([]bool, len(p.states))
-	out := make([]int, 0, len(seed))
-	for _, id := range seed {
-		if id >= 0 && id < len(p.closures) {
-			for _, item := range p.closures[id] {
-				if !seen[item] {
-					seen[item] = true
-					out = append(out, item)
-				}
-			}
-		}
-	}
-	return out
 }
 func (p *rangeNFAProgram) next(id int, value byte) []int {
 	if p == nil || id < 0 || id >= len(p.trans) {
@@ -1475,7 +1445,7 @@ func rangeRuntimeShapeOK(p *rangeNFAProgram) bool {
 		if p.dead[i] && p.accept[i] {
 			return false
 		}
-		if len(p.bucket[i]) != 256 || len(p.closures[i]) == 0 {
+		if len(p.closures[i]) == 0 {
 			return false
 		}
 		for _, id := range st.next {
@@ -1678,7 +1648,7 @@ func (p *sparseNFAProgram) validate() error {
 		} else if len(p.classClosure[i]) != 0 {
 			return fmt.Errorf("sparse non-class closure present")
 		}
-		for value := 0; value < 256; value++ {
+		for value := range 256 {
 			expected := state.kind == nfagraph.KindClass && castleMatches(state.class, byte(value)) && len(state.next) > 0
 			actual := p.classMask[i][value/64]&(1<<uint(value%64)) != 0
 			if actual != expected {
@@ -1784,13 +1754,15 @@ func compileSparseNFA(g *nfagraph.Graph) *sparseNFAProgram {
 	for i, id := range ids {
 		n := g.Nodes[id]
 		st := sparseNFAState{kind: n.Kind}
-		if n.Kind == nfagraph.KindLiteral {
+		switch n.Kind {
+		case nfagraph.KindLiteral:
 			if len(n.Literal) != 1 {
 				return nil
 			}
 			st.lit = n.Literal[0]
-		} else if n.Kind == nfagraph.KindClass {
+		case nfagraph.KindClass:
 			st.class = n
+		default:
 		}
 		for _, to := range g.Flow.Successors(id) {
 			j, ok := index[to]
@@ -1840,7 +1812,7 @@ func compileSparseNFA(g *nfagraph.Graph) *sparseNFAProgram {
 			}
 		} else if st.kind == nfagraph.KindClass && len(st.next) > 0 {
 			p.classClosure[i] = mergeClosureTargets(p.closures, st.next)
-			for value := 0; value < 256; value++ {
+			for value := range 256 {
 				if castleMatches(st.class, byte(value)) {
 					p.sourceMask[value][i/64] |= 1 << uint(i%64)
 					p.classMask[i][value/64] |= 1 << uint(value%64)
@@ -2052,7 +2024,7 @@ func firstByteMask(g *nfagraph.Graph) [4]uint64 {
 		}
 		if n.Kind == nfagraph.KindClass && n.Unicode == nil && len(g.Flow.Successors(id)) > 0 {
 			reach := nfagraph.CharReachFromClass(n.Class)
-			for b := 0; b < 256; b++ {
+			for b := range 256 {
 				if reach.Contains(byte(b)) {
 					mask[b/64] |= 1 << uint(b%64)
 				}
@@ -2100,7 +2072,7 @@ func dedupVerticesSorted(values []graph.Vertex) []graph.Vertex {
 	if len(values) < 2 {
 		return values
 	}
-	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
+	slices.Sort(values)
 	return dedupVertices(values)
 }
 
@@ -2173,25 +2145,6 @@ func (p *sparseNFAProgram) EdgeCount() int {
 func (p *sparseNFAProgram) MatchAt(data []byte, start int) []int {
 	ends, _, _ := p.MatchAtBudget(data, start, 0, 0)
 	return ends
-}
-func (p *sparseNFAProgram) closureSet(seed []int) []int {
-	if len(seed) == 0 {
-		return nil
-	}
-	seen := make([]bool, len(p.states))
-	out := []int{}
-	for _, id := range seed {
-		if id < 0 || id >= len(p.closures) {
-			continue
-		}
-		for _, v := range p.closures[id] {
-			if !seen[v] {
-				seen[v] = true
-				out = append(out, v)
-			}
-		}
-	}
-	return out
 }
 func (p *sparseNFAProgram) Spans(data []byte, limit int) []Span {
 	if p == nil || limit < 0 || !sparseRuntimeShapeOK(p) {
@@ -2328,6 +2281,7 @@ func (p *sparseNFAProgram) matchAtBudgetUnchecked(data []byte, start, maxSteps, 
 							} else {
 								transitions = p.classClosure[id]
 							}
+						default:
 						}
 						if state.kind == nfagraph.KindLiteral && state.lit != data[pos] {
 							transitions = nil
@@ -2473,7 +2427,7 @@ func sparseRuntimeShapeOK(p *sparseNFAProgram) bool {
 		if p.dead[i] && p.accept[i] {
 			return false
 		}
-		for value := 0; value < 256; value++ {
+		for value := range 256 {
 			want := (st.kind == nfagraph.KindLiteral && len(st.next) > 0 && st.lit == byte(value)) || (st.kind == nfagraph.KindClass && len(st.next) > 0 && p.classMask[i][value/64]&(1<<uint(value%64)) != 0)
 			marked := i/64 < len(p.sourceMask[value]) && p.sourceMask[value][i/64]&(1<<uint(i%64)) != 0
 			if want != marked {
@@ -2503,10 +2457,7 @@ func sparseRuntimeShapeOK(p *sparseNFAProgram) bool {
 			break
 		}
 	}
-	if p.acceptsEmpty != wantEmpty {
-		return false
-	}
-	return true
+	return p.acceptsEmpty == wantEmpty
 }
 
 func firstMaskFromSparse(p *sparseNFAProgram) [4]uint64 {
@@ -2524,7 +2475,7 @@ func firstMaskFromSparse(p *sparseNFAProgram) [4]uint64 {
 				mask[st.lit/64] |= 1 << uint(st.lit%64)
 			}
 		} else if st.kind == nfagraph.KindClass && len(st.next) > 0 {
-			for b := 0; b < 256; b++ {
+			for b := range 256 {
 				if id/64 < len(p.sourceMask[b]) && p.sourceMask[b][id/64]&(1<<uint(id%64)) != 0 && p.classMask[id][b/64]&(1<<uint(b%64)) != 0 {
 					mask[b/64] |= 1 << uint(b%64)
 				}
@@ -2532,10 +2483,6 @@ func firstMaskFromSparse(p *sparseNFAProgram) [4]uint64 {
 		}
 	}
 	return mask
-}
-
-func equalByteMask(a, b [4]uint64) bool {
-	return a == b
 }
 
 type lbrProgram struct {
@@ -2649,7 +2596,7 @@ func (p *lbrProgram) validate() error {
 			}
 		}
 		want := append([]graph.Vertex(nil), p.graph.Flow.Successors(id)...)
-		sort.Slice(want, func(i, j int) bool { return want[i] < want[j] })
+		slices.Sort(want)
 		want = dedupVertices(want)
 		if len(row) != len(want) {
 			return fmt.Errorf("lbr successor row mismatch")
@@ -2664,7 +2611,7 @@ func (p *lbrProgram) validate() error {
 			if !ok {
 				return fmt.Errorf("lbr class mask missing")
 			}
-			for value := 0; value < 256; value++ {
+			for value := range 256 {
 				expected := castleMatches(n, byte(value))
 				actual := mask[value/64]&(1<<uint(value%64)) != 0
 				if expected != actual {
@@ -2895,7 +2842,7 @@ func lbrRuntimeShapeOK(p *lbrProgram) bool {
 			}
 		}
 		want := append([]graph.Vertex(nil), p.graph.Flow.Successors(id)...)
-		sort.Slice(want, func(i, j int) bool { return want[i] < want[j] })
+		slices.Sort(want)
 		want = dedupVertices(want)
 		if len(row) != len(want) {
 			return false
@@ -2918,7 +2865,7 @@ func lbrRuntimeShapeOK(p *lbrProgram) bool {
 			if !ok {
 				return false
 			}
-			for value := 0; value < 256; value++ {
+			for value := range 256 {
 				expected := castleMatches(n, byte(value))
 				actual := mask[value/64]&(1<<uint(value%64)) != 0
 				if expected != actual {
@@ -3075,11 +3022,11 @@ func compileLBR(g *nfagraph.Graph) *lbrProgram {
 	classMask := make(map[graph.Vertex][4]uint64)
 	for _, id := range g.NodeIDs() {
 		next := append([]graph.Vertex(nil), g.Flow.Successors(id)...)
-		sort.Slice(next, func(i, j int) bool { return next[i] < next[j] })
+		slices.Sort(next)
 		successors[id] = dedupVertices(next)
 		if node := g.Nodes[id]; node != nil && node.Kind == nfagraph.KindClass {
 			var mask [4]uint64
-			for value := 0; value < 256; value++ {
+			for value := range 256 {
 				if castleMatches(node, byte(value)) {
 					mask[value/64] |= 1 << uint(value%64)
 				}
@@ -3168,7 +3115,7 @@ func lbrLiteralPrefix(g *nfagraph.Graph) []byte {
 		var value byte
 		for _, id := range closure {
 			n := g.Nodes[id]
-			if n == nil || n.Kind == nfagraph.KindAccept || n.Kind != nfagraph.KindLiteral || len(n.Literal) != 1 {
+			if n == nil || n.Kind != nfagraph.KindLiteral || len(n.Literal) != 1 {
 				return prefix
 			}
 			if len(next) == 0 {
@@ -3284,7 +3231,7 @@ func forEachNFAStart(data, prefix []byte, first [4]uint64, firstTables *simd.Byt
 	// 空掩码表示编译阶段无法证明首字节（例如仅含边界断言的图），
 	// 不能把它误当成“无匹配”而跳过整个输入。
 	if byteMaskEmpty(first) {
-		for start := 0; start < len(data); start++ {
+		for start := range len(data) {
 			if !fn(start) {
 				return
 			}
@@ -3380,7 +3327,7 @@ func (p *byteNFAProgram) validate() error {
 			return fmt.Errorf("byte class state missing payload")
 		}
 		if state.kind == nfagraph.KindClass {
-			for b := 0; b < 256; b++ {
+			for b := range 256 {
 				want := castleMatches(state.class, byte(b))
 				if (p.classMask[i][b/64]&(1<<uint(b%64)) != 0) != want {
 					return fmt.Errorf("byte class mask mismatch")
@@ -3664,8 +3611,8 @@ func (p *bitNFAProgram) validate() error {
 		if len(row) != 256 {
 			return fmt.Errorf("invalid bit width at state %d", i)
 		}
-		for _, bits := range row {
-			if len(bits) != p.words {
+		for _, word := range row {
+			if len(word) != p.words {
 				return fmt.Errorf("invalid bit transition width")
 			}
 		}
@@ -3677,9 +3624,9 @@ func (p *bitNFAProgram) validate() error {
 	}
 	for i := range p.trans {
 		var hasTransition bool
-		for value := 0; value < 256; value++ {
-			for _, bits := range p.trans[i][value] {
-				if bits != 0 {
+		for value := range 256 {
+			for _, word := range p.trans[i][value] {
+				if word != 0 {
 					hasTransition = true
 					break
 				}
@@ -3699,7 +3646,7 @@ func (p *bitNFAProgram) validate() error {
 			return fmt.Errorf("bit epsilon-only mask mismatch at state %d", i)
 		}
 	}
-	for value := 0; value < 256; value++ {
+	for value := range 256 {
 		count := 0
 		for _, word := range p.sourceMask[value] {
 			count += bits.OnesCount64(word)
@@ -3722,8 +3669,8 @@ func (p *bitNFAProgram) validate() error {
 		}
 		for i, state := range p.trans {
 			hasTransition := false
-			for _, bits := range state[value] {
-				if bits != 0 {
+			for _, word := range state[value] {
+				if word != 0 {
 					hasTransition = true
 					break
 				}
@@ -3758,8 +3705,8 @@ func (p *bitNFAProgram) validate() error {
 				return fmt.Errorf("bit source mask contains out-of-range state")
 			}
 		}
-		for _, bits := range p.closure {
-			if bits[len(bits)-1]&^mask != 0 {
+		for _, word := range p.closure {
+			if word[len(word)-1]&^mask != 0 {
 				return fmt.Errorf("bit closure contains out-of-range state")
 			}
 		}
@@ -3798,8 +3745,8 @@ func (p *bitNFAProgram) EdgeCount() int {
 	}
 	n := 0
 	for _, row := range p.trans {
-		for _, bits := range row {
-			for _, w := range bits {
+		for _, word := range row {
+			for _, w := range word {
 				n += bitsCount(w)
 			}
 		}
@@ -3863,20 +3810,20 @@ func compileBitNFA(g *nfagraph.Graph) *bitNFAProgram {
 		if n.Kind == nfagraph.KindAccept {
 			p.accept[i/64] |= 1 << uint(i%64)
 		}
-		for b := 0; b < 256; b++ {
+		for b := range 256 {
 			offset := (i*256 + b) * words
-			bits := transitionStorage[offset : offset+words]
+			vector := transitionStorage[offset : offset+words]
 			for _, to := range g.Flow.Successors(id) {
 				j := idx[to]
 				if (n.Kind == nfagraph.KindLiteral && len(n.Literal) == 1 && n.Literal[0] == byte(b)) || (n.Kind == nfagraph.KindClass && castleMatches(n, byte(b))) {
 					p.sourceMask[b][i/64] |= 1 << uint(i%64)
 					// 将目标的 epsilon 闭包预先并入转移，热路径无需再次遍历闭包。
-					bitOr(bits, p.closure[j])
+					bitOr(vector, p.closure[j])
 				}
 			}
-			p.trans[i][b] = bits
+			p.trans[i][b] = vector
 		}
-		for b := 0; b < 256; b++ {
+		for b := range 256 {
 			if bitAny(p.trans[i][b]) {
 				p.consumable[i/64] |= 1 << uint(i%64)
 				break
@@ -4011,11 +3958,8 @@ func bitClosure(g *nfagraph.Graph, ids []graph.Vertex, idx map[graph.Vertex]int,
 	return out
 }
 func bitOr(dst, src []uint64) {
-	limit := len(dst)
-	if len(src) < limit {
-		limit = len(src)
-	}
-	for i := 0; i < limit; i++ {
+	limit := min(len(dst), len(src))
+	for i := range limit {
 		dst[i] |= src[i]
 	}
 }
@@ -4027,9 +3971,6 @@ func bitAny(values []uint64) bool {
 		}
 	}
 	return false
-}
-func bitNFAHas(bits []uint64, id int) bool {
-	return id >= 0 && id/64 < len(bits) && bits[id/64]&(1<<uint(id%64)) != 0
 }
 
 // bitApplyTransitions 批量合并当前字节的位转移。
@@ -4194,13 +4135,7 @@ func bitLayoutShapeOK(p *bitNFAProgram) bool {
 		if len(p.trans[i]) != 256 || len(p.closure[i]) != p.words {
 			return false
 		}
-		hasTransition := false
-		for _, targets := range p.trans[i] {
-			if bitAny(targets) {
-				hasTransition = true
-				break
-			}
-		}
+		hasTransition := slices.ContainsFunc(p.trans[i][:], bitAny)
 		bit := uint(i % 64)
 		markedEpsilonOnly := p.epsilonOnly[i/64]&(1<<bit) != 0
 		markedAccept := p.accept[i/64]&(1<<bit) != 0
@@ -4253,7 +4188,7 @@ func firstMaskFromBit(p *bitNFAProgram) [4]uint64 {
 	if p == nil || p.start < 0 || p.start >= len(p.closure) {
 		return mask
 	}
-	for b := 0; b < 256; b++ {
+	for b := range 256 {
 		if bitIntersects(p.closure[p.start], p.sourceMask[b]) {
 			mask[b/64] |= 1 << uint(b%64)
 		}
@@ -4261,8 +4196,8 @@ func firstMaskFromBit(p *bitNFAProgram) [4]uint64 {
 	return mask
 }
 
-func bitsetAny(bits []uint64) bool {
-	for _, word := range bits {
+func bitsetAny(vector []uint64) bool {
+	for _, word := range vector {
 		if word != 0 {
 			return true
 		}
@@ -4290,11 +4225,8 @@ func (p *bitNFAProgram) Spans(data []byte, limit int) []Span {
 	return out
 }
 func bitIntersects(a, b []uint64) bool {
-	limit := len(a)
-	if len(b) < limit {
-		limit = len(b)
-	}
-	for i := 0; i < limit; i++ {
+	limit := min(len(a), len(b))
+	for i := range limit {
 		if a[i]&b[i] != 0 {
 			return true
 		}
@@ -4350,19 +4282,21 @@ func compileTableNFA(g *nfagraph.Graph) *tableNFAProgram {
 		p.accept[i] = n.Kind == nfagraph.KindAccept
 		for _, to := range g.Flow.Successors(id) {
 			j := index[to]
-			if n.Kind == nfagraph.KindLiteral {
+			switch n.Kind {
+			case nfagraph.KindLiteral:
 				if len(n.Literal) != 1 {
 					return nil
 				}
 				p.trans[i][n.Literal[0]] = append(p.trans[i][n.Literal[0]], j)
 				p.sourceMask[n.Literal[0]][i/64] |= 1 << uint(i%64)
-			} else if n.Kind == nfagraph.KindClass {
-				for b := 0; b < 256; b++ {
+			case nfagraph.KindClass:
+				for b := range 256 {
 					if castleMatches(n, byte(b)) {
 						p.trans[i][b] = append(p.trans[i][b], j)
 						p.sourceMask[b][i/64] |= 1 << uint(i%64)
 					}
 				}
+			default:
 			}
 		}
 	}
@@ -4412,7 +4346,7 @@ func firstMaskFromTable(p *tableNFAProgram) [4]uint64 {
 		return mask
 	}
 	for _, id := range p.closure[p.start] {
-		for b := 0; b < 256; b++ {
+		for b := range 256 {
 			if id >= 0 && id < len(p.trans) && len(p.trans[id][b]) > 0 {
 				mask[b/64] |= 1 << uint(b%64)
 			}
@@ -4721,19 +4655,6 @@ func (p *tableNFAProgram) Spans(data []byte, limit int) []Span {
 	})
 	return out
 }
-func tableCloseSet(p *tableNFAProgram, seed []int) []int {
-	seen := make([]bool, len(p.closure))
-	out := []int{}
-	for _, i := range seed {
-		for _, j := range p.closure[i] {
-			if !seen[j] {
-				seen[j] = true
-				out = append(out, j)
-			}
-		}
-	}
-	return out
-}
 
 // byteNFAProgram 使用紧凑字节状态和预计算的空转移执行受限图。
 type byteNFAProgram struct {
@@ -4774,7 +4695,7 @@ func compileByteNFA(g *nfagraph.Graph) *byteNFAProgram {
 	}
 	for i := range p.states {
 		if p.states[i].kind == nfagraph.KindClass {
-			for b := 0; b < 256; b++ {
+			for b := range 256 {
 				if castleMatches(p.states[i].class, byte(b)) {
 					p.classMask[i][b/64] |= 1 << uint(b%64)
 				}
@@ -4785,7 +4706,7 @@ func compileByteNFA(g *nfagraph.Graph) *byteNFAProgram {
 		}
 		p.trans[i] = make([][]int, 256)
 		p.transClosure[i] = make([][]int, 256)
-		for b := 0; b < 256; b++ {
+		for b := range 256 {
 			if p.states[i].kind == nfagraph.KindLiteral && p.states[i].lit == byte(b) || p.states[i].kind == nfagraph.KindClass && castleMatches(p.states[i].class, byte(b)) {
 				p.trans[i][b] = append([]int(nil), p.states[i].next...)
 				p.transClosure[i][b] = mergeClosureTargets(p.closures, p.states[i].next)
@@ -4854,13 +4775,15 @@ func compileByteStates(g *nfagraph.Graph) (states []byteNFAState, start int, clo
 	for i, id := range ids {
 		n := g.Nodes[id]
 		st := byteNFAState{kind: n.Kind}
-		if n.Kind == nfagraph.KindLiteral {
+		switch n.Kind {
+		case nfagraph.KindLiteral:
 			if len(n.Literal) != 1 {
 				return nil, 0, nil
 			}
 			st.lit = n.Literal[0]
-		} else if n.Kind == nfagraph.KindClass {
+		case nfagraph.KindClass:
 			st.class = n
+		default:
 		}
 		for _, to := range g.Flow.Successors(id) {
 			j, ok := index[to]
@@ -4938,30 +4861,6 @@ func (p *byteNFAProgram) closure(seed []int) []int {
 	}
 	sort.Ints(q)
 	return q
-}
-
-func (p *byteNFAProgram) cachedClosure(seed []int) []int {
-	if len(seed) == 1 && seed[0] >= 0 && seed[0] < len(p.closures) && p.closures[seed[0]] != nil {
-		return append([]int(nil), p.closures[seed[0]]...)
-	}
-	return p.closure(seed)
-}
-
-func (p *byteNFAProgram) closureSet(seed []int) []int {
-	if len(seed) == 0 {
-		return nil
-	}
-	seen := make([]bool, len(p.states))
-	out := make([]int, 0, len(seed))
-	for _, id := range seed {
-		for _, v := range p.cachedClosure([]int{id}) {
-			if !seen[v] {
-				seen[v] = true
-				out = append(out, v)
-			}
-		}
-	}
-	return out
 }
 
 // closureSetWithWork 计算 epsilon 闭包并复用调用方提供的标记和结果缓冲区。
@@ -5267,7 +5166,7 @@ func firstMaskFromByte(p *byteNFAProgram) [4]uint64 {
 		if (st.kind != nfagraph.KindLiteral && st.kind != nfagraph.KindClass) || len(st.next) == 0 {
 			continue
 		}
-		for b := 0; b < 256; b++ {
+		for b := range 256 {
 			if (st.kind == nfagraph.KindLiteral && st.lit == byte(b)) || (st.kind == nfagraph.KindClass && castleMatches(st.class, byte(b))) {
 				mask[b/64] |= 1 << uint(b%64)
 			}
@@ -5337,7 +5236,7 @@ func (p *mpvProgram) validate() error {
 		}
 		// 文字分支通常很少，使用两两比较避免每次确认都创建
 		// map 和 string 临时对象，同时覆盖非相邻的重复分支。
-		for j := 0; j < i; j++ {
+		for j := range i {
 			if bytes.Equal(p.literals[j], lit) {
 				return fmt.Errorf("duplicate mpv literal")
 			}
@@ -5618,7 +5517,7 @@ func newGoughProgram(g *nfagraph.Graph) *goughProgram {
 		p.index[v] = i
 		p.reverseTable[v] = p.computeReverseClosure(v)
 		p.predecessors[v] = append([]graph.Vertex(nil), g.Predecessors(v)...)
-		sort.Slice(p.predecessors[v], func(a, b int) bool { return p.predecessors[v][a] < p.predecessors[v][b] })
+		slices.Sort(p.predecessors[v])
 		if len(p.predecessors[v]) > 1 {
 			uniq := p.predecessors[v][:1]
 			for _, previous := range p.predecessors[v][1:] {
@@ -5668,7 +5567,7 @@ func newGoughProgram(g *nfagraph.Graph) *goughProgram {
 		}
 		n := g.Nodes[id]
 		if n != nil && g.Flow != nil && len(g.Flow.Successors(id)) > 0 && (n.Kind == nfagraph.KindLiteral && len(n.Literal) == 1 || n.Kind == nfagraph.KindClass) {
-			for value := 0; value < 256; value++ {
+			for value := range 256 {
 				if (n.Kind == nfagraph.KindLiteral && n.Literal[0] == byte(value)) || n.Kind == nfagraph.KindClass && castleMatches(n, byte(value)) {
 					p.consumeMask[value][index/64] |= 1 << uint(index%64)
 				}
@@ -5842,7 +5741,7 @@ func goughRuntimeShapeOK(p *goughProgram) bool {
 			return false
 		}
 		n := p.graph.Nodes[id]
-		for value := 0; value < 256; value++ {
+		for value := range 256 {
 			want := false
 			if len(p.graph.Flow.Successors(id)) > 0 && n.Kind == nfagraph.KindLiteral && len(n.Literal) == 1 {
 				want = n.Literal[0] == byte(value)
@@ -6006,19 +5905,6 @@ func (p *goughProgram) acceptsBit(data []byte, start, end int) bool {
 	return ok && startIndex/64 < len(active) && active[startIndex/64]&(1<<uint(startIndex%64)) != 0
 }
 
-func (p *goughProgram) vertexAt(index int) graph.Vertex {
-	if index >= 0 && index < len(p.vertices) {
-		return p.vertices[index]
-	}
-	return 0
-}
-
-func (p *goughProgram) reverseClosureBits(seed []uint64) []uint64 {
-	out := make([]uint64, p.words)
-	p.reverseClosureBitsInto(seed, out)
-	return out
-}
-
 func (p *goughProgram) reverseClosureBitsInto(seed, out []uint64) {
 	clear(out)
 	for wi, word := range seed {
@@ -6087,7 +5973,7 @@ func (p *goughProgram) computeReverseClosure(seed graph.Vertex) []graph.Vertex {
 	for id := range seen {
 		out = append(out, id)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 
@@ -6160,6 +6046,7 @@ func (e *Engine) ExecutionModel() string {
 		specialized = e.rangeNFA != nil && rangeRuntimeShapeOK(e.rangeNFA)
 	case EngineShufti, EngineTruffle:
 		specialized = e.Kind == EngineTruffle && e.truffle != nil && e.truffle.validate() || e.nibbleNFA != nil && nibbleRuntimeShapeOK(e.nibbleNFA)
+	default:
 	}
 	if specialized {
 		return e.Kind.String()
@@ -6332,13 +6219,7 @@ func (e *Engine) Validate() error {
 					return fmt.Errorf("gough reverse closure is not strictly ordered")
 				}
 			}
-			found := false
-			for _, target := range closure {
-				if target == source {
-					found = true
-					break
-				}
-			}
+			found := slices.Contains(closure, source)
 			if !found {
 				return fmt.Errorf("gough reverse closure misses source")
 			}
@@ -6403,7 +6284,7 @@ func (e *Engine) Validate() error {
 				if !hasMask {
 					return fmt.Errorf("lbr class mask missing")
 				}
-				for value := 0; value < 256; value++ {
+				for value := range 256 {
 					expected := castleMatches(n, byte(value))
 					actual := mask[value/64]&(1<<uint(value%64)) != 0
 					if expected != actual {
@@ -6652,7 +6533,7 @@ func validateBitStateKinds(g *nfagraph.Graph, p *bitNFAProgram) error {
 			return fmt.Errorf("bit accept state mismatch at %d", i)
 		}
 		n := expanded.Nodes[id]
-		for value := 0; value < 256; value++ {
+		for value := range 256 {
 			wantTransition := n != nil && ((n.Kind == nfagraph.KindLiteral && len(n.Literal) == 1 && n.Literal[0] == byte(value)) || (n.Kind == nfagraph.KindClass && castleMatches(n, byte(value))))
 			wantBits := make([]uint64, p.words)
 			if wantTransition {
@@ -7006,78 +6887,78 @@ func (e *Engine) MemoryBytes() uint64 {
 		return 0
 	}
 	if e.castle != nil && castleRuntimeShapeOK(e.castle) {
-		bytes := saturatingMul(uint64(len(e.castle.graph.Nodes)), 64)
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(e.castle.graph.Flow.EdgeCount()), 8))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.castle.index)), 16))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.castle.dead)), 2))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.castle.deadByIndex)), 1))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.castle.acceptByIndex)), 1))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.castle.kinds)), 1))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.castle.literals)), 1))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.castle.classMasks)), 32))
+		size := saturatingMul(uint64(len(e.castle.graph.Nodes)), 64)
+		size = saturatingAdd(size, saturatingMul(uint64(e.castle.graph.Flow.EdgeCount()), 8))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.castle.index)), 16))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.castle.dead)), 2))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.castle.deadByIndex)), 1))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.castle.acceptByIndex)), 1))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.castle.kinds)), 1))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.castle.literals)), 1))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.castle.classMasks)), 32))
 		for _, closure := range e.castle.closureTable {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(closure)), 8))
+			size = saturatingAdd(size, saturatingMul(uint64(len(closure)), 8))
 		}
 		for _, closure := range e.castle.closureByIndex {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(closure)), 8))
+			size = saturatingAdd(size, saturatingMul(uint64(len(closure)), 8))
 		}
 		for _, row := range e.castle.transitionByIndex {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(row)), 8))
+			size = saturatingAdd(size, saturatingMul(uint64(len(row)), 8))
 		}
 		for _, row := range e.castle.closureIndex {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(row)), 4))
+			size = saturatingAdd(size, saturatingMul(uint64(len(row)), 4))
 		}
 		for _, row := range e.castle.transitionIndex {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(row)), 4))
+			size = saturatingAdd(size, saturatingMul(uint64(len(row)), 4))
 		}
-		bytes = saturatingAdd(bytes, uint64(len(e.castle.prefix)))
-		bytes = saturatingAdd(bytes, 40)
-		return bytes
+		size = saturatingAdd(size, uint64(len(e.castle.prefix)))
+		size = saturatingAdd(size, 40)
+		return size
 	}
 	if e.lbr != nil && lbrRuntimeShapeOK(e.lbr) {
-		bytes := saturatingAdd(saturatingMul(uint64(len(e.lbr.graph.Nodes)), 48), saturatingMul(uint64(e.lbr.graph.Flow.EdgeCount()), 16))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.lbr.classMask)), 32))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.lbr.kinds)), 1))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.lbr.assertions)), 1))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.lbr.literals)), 1))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.lbr.classMasks)), 32))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.lbr.vertices)), 8))
+		size := saturatingAdd(saturatingMul(uint64(len(e.lbr.graph.Nodes)), 48), saturatingMul(uint64(e.lbr.graph.Flow.EdgeCount()), 16))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.lbr.classMask)), 32))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.lbr.kinds)), 1))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.lbr.assertions)), 1))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.lbr.literals)), 1))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.lbr.classMasks)), 32))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.lbr.vertices)), 8))
 		for _, row := range e.lbr.next {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(row)), 4))
+			size = saturatingAdd(size, saturatingMul(uint64(len(row)), 4))
 		}
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.lbr.dead)), 2))
-		bytes = saturatingAdd(bytes, e.lbr.queueBytes)
-		bytes = saturatingAdd(bytes, 40)
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.lbr.dead)), 2))
+		size = saturatingAdd(size, e.lbr.queueBytes)
+		size = saturatingAdd(size, 40)
 		for _, row := range e.lbr.successors {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(row)), 8))
+			size = saturatingAdd(size, saturatingMul(uint64(len(row)), 8))
 		}
-		return saturatingAdd(bytes, uint64(len(e.lbr.prefix)))
+		return saturatingAdd(size, uint64(len(e.lbr.prefix)))
 	}
 	if e.gough != nil {
-		bytes := saturatingMul(uint64(len(e.gough.graph.Nodes)), 64)
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(e.gough.graph.Flow.EdgeCount()), 8))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.gough.index)), 16))
+		size := saturatingMul(uint64(len(e.gough.graph.Nodes)), 64)
+		size = saturatingAdd(size, saturatingMul(uint64(e.gough.graph.Flow.EdgeCount()), 8))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.gough.index)), 16))
 		for _, closure := range e.gough.reverseTable {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(closure)), 8))
+			size = saturatingAdd(size, saturatingMul(uint64(len(closure)), 8))
 		}
 		for _, predecessors := range e.gough.predecessors {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(predecessors)), 8))
+			size = saturatingAdd(size, saturatingMul(uint64(len(predecessors)), 8))
 		}
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.gough.vertices)), 8))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.gough.acceptMask)), 8))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.gough.deadMask)), 8))
-		bytes = saturatingAdd(bytes, uint64(len(e.gough.prefix)))
-		bytes = saturatingAdd(bytes, 40)
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.gough.vertices)), 8))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.gough.acceptMask)), 8))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.gough.deadMask)), 8))
+		size = saturatingAdd(size, uint64(len(e.gough.prefix)))
+		size = saturatingAdd(size, 40)
 		for _, mask := range e.gough.reverseMask {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(mask)), 8))
+			size = saturatingAdd(size, saturatingMul(uint64(len(mask)), 8))
 		}
 		for _, mask := range e.gough.predMask {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(mask)), 8))
+			size = saturatingAdd(size, saturatingMul(uint64(len(mask)), 8))
 		}
 		for _, mask := range e.gough.consumeMask {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(mask)), 8))
+			size = saturatingAdd(size, saturatingMul(uint64(len(mask)), 8))
 		}
-		return bytes
+		return size
 	}
 	if (e.Kind == EngineMcSheng || e.Kind == EngineVermicelli) && e.sparseNFA != nil {
 		return sparseNFAMemoryBytes(e.sparseNFA)
@@ -7089,54 +6970,52 @@ func (e *Engine) MemoryBytes() uint64 {
 		return rangeNFAMemoryBytes(e.rangeNFA)
 	}
 	if e.byteNFA != nil && byteRuntimeShapeOK(e.byteNFA) {
-		bytes := saturatingMul(uint64(len(e.byteNFA.states)), 32)
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.byteNFA.classMask)), 32))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(totalByteNFAEdges(e.byteNFA)), 8))
+		size := saturatingMul(uint64(len(e.byteNFA.states)), 32)
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.byteNFA.classMask)), 32))
+		size = saturatingAdd(size, saturatingMul(uint64(totalByteNFAEdges(e.byteNFA)), 8))
 		if e.byteNFA.trans != nil {
-			bytes = saturatingAdd(bytes, saturatingMul(saturatingMul(uint64(len(e.byteNFA.trans)), 256), 8))
+			size = saturatingAdd(size, saturatingMul(saturatingMul(uint64(len(e.byteNFA.trans)), 256), 8))
 			for _, row := range e.byteNFA.transClosure {
 				for _, closure := range row {
-					bytes = saturatingAdd(bytes, saturatingMul(uint64(len(closure)), 4))
+					size = saturatingAdd(size, saturatingMul(uint64(len(closure)), 4))
 				}
 			}
 		}
-		bytes = saturatingAdd(bytes, uint64(len(e.byteNFA.dead)))
-		return saturatingAdd(bytes, uint64(len(e.byteNFA.prefix)))
+		size = saturatingAdd(size, uint64(len(e.byteNFA.dead)))
+		return saturatingAdd(size, uint64(len(e.byteNFA.prefix)))
 	}
 	if e.tableNFA != nil && tableRuntimeShapeOK(e.tableNFA) {
-		bytes := saturatingMul(saturatingMul(uint64(e.tableNFA.StateCount()), 256), 8)
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(e.tableNFA.EdgeCount()), 8))
-		if len(e.tableNFA.sourceMask) > 0 {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.tableNFA.sourceMask)), saturatingMul(uint64(len(e.tableNFA.sourceMask[0])), 8)))
-		}
-		bytes = saturatingAdd(bytes, uint64(len(e.tableNFA.prefix)))
+		size := saturatingMul(saturatingMul(uint64(e.tableNFA.StateCount()), 256), 8)
+		size = saturatingAdd(size, saturatingMul(uint64(e.tableNFA.EdgeCount()), 8))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.tableNFA.sourceMask)), saturatingMul(uint64(len(e.tableNFA.sourceMask[0])), 8)))
+		size = saturatingAdd(size, uint64(len(e.tableNFA.prefix)))
 		for _, closure := range e.tableNFA.closure {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(closure)), 4))
+			size = saturatingAdd(size, saturatingMul(uint64(len(closure)), 4))
 		}
 		for _, row := range e.tableNFA.transClosure {
 			for _, closure := range row {
-				bytes = saturatingAdd(bytes, saturatingMul(uint64(len(closure)), 4))
+				size = saturatingAdd(size, saturatingMul(uint64(len(closure)), 4))
 			}
 		}
-		bytes = saturatingAdd(bytes, uint64(len(e.tableNFA.dead)))
-		bytes = saturatingAdd(bytes, 33)
-		return bytes
+		size = saturatingAdd(size, uint64(len(e.tableNFA.dead)))
+		size = saturatingAdd(size, 33)
+		return size
 	}
 	if e.bitNFA != nil && bitRuntimeShapeOK(e.bitNFA) {
-		bytes := saturatingMul(saturatingMul(saturatingMul(uint64(len(e.bitNFA.trans)), uint64(e.bitNFA.words)), 256), 8)
-		bytes = saturatingAdd(bytes, saturatingMul(saturatingMul(256, uint64(e.bitNFA.words)), 8))
+		size := saturatingMul(saturatingMul(saturatingMul(uint64(len(e.bitNFA.trans)), uint64(e.bitNFA.words)), 256), 8)
+		size = saturatingAdd(size, saturatingMul(saturatingMul(256, uint64(e.bitNFA.words)), 8))
 		for _, states := range e.bitNFA.sourceStates {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(states)), 2))
+			size = saturatingAdd(size, saturatingMul(uint64(len(states)), 2))
 		}
-		bytes = saturatingAdd(bytes, saturatingMul(saturatingMul(uint64(len(e.bitNFA.closure)), uint64(e.bitNFA.words)), 8))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.bitNFA.accept)), 8))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.bitNFA.consumable)), 8))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.bitNFA.exceptional)), 8))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.bitNFA.epsilonOnly)), 8))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(e.bitNFA.dead)), 8))
-		bytes = saturatingAdd(bytes, 32+1+8)
-		bytes = saturatingAdd(bytes, uint64(len(e.bitNFA.prefix)))
-		return bytes
+		size = saturatingAdd(size, saturatingMul(saturatingMul(uint64(len(e.bitNFA.closure)), uint64(e.bitNFA.words)), 8))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.bitNFA.accept)), 8))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.bitNFA.consumable)), 8))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.bitNFA.exceptional)), 8))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.bitNFA.epsilonOnly)), 8))
+		size = saturatingAdd(size, saturatingMul(uint64(len(e.bitNFA.dead)), 8))
+		size = saturatingAdd(size, 32+1+8)
+		size = saturatingAdd(size, uint64(len(e.bitNFA.prefix)))
+		return size
 	}
 	if e.sparseNFA != nil && sparseRuntimeShapeOK(e.sparseNFA) {
 		return sparseNFAMemoryBytes(e.sparseNFA)
@@ -7165,85 +7044,81 @@ func sparseNFAMemoryBytes(p *sparseNFAProgram) uint64 {
 	if p == nil {
 		return 0
 	}
-	bytes := saturatingMul(uint64(len(p.states)), 32)
-	bytes = saturatingAdd(bytes, saturatingMul(uint64(len(p.classMask)), 32))
-	bytes = saturatingAdd(bytes, saturatingMul(uint64(p.EdgeCount()), 8))
+	size := saturatingMul(uint64(len(p.states)), 32)
+	size = saturatingAdd(size, saturatingMul(uint64(len(p.classMask)), 32))
+	size = saturatingAdd(size, saturatingMul(uint64(p.EdgeCount()), 8))
 	for _, transitions := range p.trans {
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(transitions)), 16))
+		size = saturatingAdd(size, saturatingMul(uint64(len(transitions)), 16))
 	}
 	for _, closure := range p.closures {
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(closure)), 4))
+		size = saturatingAdd(size, saturatingMul(uint64(len(closure)), 4))
 	}
 	for _, closure := range p.literalClosure {
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(closure)), 4))
+		size = saturatingAdd(size, saturatingMul(uint64(len(closure)), 4))
 	}
 	for _, closure := range p.classClosure {
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(closure)), 4))
+		size = saturatingAdd(size, saturatingMul(uint64(len(closure)), 4))
 	}
-	bytes = saturatingAdd(bytes, uint64(len(p.dead)))
-	if len(p.sourceMask) > 0 {
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(p.sourceMask)), saturatingMul(uint64(len(p.sourceMask[0])), 8)))
-	}
-	bytes = saturatingAdd(bytes, 512)
-	bytes = saturatingAdd(bytes, 33)
-	bytes = saturatingAdd(bytes, uint64(len(p.prefix)))
+	size = saturatingAdd(size, uint64(len(p.dead)))
+	size = saturatingAdd(size, saturatingMul(uint64(len(p.sourceMask)), saturatingMul(uint64(len(p.sourceMask[0])), 8)))
+	size = saturatingAdd(size, 512)
+	size = saturatingAdd(size, 33)
+	size = saturatingAdd(size, uint64(len(p.prefix)))
 	for _, states := range p.candidateStates {
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(states)), 4))
+		size = saturatingAdd(size, saturatingMul(uint64(len(states)), 4))
 	}
-	return bytes
+	return size
 }
 
 func rangeNFAMemoryBytes(p *rangeNFAProgram) uint64 {
 	if p == nil {
 		return 0
 	}
-	bytes := saturatingMul(uint64(len(p.states)), 32)
-	bytes = saturatingAdd(bytes, saturatingMul(uint64(p.EdgeCount()), 8))
+	size := saturatingMul(uint64(len(p.states)), 32)
+	size = saturatingAdd(size, saturatingMul(uint64(p.EdgeCount()), 8))
 	for _, row := range p.trans {
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(row)), 4))
+		size = saturatingAdd(size, saturatingMul(uint64(len(row)), 4))
 		for _, tr := range row {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(tr.next)), 4))
+			size = saturatingAdd(size, saturatingMul(uint64(len(tr.next)), 4))
 		}
 	}
 	for _, row := range p.transitionClosure {
 		for _, closure := range row {
-			bytes = saturatingAdd(bytes, saturatingMul(uint64(len(closure)), 4))
+			size = saturatingAdd(size, saturatingMul(uint64(len(closure)), 4))
 		}
 	}
 	for _, closure := range p.closures {
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(closure)), 4))
+		size = saturatingAdd(size, saturatingMul(uint64(len(closure)), 4))
 	}
 	for _, closure := range p.nextClosure {
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(closure)), 4))
+		size = saturatingAdd(size, saturatingMul(uint64(len(closure)), 4))
 	}
-	bytes = saturatingAdd(bytes, saturatingMul(uint64(len(p.masks)), 32))
-	bytes = saturatingAdd(bytes, saturatingMul(uint64(len(p.bucket)), 256*2))
-	bytes = saturatingAdd(bytes, uint64(len(p.dead)))
-	bytes = saturatingAdd(bytes, 33)
-	bytes = saturatingAdd(bytes, uint64(len(p.prefix)))
-	return bytes
+	size = saturatingAdd(size, saturatingMul(uint64(len(p.masks)), 32))
+	size = saturatingAdd(size, saturatingMul(uint64(len(p.bucket)), 256*2))
+	size = saturatingAdd(size, uint64(len(p.dead)))
+	size = saturatingAdd(size, 33)
+	size = saturatingAdd(size, uint64(len(p.prefix)))
+	return size
 }
 
 func nibbleNFAMemoryBytes(p *nibbleNFAProgram) uint64 {
 	if p == nil {
 		return 0
 	}
-	bytes := saturatingMul(uint64(len(p.states)), 32)
-	bytes = saturatingAdd(bytes, saturatingMul(uint64(p.EdgeCount()), 8))
-	bytes = saturatingAdd(bytes, saturatingMul(uint64(len(p.masks)), 32))
+	size := saturatingMul(uint64(len(p.states)), 32)
+	size = saturatingAdd(size, saturatingMul(uint64(p.EdgeCount()), 8))
+	size = saturatingAdd(size, saturatingMul(uint64(len(p.masks)), 32))
 	for _, closure := range p.closures {
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(closure)), 4))
+		size = saturatingAdd(size, saturatingMul(uint64(len(closure)), 4))
 	}
 	for _, closure := range p.nextClosure {
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(closure)), 4))
+		size = saturatingAdd(size, saturatingMul(uint64(len(closure)), 4))
 	}
-	if len(p.sourceMask) > 0 {
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(p.sourceMask)), saturatingMul(uint64(len(p.sourceMask[0])), 8)))
-	}
-	bytes = saturatingAdd(bytes, uint64(len(p.dead)))
-	bytes = saturatingAdd(bytes, 33)
-	bytes = saturatingAdd(bytes, uint64(len(p.prefix)))
-	return bytes
+	size = saturatingAdd(size, saturatingMul(uint64(len(p.sourceMask)), saturatingMul(uint64(len(p.sourceMask[0])), 8)))
+	size = saturatingAdd(size, uint64(len(p.dead)))
+	size = saturatingAdd(size, 33)
+	size = saturatingAdd(size, uint64(len(p.prefix)))
+	return size
 }
 
 func saturatingAdd(a, b uint64) uint64 {
@@ -7271,6 +7146,7 @@ func (k EngineKind) String() string {
 // Valid 判断引擎类型是否在支持范围内。
 func (k EngineKind) Valid() bool { return k >= EngineCastle && k <= EngineLBR }
 
+// CompileEngine 按指定布局编译 NFA 图，布局编号非法时返回错误。
 func CompileEngine(g *nfagraph.Graph, k EngineKind) (*Engine, error) {
 	if k < EngineCastle || k > EngineLBR {
 		return nil, fmt.Errorf("invalid nfa engine kind %d", k)
@@ -7297,16 +7173,16 @@ func CompileEngineWithBudgets(g *nfagraph.Graph, k EngineKind, maxStates int, ma
 	if maxStates < 0 {
 		return nil, ErrStateLimit
 	}
-	if expanded := nfagraph.ExpandLiterals(g); expanded == nil || expanded.Flow == nil {
+	expanded := nfagraph.ExpandLiterals(g)
+	if expanded == nil || expanded.Flow == nil {
 		return nil, ErrInvalidGraph
-	} else {
-		// 资源检查顺序固定为状态、边、内存，确保不同入口返回一致错误。
-		if maxStates > 0 && k != EngineRepeat && k != EngineMPV && len(expanded.Nodes) > maxStates {
-			return nil, ErrStateLimit
-		}
-		if limit := DefaultLimits(k).Edges; limit > 0 && expanded.Flow.EdgeCount() > limit {
-			return nil, ErrEdgeLimit
-		}
+	}
+	// 资源检查顺序固定为状态、边、内存，确保不同入口返回一致错误。
+	if maxStates > 0 && k != EngineRepeat && k != EngineMPV && len(expanded.Nodes) > maxStates {
+		return nil, ErrStateLimit
+	}
+	if limit := DefaultLimits(k).Edges; limit > 0 && expanded.Flow.EdgeCount() > limit {
+		return nil, ErrEdgeLimit
 	}
 	if maxMemory > 0 && estimateEngineMemory(g, k) > maxMemory {
 		return nil, ErrMemoryLimit
@@ -7447,6 +7323,7 @@ func compileEngineProgram(g *nfagraph.Graph, k EngineKind, p *Program) *Engine {
 		if engine.sparseNFA != nil && len(engine.sparseNFA.prefix) > 0 {
 			engine.vermicelli = &vermicelliProgram{core: engine.sparseNFA, prefix: append([]byte(nil), engine.sparseNFA.prefix...)}
 		}
+	default:
 	}
 	// 编译后立即校验布局；任何不完整或越界的专用表都丢弃，
 	// 后续由统一字节状态机安全接管，避免带病状态进入执行路径。
@@ -7606,6 +7483,7 @@ func estimateEngineCost(g *nfagraph.Graph, kind EngineKind) uint64 {
 			cost += 16
 		case nfagraph.KindRepeat:
 			cost += 12
+		default:
 		}
 	}
 	memory := estimateEngineMemory(g, kind)
@@ -7820,15 +7698,6 @@ func sameRepeatEnds(a, b []int) bool {
 		}
 	}
 	return true
-}
-
-func containsEnd(ends []int, want int) bool {
-	for _, end := range ends {
-		if end == want {
-			return true
-		}
-	}
-	return false
 }
 
 func compileMPVGraph(g *nfagraph.Graph) *mpvProgram {
@@ -8126,10 +7995,12 @@ func (e *Engine) preferredMatchAtInto(data []byte, start, maxSteps, maxResults i
 			v, n, stop := e.tableNFA.MatchAtBudgetInto(data, start, maxSteps, maxResults, dst)
 			return v, n, stop, true
 		}
+	default:
 	}
 	return nil, 0, false, false
 }
 
+// MatchAt 返回指定起点的全部结束偏移。
 func (e *Engine) MatchAt(data []byte, start int) []int {
 	if e == nil || e.Program == nil {
 		return nil
@@ -8179,7 +8050,6 @@ func (e *Engine) MatchAt(data []byte, start int) []int {
 	return e.Program.matchAtLimit(data, start, 0, false, false)
 }
 
-// MatchAtLimit 在执行状态预算内返回指定起点的结束偏移。
 // MatchAtInto 在调用方提供结束偏移缓冲时复用，避免每个起点分配临时切片。
 // 返回值是 dst[:k]，其中 k 是结束偏移数。
 func (e *Engine) MatchAtInto(data []byte, start int, dst []int) []int {
@@ -8231,13 +8101,10 @@ func (e *Engine) MatchAtInto(data []byte, start int, dst []int) []int {
 	if e.lbr != nil && lbrRuntimeShapeOK(e.lbr) {
 		return e.lbr.MatchAtInto(data, start, dst)
 	}
-	out := dst[:0]
-	for _, end := range e.Program.matchAtLimit(data, start, 0, false, false) {
-		out = append(out, end)
-	}
-	return out
+	return append(dst[:0], e.Program.matchAtLimit(data, start, 0, false, false)...)
 }
 
+// MatchAtLimit 在执行状态预算内返回指定起点的结束偏移，limit 为零时表示不限制。
 func (e *Engine) MatchAtLimit(data []byte, start, limit int) []int {
 	if e == nil || e.Program == nil || limit < 0 {
 		return nil
@@ -8492,10 +8359,6 @@ func initialSpanCapacity(data []byte, limit int) int {
 		return len(data) + 1
 	}
 	return commonSpanCount
-}
-
-func (p *mpvProgram) spans(data []byte, limit int) []Span {
-	return p.spansInto(data, nil, limit)
 }
 
 // spansInto 与 spans 语义一致，但把结果写入调用方缓冲以复用容量。

@@ -2,10 +2,12 @@ package dfa
 
 import (
 	"fmt"
+	"slices"
+	"sort"
+
 	"github.com/smartwalle/scankit/internal/graph"
 	"github.com/smartwalle/scankit/internal/nfa"
 	"github.com/smartwalle/scankit/internal/nfagraph"
-	"sort"
 )
 
 // ReverseProgram 在输入右边界向左确认匹配。对字节状态表使用反向状态表，
@@ -26,8 +28,8 @@ func ReverseEligible(g *nfagraph.Graph) bool {
 	if g == nil || g.Validate() != nil || !byteTableCompatible(nfagraph.ExpandLiterals(g)) {
 		return false
 	}
-	_, max := reverseWidth(g)
-	return max >= 0
+	_, maxWidth := reverseWidth(g)
+	return maxWidth >= 0
 }
 
 func reverseWidth(g *nfagraph.Graph) (int, int) {
@@ -68,6 +70,7 @@ func reverseWidth(g *nfagraph.Graph) (int, int) {
 				return memo[id]
 			}
 			width = 0
+		default:
 		}
 		if n.Kind == nfagraph.KindAccept {
 			state[id] = 2
@@ -124,6 +127,7 @@ func (p *ReverseProgram) Validate() error {
 	return p.forward.Validate()
 }
 
+// Clone 深拷贝反向程序，结果与原程序不共享状态表。
 func (p *ReverseProgram) Clone() *ReverseProgram {
 	if p == nil || p.Program == nil {
 		return nil
@@ -135,6 +139,7 @@ func (p *ReverseProgram) Clone() *ReverseProgram {
 	return &ReverseProgram{Program: p.Program.Clone(), forward: forward}
 }
 
+// CompileReverse 构建按右边界向左确认的反向确定性程序。
 func CompileReverse(g *nfagraph.Graph) (*ReverseProgram, error) {
 	if g == nil {
 		return nil, fmt.Errorf("nil graph")
@@ -274,11 +279,8 @@ func (p *ReverseProgram) MatchReverseAtLimitInto(data []byte, end, limit int, ds
 			startAt = end - limit
 		}
 		for start := startAt; start <= end; start++ {
-			for _, got := range p.forward.MatchAt(data, start) {
-				if got == end {
-					out = append(out, start)
-					break
-				}
+			if slices.Contains(p.forward.MatchAt(data, start), end) {
+				out = append(out, start)
 			}
 		}
 		return out
@@ -371,15 +373,17 @@ func (p *ReverseProgram) MatchReverse(data []byte) []int {
 	if p == nil {
 		return nil
 	}
-	out := []int{}
+	var out []int
 	for end := len(data); end >= 0; end-- {
 		starts := p.MatchReverseAt(data, end)
-		for i := len(starts) - 1; i >= 0; i-- {
-			out = append(out, starts[i])
+		for _, start := range slices.Backward(starts) {
+			out = append(out, start)
 		}
 	}
 	return out
 }
+
+// MatchReverseFirst 返回最靠右的一个反向匹配起点。
 func (p *ReverseProgram) MatchReverseFirst(data []byte) (int, bool) {
 	all := p.MatchReverse(data)
 	if len(all) == 0 {

@@ -30,6 +30,7 @@ type Features struct {
 // CPUFeatureMask 与编译目标中的硬件能力位保持稳定映射。
 type CPUFeatureMask uint64
 
+// CPUFeatureAVX2 表示 AVX2 能力位，其余常量对应当前支持的其他硬件特性位。
 const (
 	CPUFeatureAVX2       CPUFeatureMask = 1 << 2
 	CPUFeatureAVX512     CPUFeatureMask = 1 << 3
@@ -39,6 +40,7 @@ const (
 // TuneFamily 表示编译时的微架构调优族。
 type TuneFamily uint32
 
+// TuneGeneric 表示不做微架构特化的通用调优族，其余常量对应各代微架构。
 const (
 	TuneGeneric TuneFamily = iota
 	TuneSNB
@@ -132,6 +134,7 @@ func Detect() Features {
 // Backend 表示选中的实现后端。
 type Backend uint8
 
+// BackendGeneric 表示通用后端，其余常量对应 x86 与 arm64 后端。
 const (
 	BackendGeneric Backend = iota + 1
 	BackendX86
@@ -350,6 +353,7 @@ func SelectBackend(features Features) simd.Backend {
 			tier = x86backend.TierAVX2
 		case features.SSE4:
 			tier = x86backend.TierSSE4
+		default:
 		}
 		return x86backend.NewWithTier(tier)
 	case BackendARM64:
@@ -364,6 +368,8 @@ func SelectBackend(features Features) simd.Backend {
 		return simd.Default()
 	}
 }
+
+// BackendName 返回后端的稳定名称，未知后端返回 generic。
 func BackendName(b Backend) string {
 	switch b {
 	case BackendX86:
@@ -393,6 +399,8 @@ func ParseBackend(name string) (Backend, bool) {
 func BackendAvailable(features Features, backend Backend) bool {
 	return Select(features) == backend || backend == BackendGeneric
 }
+
+// NormalizeArch 将常见架构别名归一为 Go 的 GOARCH 取值。
 func NormalizeArch(arch string) string {
 	arch = strings.ToLower(strings.TrimSpace(arch))
 	switch arch {
@@ -404,8 +412,11 @@ func NormalizeArch(arch string) string {
 		return arch
 	}
 }
+
+// FeaturesForArch 返回只声明架构、不含具体特性的能力集合。
 func FeaturesForArch(arch string) Features { return Features{Arch: NormalizeArch(arch)} }
 
+// HasSIMD 判断能力集合是否足以选择非通用后端。
 func (f Features) HasSIMD() bool { return Select(f) != BackendGeneric }
 
 // FeatureNames 返回已启用特性的稳定名称列表。

@@ -152,8 +152,8 @@ func TestFindMatchesBruteForceFourLanes(t *testing.T) {
 
 // bruteForceMatches 按起点、编号和终点稳定排序全部真实命中，作为对照实现。
 func bruteForceMatches(data []byte, literals []hwlm.Literal) []Match {
-	out := []Match{}
-	for from := 0; from < len(data); from++ {
+	var out []Match
+	for from := range data {
 		for _, literal := range literals {
 			if !hwlm.ContainsAt(data, from, literal) {
 				continue
@@ -253,7 +253,7 @@ func BenchmarkWindowMaskClassifiers(b *testing.B) {
 func TestFindMatchesRandomizedAgainstBruteForce(t *testing.T) {
 	rng := rand.New(rand.NewSource(20260924))
 	alphabet := []byte("abcdABCDxyz")
-	for trial := 0; trial < 300; trial++ {
+	for trial := range 300 {
 		literals := make([]hwlm.Literal, 0, 4)
 		for i := 0; i < rng.Intn(4)+1; i++ {
 			value := make([]byte, rng.Intn(6)+1)

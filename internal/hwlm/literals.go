@@ -4,13 +4,15 @@ package hwlm
 import (
 	"bytes"
 	"fmt"
+	"sort"
+	"strconv"
+
 	"github.com/smartwalle/scankit/internal/dispatch"
 	"github.com/smartwalle/scankit/internal/parser"
 	"github.com/smartwalle/scankit/internal/simd"
-	"sort"
-	"strconv"
 )
 
+// Literal 是参与硬件加速匹配的文字候选。
 type Literal struct {
 	ID              uint32
 	Value           []byte
@@ -118,10 +120,10 @@ func (i *Index) Find(data []byte) []struct {
 	if i == nil {
 		return nil
 	}
-	out := []struct {
+	var out []struct {
 		ID       uint32
 		From, To int
-	}{}
+	}
 	seen := map[[3]int]struct{}{}
 	for _, lit := range i.literals {
 		for _, off := range FindAll(data, lit) {
@@ -289,10 +291,7 @@ func (i *Index) FindEndRange(data []byte, from, to int) []struct {
 	}, 0)
 	seen := make(map[[3]int]struct{})
 	for _, lit := range i.literals {
-		start := from - len(lit.Value)
-		if start < 0 {
-			start = 0
-		}
+		start := max(from-len(lit.Value), 0)
 		for _, off := range FindAllFrom(data, lit, start) {
 			end := off + len(lit.Value)
 			if end >= to {
@@ -467,8 +466,11 @@ func (i *Index) CountByID(data []byte, id uint32) int { return len(i.FindByID(da
 // Count 返回全部候选命中数量。
 func (i *Index) Count(data []byte) int { return len(i.Find(data)) }
 
+// Clone 返回文字候选副本，并复制字节内容。
 func (l Literal) Clone() Literal { l.Value = append([]byte(nil), l.Value...); return l }
-func (l Literal) Empty() bool    { return len(l.Value) == 0 }
+
+// Empty 判断文字候选是否不含字节。
+func (l Literal) Empty() bool { return len(l.Value) == 0 }
 
 // Extract 从 AST 中提取稳定的文字候选，优先保留最长连续文字。
 func Extract(root parser.Node) []Literal {
@@ -483,7 +485,7 @@ func Extract(root parser.Node) []Literal {
 		case parser.Group:
 			walk(v.Child)
 		case parser.Sequence:
-			buf := []byte{}
+			var buf []byte
 			flush := func() {
 				if len(buf) > 0 {
 					out = append(out, Literal{Value: append([]byte(nil), buf...)})
@@ -508,7 +510,8 @@ func Extract(root parser.Node) []Literal {
 				walk(v.Child)
 			}
 		case parser.Lookaround:
-			// 断言只约束匹配，不产生可消费的候选文字。
+		// 断言只约束匹配，不产生可消费的候选文字。
+		default:
 		}
 	}
 	walk(root)
@@ -573,6 +576,7 @@ func FlatKeyWidth(literals []Literal) int {
 	return FlatKeyShort
 }
 
+// Select 按文字集合的特征返回建议的后端名称，空集合返回 none。
 func Select(literals []Literal) string {
 	if len(literals) == 0 {
 		return "none"
@@ -658,8 +662,10 @@ func ExplainSelection(literals []Literal) SelectionDecision {
 	}
 	return d
 }
+
+// Deduplicate 按文字内容和大小写敏感性去重，保持首次出现顺序。
 func Deduplicate(in []Literal) []Literal {
-	out := []Literal{}
+	var out []Literal
 	seen := map[string]bool{}
 	for _, l := range in {
 		k := literalKey(l)
@@ -673,7 +679,7 @@ func Deduplicate(in []Literal) []Literal {
 }
 
 func literalKey(l Literal) string {
-	return strconv.FormatUint(uint64(l.ID), 10) + ":" + string([]byte{byte(boolByte(l.CaseInsensitive))}) + string(l.Value)
+	return strconv.FormatUint(uint64(l.ID), 10) + ":" + string([]byte{boolByte(l.CaseInsensitive)}) + string(l.Value)
 }
 
 func boolByte(v bool) byte {
@@ -682,6 +688,8 @@ func boolByte(v bool) byte {
 	}
 	return 0
 }
+
+// Longest 返回输入中最长文字的独立副本。
 func Longest(in []Literal) Literal {
 	var out Literal
 	for _, l := range in {
@@ -692,6 +700,8 @@ func Longest(in []Literal) Literal {
 	out.Value = append([]byte(nil), out.Value...)
 	return out
 }
+
+// LongestLength 返回最长文字的字节长度。
 func LongestLength(in []Literal) int { return len(Longest(in).Value) }
 
 // Shortest 返回输入中最短文字的独立副本。
@@ -720,6 +730,8 @@ func TotalBytes(in []Literal) int {
 	}
 	return total
 }
+
+// Prefix 返回全部文字的最长公共前缀。
 func Prefix(in []Literal) []byte {
 	if len(in) == 0 {
 		return nil
@@ -735,6 +747,7 @@ func Prefix(in []Literal) []byte {
 	return p
 }
 
+// PrefixLength 返回全部文字最长公共前缀的字节长度。
 func PrefixLength(in []Literal) int { return len(Prefix(in)) }
 
 // PrefixFold 返回忽略 ASCII 大小写后的公共前缀。
@@ -787,7 +800,7 @@ func FindByteRange(data []byte, lo, hi byte) []int {
 			break
 		}
 		mask := backend.InRangeMask(vec, lo, hi)
-		for bit := 0; bit < simdWidth; bit++ {
+		for bit := range simdWidth {
 			if mask&(1<<bit) != 0 {
 				out = append(out, off+bit)
 			}
@@ -822,7 +835,7 @@ func FindByteRangeLimit(data []byte, lo, hi byte, limit int) []int {
 			break
 		}
 		mask := backend.InRangeMask(vec, lo, hi)
-		for bit := 0; bit < simdWidth; bit++ {
+		for bit := range simdWidth {
 			if mask&(1<<bit) != 0 {
 				out = append(out, off+bit)
 				if len(out) >= limit {
@@ -853,12 +866,12 @@ func FindByteRangeSuper(data []byte, lo, hi byte) []int {
 			break
 		}
 		lowMask, highMask := window.InRangeMaskWithBackend(backend, lo, hi)
-		for bit := 0; bit < simdWidth; bit++ {
+		for bit := range simdWidth {
 			if lowMask&(1<<bit) != 0 {
 				out = append(out, off+bit)
 			}
 		}
-		for bit := 0; bit < simdWidth; bit++ {
+		for bit := range simdWidth {
 			if highMask&(1<<bit) != 0 {
 				out = append(out, off+simdWidth+bit)
 			}
@@ -886,7 +899,7 @@ func FindAllFrom(data []byte, literal Literal, start int) []int {
 		}
 		return positions
 	}
-	out := []int{}
+	var out []int
 	verify := func(off int) bool {
 		ok := true
 		for i, c := range literal.Value {
@@ -928,7 +941,7 @@ func FindAllFrom(data []byte, literal Literal, start int) []int {
 			off += simdWidth
 			continue
 		}
-		for bit := 0; bit < simdWidth; bit++ {
+		for bit := range simdWidth {
 			if mask&(1<<bit) == 0 {
 				continue
 			}
@@ -983,6 +996,8 @@ func foldByte(c byte) byte {
 	}
 	return c
 }
+
+// FindFirst 返回文字在 data 中最早出现的位置。
 func FindFirst(data []byte, literal Literal) (int, bool) {
 	all := FindAll(data, literal)
 	if len(all) == 0 {
@@ -990,6 +1005,8 @@ func FindFirst(data []byte, literal Literal) (int, bool) {
 	}
 	return all[0], true
 }
+
+// Count 返回文字在 data 中出现的次数，允许重叠。
 func Count(data []byte, literal Literal) int { return len(FindAll(data, literal)) }
 
 // Contains 判断文字是否出现在输入中。

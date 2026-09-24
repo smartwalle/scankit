@@ -11,8 +11,8 @@ import (
 
 // TestNativeEqualByteMaskCoverage 覆盖全部候选值与全部 lane 位置。
 func TestNativeEqualByteMaskCoverage(t *testing.T) {
-	for candidate := 0; candidate < 256; candidate++ {
-		for lane := 0; lane < generic.Width; lane++ {
+	for candidate := range 256 {
+		for lane := range generic.Width {
 			for _, item := range []byte{byte(candidate), byte(candidate ^ 0x20), byte(candidate ^ 0x80), 0} {
 				var v generic.Vector
 				v[lane] = item
@@ -38,7 +38,7 @@ func TestNativeEqualByteMaskCoverage(t *testing.T) {
 // TestNativeEqualMaskRandom 使用随机向量对核对双向量等值掩码。
 func TestNativeEqualMaskRandom(t *testing.T) {
 	rng := rand.New(rand.NewSource(31337))
-	for i := 0; i < 20000; i++ {
+	for range 20000 {
 		var a, b generic.Vector
 		for j := range a {
 			a[j] = byte(rng.Intn(256))

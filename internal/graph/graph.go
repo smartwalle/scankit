@@ -1,7 +1,10 @@
 // Package graph 提供 compiler 使用的有向/无向图基础结构和遍历算法。
 package graph
 
-import "sort"
+import (
+	"slices"
+	"sort"
+)
 
 // Vertex 是图顶点编号。编号从 0 开始，允许稀疏使用。
 type Vertex int
@@ -18,6 +21,7 @@ type Directed struct {
 	pred map[Vertex][]Vertex
 }
 
+// EdgeCount 返回有向边的数量，nil 图返回 0。
 func (g *Directed) EdgeCount() int {
 	if g == nil {
 		return 0
@@ -34,12 +38,7 @@ func (g *Directed) HasEdge(from, to Vertex) bool {
 	if g == nil {
 		return false
 	}
-	for _, next := range g.succ[from] {
-		if next == to {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(g.succ[from], to)
 }
 
 // OutDegree 返回顶点出度。
@@ -66,6 +65,7 @@ func (g *Directed) VertexCount() int {
 	return len(g.succ)
 }
 
+// Clone 返回结构副本，顶点和边的集合与原图一致。
 func (g *Directed) Clone() *Directed {
 	if g == nil {
 		return nil
@@ -79,6 +79,8 @@ func (g *Directed) Clone() *Directed {
 	}
 	return o
 }
+
+// Reverse 返回所有边方向反转后的新图。
 func (g *Directed) Reverse() *Directed {
 	if g == nil {
 		return nil
@@ -92,6 +94,8 @@ func (g *Directed) Reverse() *Directed {
 	}
 	return o
 }
+
+// Subgraph 返回由给定顶点及其之间的边构成的子图。
 func (g *Directed) Subgraph(vertices []Vertex) *Directed {
 	if g == nil {
 		return nil
@@ -166,6 +170,8 @@ func (g *Directed) RemoveEdge(from, to Vertex) bool {
 	g.pred[to] = pout
 	return true
 }
+
+// RemoveVertex 删除顶点以及所有与之相连的边。
 func (g *Directed) RemoveVertex(v Vertex) {
 	if g == nil {
 		return
@@ -227,7 +233,7 @@ func (g *Directed) Normalize() {
 		return
 	}
 	for from, list := range g.succ {
-		sort.Slice(list, func(i, j int) bool { return list[i] < list[j] })
+		slices.Sort(list)
 		out := list[:0]
 		for _, to := range list {
 			if len(out) == 0 || out[len(out)-1] != to {
@@ -245,7 +251,7 @@ func (g *Directed) Normalize() {
 		}
 	}
 	for to, list := range g.pred {
-		sort.Slice(list, func(i, j int) bool { return list[i] < list[j] })
+		slices.Sort(list)
 		g.pred[to] = list
 	}
 }
@@ -309,8 +315,8 @@ func (g *Directed) DFS(start Vertex) []Vertex {
 		stack = stack[:last]
 		order = append(order, v)
 		successors := g.succ[v]
-		for i := len(successors) - 1; i >= 0; i-- {
-			next := successors[i]
+		for _, next := range slices.Backward(successors) {
+
 			if !seen[next] {
 				seen[next] = true
 				stack = append(stack, next)
@@ -350,12 +356,7 @@ func (g *Directed) Reachable(from, to Vertex) bool {
 	if g == nil {
 		return false
 	}
-	for _, v := range g.BFS(from) {
-		if v == to {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(g.BFS(from), to)
 }
 
 // ShortestPath 返回无权图中的最短路径。
@@ -488,8 +489,8 @@ func sameVertices(a, b []Vertex) bool {
 	}
 	left := append([]Vertex(nil), a...)
 	right := append([]Vertex(nil), b...)
-	sort.Slice(left, func(i, j int) bool { return left[i] < left[j] })
-	sort.Slice(right, func(i, j int) bool { return right[i] < right[j] })
+	slices.Sort(left)
+	slices.Sort(right)
 	for i := range left {
 		if left[i] != right[i] {
 			return false
@@ -498,6 +499,7 @@ func sameVertices(a, b []Vertex) bool {
 	return true
 }
 
+// Topological 按顶点编号稳定输出拓扑序；存在环时 ok 为 false。
 func (g *Directed) Topological() ([]Vertex, bool) {
 	if g == nil {
 		return nil, true
@@ -506,14 +508,14 @@ func (g *Directed) Topological() ([]Vertex, bool) {
 	for _, v := range g.Vertices() {
 		ind[v] = len(g.Predecessors(v))
 	}
-	q := []Vertex{}
+	var q []Vertex
 	for v, n := range ind {
 		if n == 0 {
 			q = append(q, v)
 		}
 	}
-	sort.Slice(q, func(i, j int) bool { return q[i] < q[j] })
-	out := []Vertex{}
+	slices.Sort(q)
+	var out []Vertex
 	for len(q) > 0 {
 		v := q[0]
 		q = q[1:]
@@ -522,12 +524,14 @@ func (g *Directed) Topological() ([]Vertex, bool) {
 			ind[w]--
 			if ind[w] == 0 {
 				q = append(q, w)
-				sort.Slice(q, func(i, j int) bool { return q[i] < q[j] })
+				slices.Sort(q)
 			}
 		}
 	}
 	return out, len(out) == len(ind)
 }
+
+// IsAcyclic 判断图是否存在有向环。
 func (g *Directed) IsAcyclic() bool { _, ok := g.Topological(); return ok }
 
 // CyclePath 返回一条有向环路径；无环时返回空切片。
@@ -569,6 +573,8 @@ func (g *Directed) CyclePath() []Vertex {
 	}
 	return nil
 }
+
+// HasVertex 判断顶点是否存在于图中。
 func (g *Directed) HasVertex(v Vertex) bool {
 	if g == nil {
 		return false
@@ -582,7 +588,7 @@ func (g *Directed) Edges() []Edge {
 	if g == nil {
 		return nil
 	}
-	out := []Edge{}
+	var out []Edge
 	for _, from := range g.Vertices() {
 		for _, to := range g.Successors(from) {
 			out = append(out, Edge{From: from, To: to})
@@ -649,6 +655,7 @@ func (g *Directed) SCC() [][]Vertex {
 // Undirected 是无向图，边以双向邻接形式保存。
 type Undirected struct{ adj map[Vertex][]Vertex }
 
+// EdgeCount 返回无向边的数量，nil 图返回 0。
 func (g *Undirected) EdgeCount() int {
 	if g == nil {
 		return 0
@@ -709,16 +716,12 @@ func (g *Undirected) Vertices() []Vertex {
 	return vertices
 }
 
+// HasEdge 判断两个顶点之间是否存在无向边。
 func (g *Undirected) HasEdge(a, b Vertex) bool {
 	if g == nil {
 		return false
 	}
-	for _, v := range g.adj[a] {
-		if v == b {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(g.adj[a], b)
 }
 
 // HasVertex 判断顶点是否存在。
@@ -729,6 +732,8 @@ func (g *Undirected) HasVertex(v Vertex) bool {
 	_, ok := g.adj[v]
 	return ok
 }
+
+// Degree 返回顶点的度数，nil 图返回 0。
 func (g *Undirected) Degree(v Vertex) int {
 	if g == nil {
 		return 0
@@ -780,11 +785,13 @@ func (g *Undirected) Components() [][]Vertex {
 				}
 			}
 		}
-		sort.Slice(component, func(i, j int) bool { return component[i] < component[j] })
+		slices.Sort(component)
 		components = append(components, component)
 	}
 	return components
 }
+
+// Clone 返回结构副本，顶点和边的集合与原图一致。
 func (g *Undirected) Clone() *Undirected {
 	if g == nil {
 		return nil

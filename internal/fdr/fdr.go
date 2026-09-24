@@ -15,6 +15,7 @@ import (
 
 const version = 1
 
+// Match 是一条文字命中，From 与 To 为左闭右开区间。
 type Match struct {
 	ID       uint32
 	From, To int
@@ -43,8 +44,7 @@ type acNode struct {
 }
 
 type automaton struct {
-	nodes   []acNode
-	rootSet [4]uint64
+	nodes []acNode
 }
 
 // Matcher 使用两套 Aho-Corasick 自动机处理大小写敏感与不敏感文字。
@@ -131,6 +131,7 @@ func Load(data []byte) (*Matcher, error) {
 	return New(d.Literals), nil
 }
 
+// New 基于文字集合构建匹配器，输入会被去重并复制。
 func New(literals []hwlm.Literal) *Matcher {
 	out := &Matcher{literals: hwlm.Deduplicate(literals)}
 	for i := range out.literals {
@@ -142,12 +143,16 @@ func New(literals []hwlm.Literal) *Matcher {
 	out.foldedRoot = newRootSkip(out.folded.nodes)
 	return out
 }
+
+// Len 返回匹配器中的文字数量。
 func (m *Matcher) Len() int {
 	if m == nil {
 		return 0
 	}
 	return len(m.literals)
 }
+
+// Literals 返回文字集合的深拷贝。
 func (m *Matcher) Literals() []hwlm.Literal {
 	if m == nil {
 		return nil
@@ -158,7 +163,11 @@ func (m *Matcher) Literals() []hwlm.Literal {
 	}
 	return out
 }
+
+// Empty 判断匹配器是否不含任何文字。
 func (m *Matcher) Empty() bool { return m == nil || len(m.literals) == 0 }
+
+// Clone 深拷贝匹配器，结果与原匹配器不共享文字集合。
 func (m *Matcher) Clone() *Matcher {
 	if m == nil {
 		return nil
@@ -169,6 +178,8 @@ func (m *Matcher) Clone() *Matcher {
 	}
 	return out
 }
+
+// FindFirst 返回排序后最靠前的一条命中。
 func (m *Matcher) FindFirst(data []byte) (Match, bool) {
 	all := m.Find(data)
 	if len(all) == 0 {
@@ -176,6 +187,8 @@ func (m *Matcher) FindFirst(data []byte) (Match, bool) {
 	}
 	return all[0], true
 }
+
+// Count 返回 data 中的去重命中数量。
 func (m *Matcher) Count(data []byte) int { return len(m.Find(data)) }
 
 // FindReverse 返回按结束位置和起点逆序排列的文字命中。
@@ -221,6 +234,8 @@ func (m *Matcher) MatchAt(data []byte, offset int) []Match {
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
+
+// FindLimit 返回最多 limit 条命中，limit 为零时表示不限制。
 func (m *Matcher) FindLimit(data []byte, limit int) []Match {
 	if limit < 0 {
 		return nil
@@ -278,7 +293,7 @@ func (m *Matcher) FindFrom(data []byte, from int) []Match {
 	if from < 0 {
 		from = 0
 	}
-	out := []Match{}
+	var out []Match
 	for _, match := range m.Find(data) {
 		if match.From >= from {
 			out = append(out, match)
@@ -350,10 +365,7 @@ func (m *Matcher) FindEndRange(data []byte, from, to int) []Match {
 			maxLen = len(literal.Value)
 		}
 	}
-	start := from - maxLen
-	if start < 0 {
-		start = 0
-	}
+	start := max(from-maxLen, 0)
 	out := make([]Match, 0)
 	for _, match := range m.FindFrom(data, start) {
 		if match.From >= to {
@@ -386,8 +398,10 @@ func (m *Matcher) FindEndRangeLimit(data []byte, from, to, limit int) []Match {
 	}
 	return out
 }
+
+// FindByID 返回指定规则编号的命中。
 func (m *Matcher) FindByID(data []byte, id uint32) []Match {
-	out := []Match{}
+	var out []Match
 	for _, v := range m.Find(data) {
 		if v.ID == id {
 			out = append(out, v)
@@ -472,6 +486,8 @@ func (m *Matcher) CountByIDLimit(data []byte, id uint32, limit int) int {
 	}
 	return count
 }
+
+// Find 返回按起点、规则编号和终点排序去重后的全部命中。
 func (m *Matcher) Find(data []byte) []Match {
 	return m.FindInto(data, nil)
 }
@@ -645,7 +661,7 @@ func buildAutomaton(literals []hwlm.Literal, folded bool) automaton {
 		a.nodes[state].output = append(a.nodes[state].output, literal.Clone())
 	}
 	queue := make([]int, 0)
-	for value := 0; value < 256; value++ {
+	for value := range 256 {
 		child := a.nodes[0].next[byte(value)]
 		if child != 0 {
 			queue = append(queue, child)
@@ -656,7 +672,7 @@ func buildAutomaton(literals []hwlm.Literal, folded bool) automaton {
 	for len(queue) > 0 {
 		state := queue[0]
 		queue = queue[1:]
-		for value := 0; value < 256; value++ {
+		for value := range 256 {
 			child := a.nodes[state].next[byte(value)]
 			if child == 0 {
 				a.nodes[state].next[byte(value)] = a.nodes[a.nodes[state].failure].next[byte(value)]

@@ -32,6 +32,7 @@ func (l CompileLimits) Dimension(name string) uint64 {
 		return l.ProgramBytes
 	case "memory_bytes":
 		return l.MemoryBytes
+	default:
 	}
 	return 0
 }
@@ -83,6 +84,7 @@ func (l CompileLimits) RemainingDimension(name string, u Usage) (uint64, bool) {
 	return limit - used, true
 }
 
+// Unlimited 判断是否未设置任何预算。
 func (l CompileLimits) Unlimited() bool { return l == (CompileLimits{}) }
 
 // Constrained 判断是否至少设置了一项有限预算。
@@ -103,6 +105,7 @@ func (l CompileLimits) Tightest() (string, uint64) {
 	return name, value
 }
 
+// Merge 逐项取两者中更紧的非零预算，零值表示该项不限制。
 func (l CompileLimits) Merge(other CompileLimits) CompileLimits {
 	pick := func(a, b uint64) uint64 {
 		if a == 0 {
@@ -132,6 +135,7 @@ type Usage struct {
 	MemoryBytes   uint64
 }
 
+// Zero 判断资源用量是否全部为零。
 func (u Usage) Zero() bool { return u == (Usage{}) }
 
 // Exceeds 判断资源用量是否超过任一非零预算。
@@ -144,6 +148,7 @@ func (u Usage) Exceeds(l CompileLimits) bool {
 		l.MemoryBytes > 0 && u.MemoryBytes > l.MemoryBytes
 }
 
+// Add 将 v 累加到当前用量，逐项饱和以避免溢出。
 func (u *Usage) Add(v Usage) {
 	if u == nil {
 		return
@@ -186,6 +191,7 @@ func (u *Usage) Sub(v Usage) {
 // Merge 返回两份资源用量的饱和和。
 func (u Usage) Merge(other Usage) Usage { u.Add(other); return u }
 
+// Total 返回用量各分项之和，溢出时返回最大值。
 func (u Usage) Total() uint64 {
 	var out Usage
 	out.Add(u)
@@ -249,6 +255,7 @@ func (u Usage) HasDimension(name string) bool {
 	switch name {
 	case "graph_vertices", "graph_edges", "dfa_states", "rose_roles", "program_bytes", "memory_bytes":
 		return true
+	default:
 	}
 	return false
 }
@@ -292,6 +299,7 @@ func (l CompileLimits) FirstExceeded(u Usage) string {
 // ErrorKind 是可稳定断言的编译错误分类。
 type ErrorKind uint8
 
+// ErrorSyntax 表示语法错误，其余常量对应其他可稳定断言的编译错误分类。
 const (
 	ErrorSyntax ErrorKind = iota + 1
 	ErrorUnsupported
@@ -332,6 +340,7 @@ type PlatformCapabilities struct {
 	ARMSVE2Bit  bool
 }
 
+// AnySIMD 判断平台是否声明了任意一种向量能力。
 func (p PlatformCapabilities) AnySIMD() bool {
 	return p.X86SSE || p.X86SSE4 || p.X86AVX2 || p.X86AVX512 || p.X86AVX512VB || p.ARMNEON || p.ARMSVE || p.ARMSVE2 || p.ARMSVE2Bit
 }
@@ -385,6 +394,7 @@ func (c *CompileContext) ReserveChecked(u Usage) error {
 	return nil
 }
 
+// Clone 返回编译上下文的副本，用量快照随副本独立演进。
 func (c CompileContext) Clone() CompileContext { return c }
 
 // WithContext 返回绑定取消上下文的独立编译上下文。
@@ -395,6 +405,8 @@ func (c CompileContext) WithContext(ctx context.Context) CompileContext {
 
 // Remaining 返回当前资源预算扣除已用量后的快照。
 func (c CompileContext) Remaining() CompileLimits { return c.Limits.Remaining(c.Usage) }
+
+// ResetUsage 将资源用量清零，便于复用时重新统计。
 func (c *CompileContext) ResetUsage() {
 	if c != nil {
 		c.Usage = Usage{}

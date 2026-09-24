@@ -38,6 +38,7 @@ func DefaultLimits(kind EngineKind) ResourceLimits {
 		limits.States = sparseStateLimit
 	case EngineCastle, EngineGough, EngineLBR:
 		limits.States = 4096
+	default:
 	}
 	return limits
 }

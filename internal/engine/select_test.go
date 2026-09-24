@@ -1,10 +1,11 @@
 package engine
 
 import (
+	"testing"
+
 	"github.com/smartwalle/scankit/internal/dfa"
 	"github.com/smartwalle/scankit/internal/nfagraph"
 	"github.com/smartwalle/scankit/internal/parser"
-	"testing"
 )
 
 func TestCompileAuto(t *testing.T) {

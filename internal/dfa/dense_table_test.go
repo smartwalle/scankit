@@ -1,6 +1,7 @@
 package dfa
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/smartwalle/scankit/internal/nfagraph"
@@ -113,13 +114,7 @@ func TestReverseProgramPreservesDenseForwardResults(t *testing.T) {
 		revStarts := reverse.MatchReverseAt(data, end)
 		for _, start := range revStarts {
 			got := forward.MatchAt(data, start)
-			found := false
-			for _, g := range got {
-				if g == end {
-					found = true
-					break
-				}
-			}
+			found := slices.Contains(got, end)
 			if !found {
 				t.Fatalf("end=%d start=%d 前向未确认: %v", end, start, got)
 			}

@@ -25,8 +25,8 @@ func (p *Program) Width() int {
 	return len(p.Unit)
 }
 
-// Bounds 返回重复次数上下界，无上限时 max 为 -1。
-func (p *Program) Bounds() (min, max int) {
+// Bounds 返回重复次数上下界，无上限时 maxCount 为 -1。
+func (p *Program) Bounds() (minCount, maxCount int) {
 	if p == nil {
 		return 0, 0
 	}
@@ -37,8 +37,8 @@ func (p *Program) Bounds() (min, max int) {
 func (p *Program) CanMatchEmpty() bool { return p != nil && p.Min == 0 }
 
 // New 构造纯文字重复程序。
-func New(unit []byte, min, max int, greedy bool) (*Program, error) {
-	p := &Program{Unit: append([]byte(nil), unit...), Min: min, Max: max, Greedy: greedy}
+func New(unit []byte, minCount, maxCount int, greedy bool) (*Program, error) {
+	p := &Program{Unit: append([]byte(nil), unit...), Min: minCount, Max: maxCount, Greedy: greedy}
 	if err := p.Validate(); err != nil {
 		return nil, err
 	}
@@ -390,10 +390,7 @@ func (p *Program) FindEndRange(data []byte, from, to int) [][2]int {
 	if maxBytes := p.MaxBytes(); maxBytes >= 0 && from > maxBytes {
 		startFrom = from - maxBytes
 	}
-	startTo := to
-	if startTo > len(data) {
-		startTo = len(data)
-	}
+	startTo := min(to, len(data))
 	forEachRepeatStartRange(data, p.Unit, p.Min > 0, startFrom, startTo, func(start int) bool {
 		ends = p.MatchAtInto(data, start, ends[:0])
 		for _, end := range ends {
@@ -418,10 +415,7 @@ func (p *Program) FindEndRangeLimit(data []byte, from, to, limit int) [][2]int {
 	if maxBytes := p.MaxBytes(); maxBytes >= 0 && from > maxBytes {
 		startFrom = from - maxBytes
 	}
-	startTo := to
-	if startTo > len(data) {
-		startTo = len(data)
-	}
+	startTo := min(to, len(data))
 	forEachRepeatStartRange(data, p.Unit, p.Min > 0, startFrom, startTo, func(start int) bool {
 		ends = p.MatchAtInto(data, start, ends[:0])
 		for _, end := range ends {
@@ -577,11 +571,4 @@ func (p *Program) unitAt(data []byte, start int) bool {
 		}
 	}
 	return true
-}
-
-func (p *Program) prefixAt(data []byte, start int) bool {
-	if p == nil || start < 0 || start+len(p.Unit) > len(data) {
-		return false
-	}
-	return bytes.Equal(data[start:start+len(p.Unit)], p.Unit)
 }

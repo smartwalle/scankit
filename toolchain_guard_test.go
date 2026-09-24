@@ -17,7 +17,7 @@ func moduleGoDirective(t *testing.T, path string) (major, minor int) {
 	if err != nil {
 		t.Fatalf("读取 %s 失败: %v", path, err)
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "go ") {
 			continue

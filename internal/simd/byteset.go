@@ -15,12 +15,12 @@ type ByteSet struct {
 
 // NewByteSet 由 256 位位图构建预编译字节集合。
 func NewByteSet(raw [4]uint64) ByteSet {
-	set := ByteSet{raw: raw}
-	set.empty = raw[0] == 0 && raw[1] == 0 && raw[2] == 0 && raw[3] == 0
+	set := ByteSet{raw: raw,
+		empty: raw[0] == 0 && raw[1] == 0 && raw[2] == 0 && raw[3] == 0}
 	if set.empty {
 		return set
 	}
-	for h := 0; h < 16; h++ {
+	for h := range 16 {
 		row := uint16(raw[h>>2] >> (uint(h&3) * 16))
 		set.tables[h] = byte(row)
 		set.tables[16+h] = byte(row >> 8)

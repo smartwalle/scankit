@@ -5,18 +5,22 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/smartwalle/scankit/internal/graph"
-	"github.com/smartwalle/scankit/internal/nfagraph"
-	"github.com/smartwalle/scankit/internal/parser"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/smartwalle/scankit/internal/graph"
+	"github.com/smartwalle/scankit/internal/nfagraph"
+	"github.com/smartwalle/scankit/internal/parser"
 )
 
 const version = 1
 
+// Program 是 NFA 执行后端，持有图、专用引擎布局与推导出的静态元数据。
 type Program struct {
 	Graph  *nfagraph.Graph
 	castle *castleProgram
@@ -35,6 +39,8 @@ type Program struct {
 	prefix        []byte
 	classMasks    map[graph.Vertex][4]uint64
 }
+
+// Span 是一段匹配区间，From 与 To 为左闭右开偏移。
 type Span struct{ From, To int }
 
 type genericState struct {
@@ -157,17 +163,17 @@ func (p *Program) MemoryBytes() uint64 {
 	if p == nil || p.Graph == nil {
 		return 0
 	}
-	bytes := saturatingAdd(saturatingMul(uint64(len(p.Graph.Nodes)), 64), saturatingMul(uint64(p.EdgeCount()), 16))
+	size := saturatingAdd(saturatingMul(uint64(len(p.Graph.Nodes)), 64), saturatingMul(uint64(p.EdgeCount()), 16))
 	for _, id := range p.Graph.NodeIDs() {
 		n := p.Graph.Nodes[id]
 		if n == nil {
 			continue
 		}
-		bytes = saturatingAdd(bytes, uint64(len(n.Literal)))
-		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(n.Class.Ranges)), 4))
+		size = saturatingAdd(size, uint64(len(n.Literal)))
+		size = saturatingAdd(size, saturatingMul(uint64(len(n.Class.Ranges)), 4))
 	}
-	bytes = saturatingAdd(bytes, saturatingMul(uint64(len(p.classMasks)), 32))
-	return bytes
+	size = saturatingAdd(size, saturatingMul(uint64(len(p.classMasks)), 32))
+	return size
 }
 
 // StartVertex 返回程序起始节点编号。
@@ -239,7 +245,7 @@ func (p *Program) ReportIDs() []uint32 {
 	if len(ids) < 2 {
 		return ids
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	out := ids[:1]
 	for _, id := range ids[1:] {
 		if id != out[len(out)-1] {
@@ -289,12 +295,7 @@ func (p *Program) AcceptsEmpty() bool {
 }
 
 func containsInt(values []int, target int) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(values, target)
 }
 
 func computeGraphDead(g *nfagraph.Graph) map[graph.Vertex]bool {
@@ -430,7 +431,7 @@ func (p *Program) Validate() error {
 			if n == nil || n.Kind != nfagraph.KindClass || n.Unicode != nil {
 				return fmt.Errorf("nfa class mask node mismatch")
 			}
-			for b := 0; b < 256; b++ {
+			for b := range 256 {
 				want := castleMatches(n, byte(b))
 				got := mask[b/64]&(1<<uint(b%64)) != 0
 				if want != got {
@@ -466,6 +467,7 @@ func graphHasAssertions(g *nfagraph.Graph) bool {
 	return false
 }
 
+// Clone 深拷贝程序，结果与原程序不共享图与缓存布局。
 func (p *Program) Clone() *Program {
 	if p == nil || p.Graph == nil {
 		return nil
@@ -479,6 +481,7 @@ func (p *Program) Clone() *Program {
 	return out
 }
 
+// Compile 将 NFA 图编译为执行程序，g 为 nil 时返回错误。
 func Compile(g *nfagraph.Graph) (*Program, error) {
 	if g == nil {
 		return nil, fmt.Errorf("nil graph")
@@ -491,7 +494,7 @@ func Compile(g *nfagraph.Graph) (*Program, error) {
 	for _, id := range g.NodeIDs() {
 		if n := g.Nodes[id]; n != nil && n.Kind == nfagraph.KindClass && n.Unicode == nil {
 			var mask [4]uint64
-			for b := 0; b < 256; b++ {
+			for b := range 256 {
 				if castleMatches(n, byte(b)) {
 					mask[b/64] |= 1 << uint(b%64)
 				}
@@ -516,17 +519,17 @@ func graphLengthBounds(g *nfagraph.Graph) (int, int) {
 	}
 	const inf = int(^uint(0) >> 1)
 	ids := g.NodeIDs()
-	min := make(map[graph.Vertex]int, len(ids))
+	dist := make(map[graph.Vertex]int, len(ids))
 	for _, id := range ids {
-		min[id] = inf
+		dist[id] = inf
 	}
 	for _, id := range ids {
 		if n := g.Nodes[id]; n != nil && n.Kind == nfagraph.KindAccept {
-			min[id] = 0
+			dist[id] = 0
 		}
 	}
 	// 图规模受 Validate 限制，|V| 次松弛足以求得无负权最短路。
-	for pass := 0; pass < len(ids); pass++ {
+	for range ids {
 		changed := false
 		for _, id := range ids {
 			n := g.Nodes[id]
@@ -534,21 +537,21 @@ func graphLengthBounds(g *nfagraph.Graph) (int, int) {
 				continue
 			}
 			cost := nodeMinWidth(n)
-			best := min[id]
+			best := dist[id]
 			for _, to := range g.Flow.Successors(id) {
-				if v := min[to]; v != inf && v <= inf-cost && cost+v < best {
+				if v := dist[to]; v != inf && v <= inf-cost && cost+v < best {
 					best = cost + v
 				}
 			}
-			if best != min[id] {
-				min[id], changed = best, true
+			if best != dist[id] {
+				dist[id], changed = best, true
 			}
 		}
 		if !changed {
 			break
 		}
 	}
-	minStart := min[g.Start]
+	minStart := dist[g.Start]
 	if minStart == inf {
 		minStart = 0
 	}
@@ -601,8 +604,8 @@ func graphLengthBounds(g *nfagraph.Graph) (int, int) {
 		return minStart, -1
 	}
 	maxLen := make(map[graph.Vertex]int, len(reachable))
-	for i := len(topo) - 1; i >= 0; i-- {
-		id := topo[i]
+	for _, id := range slices.Backward(topo) {
+
 		n := g.Nodes[id]
 		best := -1
 		if n != nil && n.Kind == nfagraph.KindAccept {
@@ -662,9 +665,7 @@ func cloneClassMasks(src map[graph.Vertex][4]uint64) map[graph.Vertex][4]uint64 
 		return nil
 	}
 	dst := make(map[graph.Vertex][4]uint64, len(src))
-	for id, mask := range src {
-		dst[id] = mask
-	}
+	maps.Copy(dst, src)
 	return dst
 }
 
@@ -793,7 +794,7 @@ func (p *Program) matchAtLimitBudget(data []byte, start int, limit int, multilin
 	}
 	seen := work.seen
 	emitted := work.emitted
-	out := []int{}
+	var out []int
 	steps := 0
 	for head < len(q) {
 		s := q[head]
@@ -947,11 +948,13 @@ func equalLiteral(got, want []byte, caseless bool) bool {
 	}
 	return true
 }
+
+// Match 返回 data 全部起点上的结束偏移，按数值升序去重。
 func (p *Program) Match(data []byte) []int {
 	if p == nil {
 		return nil
 	}
-	out := []int{}
+	var out []int
 	seen := map[int]struct{}{}
 	prefix := p.prefix
 	if !p.metadataKnown {
@@ -1014,11 +1017,13 @@ func (p *Program) MatchLimit(data []byte, limit int) []int {
 	})
 	return out
 }
+
+// Spans 返回 data 中全部匹配区间，按起点和终点升序去重。
 func (p *Program) Spans(data []byte) []Span {
 	if p == nil {
 		return nil
 	}
-	out := []Span{}
+	var out []Span
 	seen := map[Span]struct{}{}
 	prefix := p.prefix
 	if !p.metadataKnown {
@@ -1211,6 +1216,8 @@ func (p *Program) ScanEach(data []byte, fn func(Span) bool) {
 		return true
 	})
 }
+
+// MatchFirst 返回最早出现的匹配起点与结束偏移。
 func (p *Program) MatchFirst(data []byte) (int, int, bool) {
 	if p == nil {
 		return 0, 0, false
@@ -1275,7 +1282,11 @@ func (p *Program) MatchAtRange(data []byte, start, from, to, limit int) []int {
 	}
 	return out
 }
+
+// MinEnd 返回指定起点的最早结束偏移。
 func (p *Program) MinEnd(data []byte, start int) (int, bool) { return p.MatchAtFirst(data, start) }
+
+// MaxEnd 返回指定起点的最晚结束偏移。
 func (p *Program) MaxEnd(data []byte, start int) (int, bool) {
 	ends := p.MatchAt(data, start)
 	if len(ends) == 0 {
@@ -1283,13 +1294,10 @@ func (p *Program) MaxEnd(data []byte, start int) (int, bool) {
 	}
 	return ends[len(ends)-1], true
 }
+
+// AcceptsAt 判断指定起点能否恰好结束在 end。
 func (p *Program) AcceptsAt(data []byte, start int, end int) bool {
-	for _, got := range p.MatchAt(data, start) {
-		if got == end {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(p.MatchAt(data, start), end)
 }
 func inClass(c byte, class parser.Class, caseless bool) bool {
 	matched := false
@@ -1317,6 +1325,7 @@ func assertion(kind parser.AssertionKind, data []byte, pos int, multiline bool) 
 		return (pos > 0 && word(data[pos-1])) != (pos < len(data) && word(data[pos]))
 	case parser.NonWordBoundary:
 		return (pos > 0 && word(data[pos-1])) == (pos < len(data) && word(data[pos]))
+	default:
 	}
 	return false
 }
@@ -1327,8 +1336,8 @@ func word(c byte) bool {
 func unicodeProperty(r rune, name string) bool {
 	name = normalizeUnicodeProperty(name)
 	for _, prefix := range []string{"script=", "sc=", "script:", "generalcategory=", "gc="} {
-		if strings.HasPrefix(name, prefix) {
-			name = strings.TrimPrefix(name, prefix)
+		if after, ok := strings.CutPrefix(name, prefix); ok {
+			name = after
 			break
 		}
 	}

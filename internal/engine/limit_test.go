@@ -2,10 +2,11 @@ package engine
 
 import (
 	"errors"
+	"testing"
+
 	"github.com/smartwalle/scankit/internal/nfa"
 	"github.com/smartwalle/scankit/internal/nfagraph"
 	"github.com/smartwalle/scankit/internal/parser"
-	"testing"
 )
 
 func TestSelectKindWithLimit(t *testing.T) {

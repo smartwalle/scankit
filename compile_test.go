@@ -3,9 +3,10 @@ package scankit
 import (
 	"context"
 	"errors"
+	"testing"
+
 	"github.com/smartwalle/scankit/internal/compiler"
 	"github.com/smartwalle/scankit/internal/parser"
-	"testing"
 )
 
 func TestCompileRejectsDuplicateIDs(t *testing.T) {

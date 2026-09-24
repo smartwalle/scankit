@@ -18,7 +18,7 @@ func TestCompileLimits(t *testing.T) {
 
 func TestCompileErrorDoesNotContainPattern(t *testing.T) {
 	err := (&CompileError{Kind: ErrorSyntax, Expression: 1, Position: 4, Message: "unexpected token"}).Error()
-	if strings.Contains(err, "unexpected token") == false || strings.Contains(err, "pattern") {
+	if !strings.Contains(err, "unexpected token") || strings.Contains(err, "pattern") {
 		t.Fatalf("unexpected compile error: %q", err)
 	}
 }
@@ -32,12 +32,12 @@ func TestCheckStageIncludesStageAndLimitKind(t *testing.T) {
 
 func FuzzCompileLimits(f *testing.F) {
 	f.Add(uint64(1), uint64(2))
-	f.Fuzz(func(t *testing.T, max, used uint64) {
-		err := CompileLimits{GraphVertices: max}.Check(Usage{GraphVertices: used})
-		if max != 0 && used > max && err == nil {
+	f.Fuzz(func(t *testing.T, maxValue, used uint64) {
+		err := CompileLimits{GraphVertices: maxValue}.Check(Usage{GraphVertices: used})
+		if maxValue != 0 && used > maxValue && err == nil {
 			t.Fatal("limit not enforced")
 		}
-		if (max == 0 || used <= max) && err != nil {
+		if (maxValue == 0 || used <= maxValue) && err != nil {
 			t.Fatal(err)
 		}
 	})

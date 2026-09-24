@@ -1,9 +1,10 @@
 package nfa
 
 import (
+	"testing"
+
 	"github.com/smartwalle/scankit/internal/nfagraph"
 	"github.com/smartwalle/scankit/internal/parser"
-	"testing"
 )
 
 func TestMatchFirst(t *testing.T) {

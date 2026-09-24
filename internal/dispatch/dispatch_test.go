@@ -1,8 +1,9 @@
 package dispatch
 
 import (
-	"github.com/smartwalle/scankit/internal/simd"
 	"testing"
+
+	"github.com/smartwalle/scankit/internal/simd"
 
 	armbackend "github.com/smartwalle/scankit/internal/simd/arm64"
 	x86backend "github.com/smartwalle/scankit/internal/simd/x86"
@@ -22,8 +23,7 @@ func TestSelectFallback(t *testing.T) {
 
 func TestSelectBackendSafeFallback(t *testing.T) {
 	b := SelectBackend(Features{Arch: "unknown"})
-	v, ok := b.Load(make([]byte, 16), 0)
-	if !ok || len(v) != 16 {
+	if _, ok := b.Load(make([]byte, 16), 0); !ok {
 		t.Fatal(ok)
 	}
 }

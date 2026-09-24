@@ -14,7 +14,7 @@ func TestSelectionBoundaryAndEligibility(t *testing.T) {
 	if short.Eligible([]byte("123456789")) || !long.Eligible([]byte("123456789")) {
 		t.Fatal("容量判定错误")
 	}
-	if short.MatchAt([]byte("x12345678"), 1) != true || long.MatchAt([]byte("x123456789"), 1) != true {
+	if !short.MatchAt([]byte("x12345678"), 1) || !long.MatchAt([]byte("x123456789"), 1) {
 		t.Fatal("匹配接口错误")
 	}
 }

@@ -111,19 +111,19 @@ func TestMinimizeKeepsReportSemantics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	min, err := Minimize(g)
+	minimized, err := Minimize(g)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := min.Validate(); err != nil {
+	if err := minimized.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := min.AcceptReportIDs(), []uint32{1, 2}; !reflect.DeepEqual(got, want) {
+	if got, want := minimized.AcceptReportIDs(), []uint32{1, 2}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("最小化丢失报告语义: got=%v want=%v", got, want)
 	}
 	reportSets := map[string]struct{}{}
-	for _, id := range min.AcceptStates() {
-		reportSets[reportPartitionKey(min.States[id])] = struct{}{}
+	for _, id := range minimized.AcceptStates() {
+		reportSets[reportPartitionKey(minimized.States[id])] = struct{}{}
 	}
 	if len(reportSets) != 2 {
 		t.Fatalf("不同报告编号的接受状态被合并: %v", reportSets)
@@ -131,7 +131,7 @@ func TestMinimizeKeepsReportSemantics(t *testing.T) {
 	for _, input := range []string{"a", "b", "ab", "ba", ""} {
 		for start := 0; start <= len(input); start++ {
 			want := base.MatchAt([]byte(input), start)
-			got := min.MatchAt([]byte(input), start)
+			got := minimized.MatchAt([]byte(input), start)
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("最小化改变语言 input=%q start=%d got=%v want=%v", input, start, got, want)
 			}
@@ -155,15 +155,15 @@ func TestMinimizeMergesStatesWithEqualReportSet(t *testing.T) {
 	g.AddEdge(0, 4)
 	g.AddEdge(4, 5)
 	g.AddEdge(5, 6)
-	min, err := Minimize(g)
+	minimized, err := Minimize(g)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := min.AcceptReportIDs(), []uint32{4}; !reflect.DeepEqual(got, want) {
+	if got, want := minimized.AcceptReportIDs(), []uint32{4}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("报告集合一致的状态未按预期合并: got=%v want=%v", got, want)
 	}
-	if got := len(min.AcceptStates()); got != 1 {
-		t.Fatalf("报告集合相同的接受状态应合并: %v", min.AcceptStates())
+	if got := len(minimized.AcceptStates()); got != 1 {
+		t.Fatalf("报告集合相同的接受状态应合并: %v", minimized.AcceptStates())
 	}
 }
 

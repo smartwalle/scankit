@@ -4,12 +4,15 @@ package smallengine
 import (
 	"encoding/json"
 	"fmt"
+
 	"github.com/smartwalle/scankit/internal/smallblock"
 	"github.com/smartwalle/scankit/internal/smallwrite"
 )
 
+// Kind 标识短文字程序使用的专用引擎类型。
 type Kind uint8
 
+// KindNone 表示未选择引擎，其余常量对应小写入与小分块引擎。
 const (
 	KindNone Kind = iota
 	KindSmallWrite
@@ -63,6 +66,7 @@ func CompileWithOptions(literal []byte, options CompileOptions) (*Program, error
 	return &Program{Kind: KindSmallBlock, Block: smallblock.NewWithLimit(literal, options.MaxInput)}, nil
 }
 
+// Validate 检查程序内部结构与引擎类型是否一致。
 func (p *Program) Validate() error {
 	if p == nil {
 		return fmt.Errorf("nil small engine")
@@ -98,6 +102,7 @@ func (p *Program) Clone() *Program {
 	return out
 }
 
+// Size 返回底层引擎的模式长度，空程序返回 0。
 func (p *Program) Size() int {
 	if p == nil {
 		return 0
@@ -110,6 +115,8 @@ func (p *Program) Size() int {
 	}
 	return 0
 }
+
+// Eligible 判断输入长度是否满足底层引擎预算。
 func (p *Program) Eligible(data []byte) bool {
 	if p == nil {
 		return false
@@ -122,6 +129,8 @@ func (p *Program) Eligible(data []byte) bool {
 	}
 	return false
 }
+
+// Find 返回输入中全部命中的结束偏移。
 func (p *Program) Find(data []byte) []int {
 	if p == nil {
 		return nil
@@ -182,6 +191,8 @@ func Load(data []byte) (*Program, error) {
 	}
 	return p, nil
 }
+
+// FindRange 返回 [from, to) 区间内最多 limit 个命中的结束偏移。
 func (p *Program) FindRange(data []byte, from, to, limit int) []int {
 	if p == nil {
 		return nil

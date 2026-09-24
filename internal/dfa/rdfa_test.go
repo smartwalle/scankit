@@ -1,11 +1,12 @@
 package dfa
 
 import (
+	"reflect"
+	"testing"
+
 	"github.com/smartwalle/scankit/internal/nfa"
 	"github.com/smartwalle/scankit/internal/nfagraph"
 	"github.com/smartwalle/scankit/internal/parser"
-	"reflect"
-	"testing"
 )
 
 func TestReverseProgram(t *testing.T) {
@@ -87,7 +88,7 @@ func BenchmarkMatchReverseAt(b *testing.B) {
 	data := []byte("prefix-abcdef")
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if starts := p.MatchReverseAt(data, len(data)); len(starts) != 1 {
 			b.Fatal(starts)
 		}

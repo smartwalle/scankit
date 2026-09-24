@@ -191,7 +191,7 @@ func newPIIRules100Fixture(tb testing.TB, density piiRules100Density) piiRules10
 		tb.Fatal(err)
 	}
 	masked := append([]byte(nil), data...)
-	if _, err := engine.Mask(masked, maskPIIValue); err != nil {
+	if err := engine.Mask(masked, maskPIIValue); err != nil {
 		tb.Fatal(err)
 	}
 	if !bytes.Equal(masked, fixture.masked) {
@@ -228,17 +228,16 @@ func BenchmarkPIIRedactionRules100(b *testing.B) {
 			b.Run("EngineMask", func(b *testing.B) {
 				data := make([]byte, len(fixture.data))
 				copy(data, fixture.data)
-				if _, err := fixture.engine.Mask(data, maskPIIValue); err != nil {
+				if err := fixture.engine.Mask(data, maskPIIValue); err != nil {
 					b.Fatal(err)
 				}
 				startPIIRules100Timer(b, fixture)
 				for range b.N {
 					copy(data, fixture.data)
-					result, err := fixture.engine.Mask(data, maskPIIValue)
-					if err != nil {
+					if err := fixture.engine.Mask(data, maskPIIValue); err != nil {
 						b.Fatal(err)
 					}
-					piiBenchmarkBytesSink = result
+					piiBenchmarkBytesSink = data
 				}
 			})
 
@@ -352,7 +351,7 @@ func TestPIIRedactionRules100Stable(t *testing.T) {
 
 		// --- ScannerScanInto ---
 		matches := make([]scankit.Match, 0, len(fixture.matches))
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			matches = matches[:0]
 			var err error
 			matches, err = fixture.scanner.ScanInto(fixture.data, matches)
@@ -390,30 +389,28 @@ func TestPIIRedactionRules100Stable(t *testing.T) {
 		// --- EngineMask ---
 		data := make([]byte, dataLen)
 		copy(data, fixture.data)
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			copy(data, fixture.data)
-			if _, err := fixture.engine.Mask(data, maskPIIValue); err != nil {
+			if err := fixture.engine.Mask(data, maskPIIValue); err != nil {
 				t.Fatal(err)
 			}
 		}
 		engineAllocs := testing.AllocsPerRun(200, func() {
 			copy(data, fixture.data)
-			result, err := fixture.engine.Mask(data, maskPIIValue)
-			if err != nil {
+			if err := fixture.engine.Mask(data, maskPIIValue); err != nil {
 				t.Fatal(err)
 			}
-			piiBenchmarkBytesSink = result
+			piiBenchmarkBytesSink = data
 		})
 		engineRes := testing.Benchmark(func(b *testing.B) {
 			data := make([]byte, dataLen)
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				copy(data, fixture.data)
-				result, err := fixture.engine.Mask(data, maskPIIValue)
-				if err != nil {
+				if err := fixture.engine.Mask(data, maskPIIValue); err != nil {
 					b.Fatal(err)
 				}
-				piiBenchmarkBytesSink = result
+				piiBenchmarkBytesSink = data
 			}
 		})
 		nsPerOp = float64(engineRes.NsPerOp())
@@ -422,7 +419,7 @@ func TestPIIRedactionRules100Stable(t *testing.T) {
 			density.name, nsPerOp, mbPerS, engineRes.AllocedBytesPerOp(), engineAllocs, len(fixture.matches))
 
 		// --- GoRegexpReplace ---
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			piiBenchmarkBytesSink = fixture.goRegexp.ReplaceAllFunc(fixture.data, fixture.maskFn)
 		}
 		regexpAllocs := testing.AllocsPerRun(200, func() {

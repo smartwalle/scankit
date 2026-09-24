@@ -57,12 +57,15 @@ func (q *PriorityQueue[T]) Pop() (T, int, bool) {
 	return item.value, item.priority, true
 }
 
+// Len 返回队列中的元素数量，nil 队列返回 0。
 func (q *PriorityQueue[T]) Len() int {
 	if q == nil {
 		return 0
 	}
 	return len(q.items)
 }
+
+// Reset 清空队列并重置优先级序号。
 func (q *PriorityQueue[T]) Reset() {
 	if q != nil {
 		q.items = q.items[:0]
@@ -94,9 +97,15 @@ func (q *Queue[T]) Pop() (T, bool) {
 }
 
 // Len 返回待出队数量。
-func (q Queue[T]) Len() int       { return len(q.items) - q.head }
-func (q Queue[T]) Empty() bool    { return q.head >= len(q.items) }
+func (q Queue[T]) Len() int { return len(q.items) - q.head }
+
+// Empty 判断队列中是否还有待出队元素。
+func (q Queue[T]) Empty() bool { return q.head >= len(q.items) }
+
+// HeadIndex 返回队首元素在底层存储中的下标，供压缩存储时对齐。
 func (q Queue[T]) HeadIndex() int { return q.head }
+
+// Drain 依次出队全部元素并追加到 dst。
 func (q *Queue[T]) Drain(dst []T) []T {
 	for {
 		v, ok := q.Pop()
@@ -106,6 +115,8 @@ func (q *Queue[T]) Drain(dst []T) []T {
 		dst = append(dst, v)
 	}
 }
+
+// Peek 返回队首元素但不移出队列，队列为空时返回零值和 false。
 func (q Queue[T]) Peek() (T, bool) {
 	if q.head >= len(q.items) {
 		var z T
@@ -113,6 +124,8 @@ func (q Queue[T]) Peek() (T, bool) {
 	}
 	return q.items[q.head], true
 }
+
+// Cap 返回底层存储的容量，用于观测压缩整理效果。
 func (q Queue[T]) Cap() int { return cap(q.items) }
 
 // Values 返回待出队元素的快照。

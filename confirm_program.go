@@ -2,6 +2,7 @@ package scankit
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 
 	"github.com/smartwalle/scankit/internal/parser"
@@ -151,6 +152,7 @@ func (c *confirmCompiler) setFromNode(node parser.Node) (confirmByteSet, bool) {
 			return set, false
 		}
 		return c.setFromNode(v.Child)
+	default:
 	}
 	return set, false
 }
@@ -188,8 +190,8 @@ func (c *confirmCompiler) addLiteral(value []byte) int32 {
 	return int32(len(c.literals) - 1)
 }
 
-func (c *confirmCompiler) addRepeat(set int32, min, max int32, final bool) int32 {
-	c.repeats = append(c.repeats, confirmRepeat{set: set, min: min, max: max, final: final})
+func (c *confirmCompiler) addRepeat(set int32, minCount, maxCount int32, final bool) int32 {
+	c.repeats = append(c.repeats, confirmRepeat{set: set, min: minCount, max: maxCount, final: final})
 	return int32(len(c.repeats) - 1)
 }
 
@@ -292,7 +294,7 @@ func buildConfirmRemain(p *confirmProgram) []int {
 		return nil
 	}
 	remain := make([]int, size)
-	for pass := 0; pass < size; pass++ {
+	for range size {
 		changed := false
 		for index := range remain {
 			next := confirmRemainAt(p, int32(index), remain)
@@ -354,6 +356,7 @@ func confirmRemainAt(p *confirmProgram, pc int32, remain []int) int {
 		return after(instr.next, int(repeat.max))
 	case confirmOpMatch:
 		return 0
+	default:
 	}
 	return confirmRemainUnbounded
 }
@@ -389,8 +392,8 @@ func (c *confirmCompiler) compile(node parser.Node, next int32) int32 {
 		return c.compile(v.Child, next)
 	case parser.Sequence:
 		entry := next
-		for index := len(v.Elements) - 1; index >= 0; index-- {
-			entry = c.compile(v.Elements[index], entry)
+		for _, v0 := range slices.Backward(v.Elements) {
+			entry = c.compile(v0, entry)
 			if !c.ok {
 				return -1
 			}
@@ -416,6 +419,7 @@ func (c *confirmCompiler) compile(node parser.Node, next int32) int32 {
 			return c.emit(confirmInstr{op: confirmOpMatch})
 		}
 		return c.fail()
+	default:
 	}
 	return c.fail()
 }
@@ -446,7 +450,7 @@ func (c *confirmCompiler) compileRepeat(v parser.Repeat, next int32) int32 {
 		return c.emit(confirmInstr{op: confirmOpSetRepeat, index: index, next: next})
 	}
 	if v.Max < 0 {
-		if min, _, ok := parser.WidthRange(v.Child); !ok || min < 1 {
+		if minWidth, _, ok := parser.WidthRange(v.Child); !ok || minWidth < 1 {
 			return c.fail()
 		}
 		c.unbounded = true
@@ -586,21 +590,21 @@ scan:
 		case confirmOpSetRepeat:
 			repeat := &p.repeats[instr.index]
 			limit := dataLen - pos
-			max := int(repeat.max)
-			if max < 0 || max > limit {
-				max = limit
+			maxCount := int(repeat.max)
+			if maxCount < 0 || maxCount > limit {
+				maxCount = limit
 			}
 			set := &p.sets[repeat.set]
 			count := 0
-			for count < max {
+			for count < maxCount {
 				value := data[pos+count]
 				if set[value>>6]&(uint64(1)<<(value&63)) == 0 {
 					break
 				}
 				count++
 			}
-			min := int(repeat.min)
-			if count < min {
+			minCount := int(repeat.min)
+			if count < minCount {
 				goto backtrack
 			}
 			proceed := count
@@ -609,10 +613,10 @@ scan:
 				// 后继就是接受状态：本次重复的所有合法次数都是完整命中的
 				// 结束位置，直接按偏好方向取端点，无需保存回溯点。
 				if !maxEnd {
-					proceed = min
+					proceed = minCount
 				}
 			case maxEnd:
-				for shorter := count - 1; shorter >= min; shorter-- {
+				for shorter := count - 1; shorter >= minCount; shorter-- {
 					if depth == len(stack) {
 						return -1, false
 					}
@@ -620,14 +624,14 @@ scan:
 					depth++
 				}
 			default:
-				for longer := min + 1; longer <= count; longer++ {
+				for longer := minCount + 1; longer <= count; longer++ {
 					if depth == len(stack) {
 						return -1, false
 					}
 					stack[depth] = confirmFrame{pc: instr.next, pos: pos + longer}
 					depth++
 				}
-				proceed = min
+				proceed = minCount
 			}
 			pos += proceed
 			pc = instr.next

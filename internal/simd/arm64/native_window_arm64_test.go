@@ -14,7 +14,7 @@ import (
 func TestNativeByteSetMask32CoversAllValues(t *testing.T) {
 	for _, raw := range bytesetSets() {
 		set := simd.NewByteSet(raw)
-		for b := 0; b < 256; b++ {
+		for b := range 256 {
 			window := make([]byte, simd.SuperWidth)
 			for i := range window {
 				window[i] = byte(b)
@@ -32,11 +32,11 @@ func TestNativeByteSetMask32CoversAllValues(t *testing.T) {
 
 // TestNativeByteSetMask32PinsBitOrder 使用单字节集合逐位置验证掩码位序。
 func TestNativeByteSetMask32PinsBitOrder(t *testing.T) {
-	for b := 0; b < 256; b++ {
+	for b := range 256 {
 		var raw [4]uint64
 		raw[b/64] = 1 << uint(b%64)
 		set := simd.NewByteSet(raw)
-		for lane := 0; lane < simd.SuperWidth; lane++ {
+		for lane := range simd.SuperWidth {
 			window := make([]byte, simd.SuperWidth)
 			for i := range window {
 				window[i] = byte(b + 1)
@@ -54,7 +54,7 @@ func TestNativeByteSetMask32PinsBitOrder(t *testing.T) {
 func TestNativeByteSetMask32RandomWindows(t *testing.T) {
 	rng := rand.New(rand.NewSource(17))
 	sets := bytesetSets()
-	for i := 0; i < 20000; i++ {
+	for range 20000 {
 		raw := sets[rng.Intn(len(sets))]
 		set := simd.NewByteSet(raw)
 		window := make([]byte, simd.SuperWidth)
@@ -86,7 +86,7 @@ func BenchmarkNativeByteSetMask32(b *testing.B) {
 	}
 	b.ReportAllocs()
 	var acc uint32
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		acc |= nativeByteSetMask32(window, tables)
 	}
 	if acc == 0 {
@@ -99,7 +99,7 @@ func BenchmarkNativeByteSetMask32(b *testing.B) {
 func TestNativeByteSetMask64CoversAllValues(t *testing.T) {
 	for _, raw := range bytesetSets() {
 		set := simd.NewByteSet(raw)
-		for b := 0; b < 256; b++ {
+		for b := range 256 {
 			window := make([]byte, simd.WideWidth)
 			for i := range window {
 				window[i] = byte(b)
@@ -117,11 +117,11 @@ func TestNativeByteSetMask64CoversAllValues(t *testing.T) {
 
 // TestNativeByteSetMask64PinsBitOrder 使用单字节集合逐位置验证掩码位序。
 func TestNativeByteSetMask64PinsBitOrder(t *testing.T) {
-	for b := 0; b < 256; b++ {
+	for b := range 256 {
 		var raw [4]uint64
 		raw[b/64] = 1 << uint(b%64)
 		set := simd.NewByteSet(raw)
-		for lane := 0; lane < simd.WideWidth; lane++ {
+		for lane := range simd.WideWidth {
 			window := make([]byte, simd.WideWidth)
 			for i := range window {
 				window[i] = byte(b + 1)
@@ -139,7 +139,7 @@ func TestNativeByteSetMask64PinsBitOrder(t *testing.T) {
 func TestNativeByteSetMask64RandomWindows(t *testing.T) {
 	rng := rand.New(rand.NewSource(29))
 	sets := bytesetSets()
-	for i := 0; i < 20000; i++ {
+	for range 20000 {
 		raw := sets[rng.Intn(len(sets))]
 		set := simd.NewByteSet(raw)
 		window := make([]byte, simd.WideWidth)
@@ -172,7 +172,7 @@ func BenchmarkNativeByteSetMask64(b *testing.B) {
 	}
 	b.ReportAllocs()
 	var acc uint64
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		acc |= nativeByteSetMask64(&window[0], tables)
 	}
 	if acc == 0 {

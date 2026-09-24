@@ -2,10 +2,11 @@ package rose
 
 import (
 	"encoding/json"
-	"github.com/smartwalle/scankit/internal/nfagraph"
-	"github.com/smartwalle/scankit/internal/parser"
 	"sort"
 	"testing"
+
+	"github.com/smartwalle/scankit/internal/nfagraph"
+	"github.com/smartwalle/scankit/internal/parser"
 )
 
 func TestBuildDumpLoad(t *testing.T) {
@@ -104,7 +105,7 @@ func TestLoadRejectsDuplicateRoles(t *testing.T) {
 }
 func FuzzProgramDump(f *testing.F) {
 	f.Add([]byte(`{"version":1,"roles":[]}`))
-	f.Fuzz(func(t *testing.T, d []byte) {
+	f.Fuzz(func(_ *testing.T, d []byte) {
 		if p, e := Load(d); e == nil {
 			_ = p.Validate()
 		}
@@ -171,7 +172,7 @@ func BenchmarkProgramFindMatches(b *testing.B) {
 	data := []byte("header body payload footer header body footer")
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if len(p.FindMatches(data)) == 0 {
 			b.Fatal("未产生角色命中")
 		}

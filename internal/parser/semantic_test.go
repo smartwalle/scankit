@@ -10,9 +10,9 @@ func TestSemanticHelpers(t *testing.T) {
 	if CaptureCount(n) != 1 || !Nullable(Sequence{Elements: []Node{Repeat{Child: Literal{Value: []byte{'x'}}, Min: 0, Max: 1}}}) {
 		t.Fatal("semantic helper mismatch")
 	}
-	min, max, ok := FixedWidth(n)
-	if ok || min != -1 || max != -1 {
-		t.Fatalf("unexpected width %d %d %v", min, max, ok)
+	minWidth, maxWidth, ok := FixedWidth(n)
+	if ok || minWidth != -1 || maxWidth != -1 {
+		t.Fatalf("unexpected width %d %d %v", minWidth, maxWidth, ok)
 	}
 	copyNode := Clone(n).(Sequence)
 	if len(copyNode.Elements) != 2 {
@@ -64,8 +64,8 @@ func TestStatefulRuntimeRequirement(t *testing.T) {
 
 func TestFixedWidthUTF8(t *testing.T) {
 	node := Literal{Value: []byte("é")}
-	if min, max, ok := FixedWidthUTF8(node); !ok || min != 2 || max != 2 {
-		t.Fatalf("宽度=%d,%d,%v", min, max, ok)
+	if minWidth, maxWidth, ok := FixedWidthUTF8(node); !ok || minWidth != 2 || maxWidth != 2 {
+		t.Fatalf("宽度=%d,%d,%v", minWidth, maxWidth, ok)
 	}
 	parsed, err := Parse(".")
 	if err != nil {

@@ -17,7 +17,7 @@ func bytesetReferenceSets() [][4]uint64 {
 		{0xAAAAAAAAAAAAAAAA, 0x5555555555555555, 0xAAAAAAAAAAAAAAAA, 0x5555555555555555},
 	}
 	rng := rand.New(rand.NewSource(20260920))
-	for i := 0; i < 64; i++ {
+	for range 64 {
 		var set [4]uint64
 		for word := range set {
 			set[word] = rng.Uint64()
@@ -35,7 +35,7 @@ func TestByteSetMaskMatchesGeneric(t *testing.T) {
 		if got := set.Mask(generic.Vector{}); got != want {
 			t.Fatalf("zero vector raw=%v got=%#x want=%#x", raw, got, want)
 		}
-		for b := 0; b < 256; b++ {
+		for b := range 256 {
 			var v Vector
 			for i := range v {
 				v[i] = byte((b + i*7) & 0xFF)
@@ -137,7 +137,7 @@ func windowMaskNaive(data []byte, off int, tables *ByteSetTables, lanes int) (ui
 func TestWindowMaskScalarMatchesNaiveReference(t *testing.T) {
 	rng := rand.New(rand.NewSource(20260921))
 	pool := bytesetReferenceSets()
-	for iter := 0; iter < 128; iter++ {
+	for iter := range 128 {
 		var laneSets [4][4]uint64
 		for lane := range laneSets {
 			laneSets[lane] = pool[rng.Intn(len(pool))]
@@ -212,7 +212,7 @@ func TestWindowMaskScalarEdgeCases(t *testing.T) {
 // 供原生后端在相同窗口语义下对照。
 func BenchmarkWindowMaskScalar(b *testing.B) {
 	var laneSets [4][4]uint64
-	for lane := 0; lane < 4; lane++ {
+	for lane := range 4 {
 		for value := 0; value < 256; value += 3 {
 			laneSets[lane][value/64] |= 1 << uint(value%64)
 		}
@@ -254,7 +254,7 @@ func TestFirstByteTablesOnlyFillsFirstLane(t *testing.T) {
 				t.Fatalf("lane %d 非空: %v", lane, tables[lane])
 			}
 		}
-		for value := 0; value < 256; value++ {
+		for value := range 256 {
 			member := set[value/64]>>uint(value%64)&1 == 1
 			if got := tableHas(&tables[0], byte(value)); got != member {
 				t.Fatalf("集合=%v 字节=%d 表判定=%v 位图=%v", set, value, got, member)
@@ -311,7 +311,7 @@ func windowMask64Naive(data []byte, off int, tables *ByteSetTables, lanes int) (
 func TestWindowMask64ScalarMatchesNaiveReference(t *testing.T) {
 	rng := rand.New(rand.NewSource(20260925))
 	pool := bytesetReferenceSets()
-	for iter := 0; iter < 128; iter++ {
+	for iter := range 128 {
 		var laneSets [4][4]uint64
 		for lane := range laneSets {
 			laneSets[lane] = pool[rng.Intn(len(pool))]
@@ -417,7 +417,7 @@ func TestWindowMask64WithFirstByteTables(t *testing.T) {
 // 供原生后端在相同窗口语义下对照。
 func BenchmarkWindowMask64Scalar(b *testing.B) {
 	var laneSets [4][4]uint64
-	for lane := 0; lane < 4; lane++ {
+	for lane := range 4 {
 		for value := 0; value < 256; value += 3 {
 			laneSets[lane][value/64] |= 1 << uint(value%64)
 		}

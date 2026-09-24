@@ -46,5 +46,5 @@ func TestDigestDetectsTamper(t *testing.T) {
 }
 func FuzzUnmarshal(f *testing.F) {
 	f.Add([]byte(`{"version":1,"architecture":""}`))
-	f.Fuzz(func(t *testing.T, data []byte) { _, _ = Unmarshal[int](data) })
+	f.Fuzz(func(_ *testing.T, data []byte) { _, _ = Unmarshal[int](data) })
 }

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,8 +23,11 @@ const version = 3
 
 // ErrStateLimit 表示确定化状态数超过调用方预算。
 var ErrStateLimit = errors.New("dfa state limit exceeded")
+
+// ErrMemoryLimit 表示确定化过程的估算内存超过预算。
 var ErrMemoryLimit = errors.New("dfa memory limit exceeded")
 
+// State 是确定化后的 DFA 状态，Nodes 为对应的 NFA 顶点集合。
 type State struct {
 	ID     uint32
 	Nodes  []graph.Vertex
@@ -36,6 +41,7 @@ type State struct {
 	Transitions map[byte]uint32
 }
 
+// Program 是字节状态表形式的确定性程序。
 type Program struct {
 	*nfa.Program
 	States    []State
@@ -127,7 +133,7 @@ func (p *Program) Validate() error {
 				return fmt.Errorf("dead state cannot accept")
 			}
 			if p.ByteTable {
-				for value := 0; value < 256; value++ {
+				for value := range 256 {
 					if state.Transitions[byte(value)] != state.ID {
 						return fmt.Errorf("invalid dead state transition")
 					}
@@ -141,7 +147,7 @@ func (p *Program) Validate() error {
 			}
 		}
 		if len(p.dense) == len(p.States) {
-			for value := 0; value < 256; value++ {
+			for value := range 256 {
 				to := p.dense[i][value]
 				if to == ^uint32(0) {
 					if _, exists := state.Transitions[byte(value)]; exists {
@@ -158,7 +164,7 @@ func (p *Program) Validate() error {
 			}
 		}
 		if p.ByteTable && !p.Minimized {
-			for value := 0; value < 256; value++ {
+			for value := range 256 {
 				expected := epsilonClosure(p.Graph, move(p.Graph, state.Nodes, byte(value)))
 				to, exists := state.Transitions[byte(value)]
 				if len(expected) == 0 {
@@ -237,7 +243,7 @@ func compactReports(ids []uint32) []uint32 {
 	if len(ids) < 2 {
 		return ids
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	write := 1
 	for _, id := range ids[1:] {
 		if id == ids[write-1] {
@@ -305,7 +311,7 @@ func Load(data []byte) (*Program, error) {
 	if err := decoder.Decode(&d); err != nil {
 		return nil, err
 	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		if err == nil {
 			return nil, fmt.Errorf("dfa payload contains multiple values")
 		}
@@ -345,6 +351,7 @@ func Load(data []byte) (*Program, error) {
 	return p, nil
 }
 
+// StateCount 返回状态数量，nil 程序返回 0。
 func (p *Program) StateCount() int {
 	if p == nil {
 		return 0
@@ -448,7 +455,7 @@ func (p *Program) AcceptReportIDs() []uint32 {
 			out = append(out, id)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 
@@ -503,7 +510,7 @@ func (p *Program) StartBytes() []byte {
 	for b := range p.States[p.Start].Transitions {
 		out = append(out, b)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 
@@ -513,9 +520,7 @@ func (p *Program) TransitionsCopy(state uint32) map[byte]uint32 {
 		return nil
 	}
 	out := make(map[byte]uint32, len(p.States[state].Transitions))
-	for b, to := range p.States[state].Transitions {
-		out[b] = to
-	}
+	maps.Copy(out, p.States[state].Transitions)
 	return out
 }
 
@@ -527,9 +532,7 @@ func (p *Program) StateAt(id uint32) (State, bool) {
 	s := p.States[id]
 	s.Nodes = append([]graph.Vertex(nil), s.Nodes...)
 	s.Transitions = make(map[byte]uint32, len(s.Transitions))
-	for b, to := range p.States[id].Transitions {
-		s.Transitions[b] = to
-	}
+	maps.Copy(s.Transitions, p.States[id].Transitions)
 	return s, true
 }
 
@@ -556,6 +559,8 @@ func (p *Program) DenseTable() [][256]uint32 {
 	}
 	return out
 }
+
+// Transition 返回状态在字节 b 上的后继；状态或转移非法时返回 false。
 func (p *Program) Transition(state uint32, b byte) (uint32, bool) {
 	if p == nil || int(state) >= len(p.States) {
 		return 0, false
@@ -627,7 +632,7 @@ func (p *Program) ReachableStates() []uint32 {
 	for id := range seen {
 		out = append(out, id)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 
@@ -650,9 +655,13 @@ func (p *Program) RunLimit(data []byte, limit int) (uint32, int, bool) {
 	}
 	return p.Run(data[:limit])
 }
+
+// IsAccept 判断状态是否为接受状态。
 func (p *Program) IsAccept(state uint32) bool {
 	return p != nil && int(state) < len(p.States) && p.States[state].Accept
 }
+
+// TableMatchAt 按字节状态表返回指定起点的全部结束偏移。
 func (p *Program) TableMatchAt(data []byte, start int) []int {
 	return p.TableMatchAtLimit(data, start, 0)
 }
@@ -663,7 +672,7 @@ func (p *Program) TableMatchAtLimit(data []byte, start int, limit int) []int {
 		return nil
 	}
 	state := p.Start
-	out := []int{}
+	var out []int
 	if p.IsAccept(state) {
 		out = append(out, start)
 	}
@@ -683,6 +692,7 @@ func (p *Program) TableMatchAtLimit(data []byte, start int, limit int) []int {
 	return out
 }
 
+// MatchAt 返回指定起点的全部结束偏移，不限制上界。
 func (p *Program) MatchAt(data []byte, start int) []int {
 	return p.MatchAtLimit(data, start, 0)
 }
@@ -848,6 +858,7 @@ func (p *Program) ScanEach(data []byte, fn func(nfa.Span) bool) {
 	}
 }
 
+// Clone 深拷贝程序，结果与原程序不共享状态表。
 func (p *Program) Clone() *Program {
 	if p == nil {
 		return nil
@@ -872,9 +883,7 @@ func cloneStates(states []State) []State {
 			ReportsEOD:  append([]uint32(nil), s.ReportsEOD...),
 			Transitions: make(map[byte]uint32, len(s.Transitions)),
 		}
-		for b, to := range s.Transitions {
-			out[i].Transitions[b] = to
-		}
+		maps.Copy(out[i].Transitions, s.Transitions)
 	}
 	return out
 }
@@ -895,6 +904,7 @@ func (p *Program) rebuildDense() {
 	}
 }
 
+// Compile 使用默认预算确定化整张图。
 func Compile(g *nfagraph.Graph) (*Program, error) {
 	return CompileWithLimit(g, 0)
 }
@@ -949,18 +959,6 @@ func determinizeWithOptions(g *nfagraph.Graph, options CompileOptions) ([]State,
 	return states, nil
 }
 
-func determinizeWithMemory(g *nfagraph.Graph, limit int, memoryLimit uint64) ([]State, error) {
-	states, err := Determinize(g, limit)
-	if err != nil || memoryLimit == 0 {
-		return states, err
-	}
-	p := &Program{States: states, ByteTable: byteTableCompatible(g)}
-	if p.MemoryBytes() > memoryLimit {
-		return nil, ErrMemoryLimit
-	}
-	return states, nil
-}
-
 // Determinize 构造带空闭包的字节转移表；非字节结构保留在通用执行器中。
 func Determinize(g *nfagraph.Graph, limit int) ([]State, error) {
 	return DeterminizeWithOptions(g, CompileOptions{StateLimit: limit})
@@ -979,7 +977,7 @@ func DeterminizeWithOptions(g *nfagraph.Graph, options CompileOptions) ([]State,
 		return nil, err
 	}
 	start := epsilonClosure(g, []graph.Vertex{g.Start})
-	states := []State{}
+	var states []State
 	index := map[string]uint32{}
 	byteTable := options.Dense || byteTableCompatible(g)
 	eodGuarded := eodGuardedNodes(g)
@@ -1020,7 +1018,7 @@ func DeterminizeWithOptions(g *nfagraph.Graph, options CompileOptions) ([]State,
 		return nil, err
 	}
 	for cursor := 0; cursor < len(states); cursor++ {
-		for value := 0; value < 256; value++ {
+		for value := range 256 {
 			next := move(g, states[cursor].Nodes, byte(value))
 			if len(next) == 0 {
 				continue
@@ -1039,11 +1037,11 @@ func DeterminizeWithOptions(g *nfagraph.Graph, options CompileOptions) ([]State,
 			return nil, ErrStateLimit
 		}
 		dead := State{ID: deadID, Nodes: nil, Transitions: make(map[byte]uint32, 256)}
-		for value := 0; value < 256; value++ {
+		for value := range 256 {
 			dead.Transitions[byte(value)] = deadID
 		}
 		for i := range states {
-			for value := 0; value < 256; value++ {
+			for value := range 256 {
 				if _, ok := states[i].Transitions[byte(value)]; !ok {
 					states[i].Transitions[byte(value)] = deadID
 				}
@@ -1074,12 +1072,12 @@ func epsilonClosure(g *nfagraph.Graph, seed []graph.Vertex) []graph.Vertex {
 	for v := range seen {
 		out = append(out, v)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 
 func move(g *nfagraph.Graph, nodes []graph.Vertex, b byte) []graph.Vertex {
-	out := []graph.Vertex{}
+	var out []graph.Vertex
 	seen := map[graph.Vertex]bool{}
 	for _, v := range nodes {
 		n := g.Nodes[v]
@@ -1188,6 +1186,7 @@ func matchesByte(n *nfagraph.Node, b byte) bool {
 			}
 		}
 		return hit != n.Class.Negated
+	default:
 	}
 	return false
 }
@@ -1226,18 +1225,23 @@ func stateKey(nodes []graph.Vertex) string {
 	return out.String()
 }
 
+// StateCount 估算确定化后的状态数量，用于预算评估。
 func StateCount(g *nfagraph.Graph) int {
 	if g == nil {
 		return 0
 	}
 	return len(g.Nodes)
 }
+
+// EdgeCount 估算确定化后的转移数量，用于预算评估。
 func EdgeCount(g *nfagraph.Graph) int {
 	if g == nil {
 		return 0
 	}
 	return g.EdgeCount()
 }
+
+// IsDeterministic 判断图是否已满足确定化前提。
 func IsDeterministic(g *nfagraph.Graph) bool {
 	if g == nil || g.Flow == nil {
 		return false
@@ -1308,7 +1312,7 @@ func Minimize(g *nfagraph.Graph) (*Program, error) {
 		for i, state := range p.States {
 			var key strings.Builder
 			key.WriteString(strconv.Itoa(part[i]))
-			for b := 0; b < 256; b++ {
+			for b := range 256 {
 				to, ok := state.Transitions[byte(b)]
 				if !ok {
 					key.WriteString(",-")
@@ -1355,7 +1359,7 @@ func Minimize(g *nfagraph.Graph) (*Program, error) {
 		}
 	}
 	for i := range states {
-		sort.Slice(states[i].Nodes, func(left, right int) bool { return states[i].Nodes[left] < states[i].Nodes[right] })
+		slices.Sort(states[i].Nodes)
 		states[i].Nodes = compactVertices(states[i].Nodes)
 		states[i].ReportsEOD = subtractReports(states[i].ReportsEOD, states[i].Reports)
 	}
@@ -1416,13 +1420,13 @@ func compactVertices(nodes []graph.Vertex) []graph.Vertex {
 }
 
 func maxPart(values []int) int {
-	max := -1
+	maxValue := -1
 	for _, value := range values {
-		if value > max {
-			max = value
+		if value > maxValue {
+			maxValue = value
 		}
 	}
-	return max
+	return maxValue
 }
 
 // reportPartitionKey 生成最小化初始划分键，把接受标记和报告集合一起编码。

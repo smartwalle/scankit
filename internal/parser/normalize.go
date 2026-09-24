@@ -2,6 +2,7 @@ package parser
 
 import "fmt"
 
+// Normalize 归一化 AST：合并相邻字符类与文字、消除空结构，保持匹配语义不变。
 func Normalize(root Node) Node {
 	switch v := root.(type) {
 	case Class:
@@ -28,15 +29,15 @@ func Normalize(root Node) Node {
 		v.Ranges = out
 		return v
 	case Sequence:
-		out := []Node{}
-		buf := []byte{}
+		var out []Node
+		var buf []byte
 		flush := func() {
 			if len(buf) > 0 {
 				out = append(out, Literal{Value: append([]byte(nil), buf...)})
 				buf = nil
 			}
 		}
-		elements := []Node{}
+		var elements []Node
 		for _, c := range v.Elements {
 			if nested, ok := c.(Sequence); ok {
 				elements = append(elements, nested.Elements...)
@@ -61,7 +62,7 @@ func Normalize(root Node) Node {
 		v.Child = Normalize(v.Child)
 		return v
 	case Alternation:
-		flat := []Node{}
+		var flat []Node
 		for _, c := range v.Options {
 			if nested, ok := c.(Alternation); ok {
 				flat = append(flat, nested.Options...)
@@ -97,6 +98,7 @@ func Normalize(root Node) Node {
 	case Lookaround:
 		v.Child = Normalize(v.Child)
 		return v
+	default:
 	}
 	return root
 }

@@ -1,8 +1,9 @@
 package nfagraph
 
 import (
-	"github.com/smartwalle/scankit/internal/parser"
 	"testing"
+
+	"github.com/smartwalle/scankit/internal/parser"
 )
 
 func TestClone(t *testing.T) {

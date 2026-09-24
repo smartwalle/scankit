@@ -138,7 +138,7 @@ func OptimizeWithCostAndLimit(g *Graph, cm CostModel, maxRounds int) (NormalizeS
 	}
 	original := g.Clone()
 	lastModifiedPass := ""
-	for round := 0; round < maxRounds; round++ {
+	for range maxRounds {
 		before := g.Clone()
 		stats, err := NormalizeWithCost(g, cm)
 		if err != nil {
@@ -185,6 +185,7 @@ func lastChangingPass(s NormalizeStats) string {
 		return "PruneUnreachable"
 	case s.RemovedEdges > 0:
 		return "RemoveRedundantEdges"
+	default:
 	}
 	return ""
 }
@@ -378,6 +379,7 @@ func mergeableNode(g *Graph, id graph.Vertex, node *Node) bool {
 	switch node.Kind {
 	case KindLiteral, KindClass, KindAssertion, KindJoin:
 		return true
+	default:
 	}
 	return false
 }

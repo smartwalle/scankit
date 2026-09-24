@@ -2,10 +2,11 @@ package hwlm
 
 import (
 	"fmt"
-	"github.com/smartwalle/scankit/internal/parser"
-	"github.com/smartwalle/scankit/internal/simd"
 	"reflect"
 	"testing"
+
+	"github.com/smartwalle/scankit/internal/parser"
+	"github.com/smartwalle/scankit/internal/simd"
 )
 
 func TestExtractAndFindAll(t *testing.T) {
@@ -149,7 +150,7 @@ func BenchmarkFindAll(b *testing.B) {
 	lit := Literal{Value: []byte("0123")}
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = FindAll(data, lit)
 	}
 }

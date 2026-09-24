@@ -72,7 +72,7 @@ func TestFlatTableMatchesNaiveScan(t *testing.T) {
 	data := []byte("field000=1234567 field000=1 field000 field001= tail\xFF\xFE\xFD\xFC\xFB\xFA\xF9\xF8\xFF\x00\x01\x02\x03\x04\x05\x06\x07\x08")
 	out := make([]Match, 0, 32)
 	index := 0
-	for from := 0; from < len(data); from++ {
+	for from := range data {
 		got := table.appendMatches(nil, data, from)
 		want := make([]Match, 0, 2)
 		for _, literal := range literals {
@@ -203,7 +203,7 @@ func TestFlatTableOpenAddressingLoad(t *testing.T) {
 	for value := range 64 {
 		literals = append(literals, hwlm.Literal{
 			ID:    uint32(value + 1),
-			Value: []byte(fmt.Sprintf("field%03d=", value)),
+			Value: fmt.Appendf(nil, "field%03d=", value),
 		})
 	}
 	table := newFlatTable(literals)
@@ -211,7 +211,7 @@ func TestFlatTableOpenAddressingLoad(t *testing.T) {
 		t.Fatal("flat table is nil")
 	}
 	for value := range 64 {
-		key := []byte(fmt.Sprintf("field%03d=", value))
+		key := fmt.Appendf(nil, "field%03d=", value)
 		entries := table.bucket(table.keyAt(key, 0))
 		if len(entries) == 0 {
 			t.Fatalf("主键 field%03d= 没有命中桶", value)
@@ -254,7 +254,7 @@ func TestFlatShortKeyMatchesNaiveScan(t *testing.T) {
 		t.Fatalf("主键宽度 = %d, want %d", table.keyBytes, hwlm.FlatKeyShort)
 	}
 	data := flatShortCorpus()
-	for from := 0; from < len(data); from++ {
+	for from := range data {
 		got := table.appendMatches(nil, data, from)
 		want := make([]Match, 0, 2)
 		for _, literal := range literals {

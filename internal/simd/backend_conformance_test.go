@@ -64,7 +64,7 @@ func TestBackendByteSetAndNativeMasksCoverAllValues(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			v := tc.b.PartialLoad(data, 3)
-			for value := 0; value < 256; value++ {
+			for value := range 256 {
 				var set [4]uint64
 				set[value/64] |= 1 << uint(value%64)
 				want := uint16(0)
@@ -98,7 +98,7 @@ func TestBackendInRangeMaskCoversAllValues(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			v := tc.b.PartialLoad(data, 3)
-			for lo := 0; lo < 256; lo++ {
+			for lo := range 256 {
 				for hi := lo; hi < 256; hi++ {
 					var want uint16
 					for i, item := range v {
@@ -126,7 +126,7 @@ func TestBackendPreparedByteSetCoversAllValues(t *testing.T) {
 		{0x000000000000FF00, 0, 0, 0},
 		{0, 0, 0xFF00000000000000, 0xFF00000000000000},
 	}
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		var raw [4]uint64
 		for w := range raw {
 			raw[w] = uint64(i) * 0x9E3779B97F4A7C15 * uint64(w+1)
@@ -144,8 +144,8 @@ func TestBackendPreparedByteSetCoversAllValues(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, raw := range rawSets {
 				set := simd.NewByteSet(raw)
-				for value := 0; value < 256; value++ {
-					for lane := 0; lane < simd.SuperWidth/2; lane++ {
+				for value := range 256 {
+					for lane := range simd.SuperWidth / 2 {
 						var v simd.Vector
 						v[lane] = byte(value)
 						want := simd.GenericBackend{}.ByteSetMask(v, raw)
@@ -162,7 +162,7 @@ func TestBackendPreparedByteSetCoversAllValues(t *testing.T) {
 // TestBackendPreparedByteSetMatchesRaw 验证预编译路径与原始位图路径在所有字节取值上一致。
 func TestBackendPreparedByteSetMatchesRaw(t *testing.T) {
 	var raw [4]uint64
-	for b := 0; b < 256; b++ {
+	for b := range 256 {
 		if b%3 == 0 || b >= 128 {
 			raw[b/64] |= 1 << uint(b%64)
 		}
@@ -210,8 +210,8 @@ func TestBackendEqualMasksCoverAllValues(t *testing.T) {
 		{"arm64", armbackend.NewWithTier(armbackend.TierSVE2)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			for candidate := 0; candidate < 256; candidate++ {
-				for lane := 0; lane < simd.SuperWidth/2; lane++ {
+			for candidate := range 256 {
+				for lane := range simd.SuperWidth / 2 {
 					for _, item := range []byte{byte(candidate), byte(candidate ^ 0x20), byte(candidate ^ 0x80), 0} {
 						var v simd.Vector
 						v[lane] = item
@@ -243,7 +243,7 @@ func TestBackendEqualMasksCoverAllValues(t *testing.T) {
 				}
 			}
 			// 整向量跨 lane 抽查，避免只覆盖单 lane 场景。
-			for shift := 0; shift < 256; shift++ {
+			for shift := range 256 {
 				var a, b simd.Vector
 				for i := range a {
 					a[i] = byte((shift + i) & 0xFF)
@@ -283,7 +283,7 @@ func TestBackendWindowMaskMatchesScalar(t *testing.T) {
 	}
 	for _, tc := range backends {
 		t.Run(tc.name, func(t *testing.T) {
-			for iter := 0; iter < 64; iter++ {
+			for iter := range 64 {
 				var laneSets [4][4]uint64
 				for lane := range laneSets {
 					for word := range laneSets[lane] {
@@ -292,7 +292,7 @@ func TestBackendWindowMaskMatchesScalar(t *testing.T) {
 							continue
 						}
 						// 稀疏集合：每个 lane 只保留少量候选字节，覆盖查找表全零行。
-						for n := 0; n < 4; n++ {
+						for range 4 {
 							value := rng.Intn(256)
 							laneSets[lane][value/64] |= 1 << uint(value%64)
 						}
@@ -355,7 +355,7 @@ func TestBackendWindowMaskCoversAllBytes(t *testing.T) {
 // 用于对照通用标量实现、SSE 半区拼接与 NEON 合并路径。
 func BenchmarkWindowMaskBackends(b *testing.B) {
 	var laneSets [4][4]uint64
-	for lane := 0; lane < 4; lane++ {
+	for lane := range 4 {
 		for value := 0; value < 256; value += 3 {
 			laneSets[lane][value/64] |= 1 << uint(value%64)
 		}
@@ -415,7 +415,7 @@ func TestBackendWindowMask64MatchesScalar(t *testing.T) {
 	}
 	for _, tc := range backends {
 		t.Run(tc.name, func(t *testing.T) {
-			for iter := 0; iter < 64; iter++ {
+			for iter := range 64 {
 				var laneSets [4][4]uint64
 				for lane := range laneSets {
 					for word := range laneSets[lane] {
@@ -424,7 +424,7 @@ func TestBackendWindowMask64MatchesScalar(t *testing.T) {
 							continue
 						}
 						// 稀疏集合：每个 lane 只保留少量候选字节，覆盖查找表全零行。
-						for n := 0; n < 4; n++ {
+						for range 4 {
 							value := rng.Intn(256)
 							laneSets[lane][value/64] |= 1 << uint(value%64)
 						}
@@ -487,7 +487,7 @@ func TestBackendWindowMask64CoversAllBytes(t *testing.T) {
 // 用于对照通用标量实现、SSE/AVX2 半区拼接与 AVX512 单寄存器路径。
 func BenchmarkWindowMask64Backends(b *testing.B) {
 	var laneSets [4][4]uint64
-	for lane := 0; lane < 4; lane++ {
+	for lane := range 4 {
 		for value := 0; value < 256; value += 3 {
 			laneSets[lane][value/64] |= 1 << uint(value%64)
 		}
@@ -531,7 +531,7 @@ func BenchmarkWindowMask64Backends(b *testing.B) {
 // 宽窗口掩码内核的同字节成本，用于确认宽窗口内核本身不会引入回归。
 func BenchmarkWindowMask32Vs64PerByte(b *testing.B) {
 	var laneSets [4][4]uint64
-	for lane := 0; lane < 4; lane++ {
+	for lane := range 4 {
 		// 全部小写字母都进入集合，保证 lanes>=2 的严格判定也有命中。
 		for value := byte('a'); value <= 'z'; value++ {
 			laneSets[lane][value/64] |= 1 << uint(value%64)

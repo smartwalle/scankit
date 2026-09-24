@@ -1,7 +1,6 @@
 package nfagraph
 
 import (
-	"errors"
 	"strings"
 	"testing"
 
@@ -96,9 +95,6 @@ func TestOptimizeSucceedsWithinLimit(t *testing.T) {
 	}
 	_ = stats
 }
-
-// Compile-time interface check for the error type used in bailout messages.
-var _ error = errors.New("placeholder")
 
 // TestNormalizeWithCostSkipsExpensivePassesForSmallGraph 验证 NormalizeWithCost
 // 在节点数小于阈值时跳过 BypassEpsilonJoins/SquashLinearJoins/MergeEquivalentNodes

@@ -2,14 +2,17 @@ package parser
 
 import "fmt"
 
+// Combination 表示一条规则编号逻辑组合表达式。
 type Combination struct{ Expr Node }
 
 func (Combination) node() {}
 
+// CombinationOperand 表示组合表达式中的规则编号操作数。
 type CombinationOperand struct{ ID uint32 }
 
 func (CombinationOperand) node() {}
 
+// CombinationOperator 表示组合表达式中的二元运算符。
 type CombinationOperator struct {
 	Op          byte
 	Left, Right Node
@@ -17,6 +20,7 @@ type CombinationOperator struct {
 
 func (CombinationOperator) node() {}
 
+// CombinationNot 表示组合表达式中的逻辑取反。
 type CombinationNot struct{ Child Node }
 
 func (CombinationNot) node() {}

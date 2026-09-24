@@ -1,8 +1,9 @@
 package nfagraph
 
 import (
-	"github.com/smartwalle/scankit/internal/parser"
 	"testing"
+
+	"github.com/smartwalle/scankit/internal/parser"
 )
 
 func TestNormalize(t *testing.T) {
@@ -133,7 +134,7 @@ func BenchmarkNormalize(b *testing.B) {
 	r, _ := parser.Parse(`(?:ab|cd){1,3}`)
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		g, _ := NewBuilder().Build(r)
 		_ = Normalize(g)
 	}

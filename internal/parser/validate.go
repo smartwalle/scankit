@@ -80,6 +80,7 @@ func validate(root Node, utf8Mode bool) error {
 		case Conditional:
 			collect(v.Yes)
 			collect(v.No)
+		default:
 		}
 	}
 	collect(root)
@@ -125,15 +126,15 @@ func validate(root Node, utf8Mode bool) error {
 			return walk(v.Child)
 		case Lookaround:
 			if v.Kind == Lookbehind || v.Kind == NegativeLookbehind {
-				min, max := fixedWidth(v.Child)
+				minWidth, maxWidth := fixedWidth(v.Child)
 				if utf8Mode {
 					_, _, fixed := FixedWidthUTF8(v.Child)
 					if !fixed {
 						return fmt.Errorf("lookbehind must have fixed UTF-8 width")
 					}
-					min, max, _ = FixedWidthUTF8(v.Child)
+					minWidth, maxWidth, _ = FixedWidthUTF8(v.Child)
 				}
-				if min < 0 || min != max {
+				if minWidth < 0 || minWidth != maxWidth {
 					return fmt.Errorf("lookbehind must have fixed length")
 				}
 			}
@@ -187,6 +188,7 @@ func validate(root Node, utf8Mode bool) error {
 			return walk(v.Right)
 		case CombinationNot:
 			return walk(v.Child)
+		default:
 		}
 		return nil
 	}
@@ -260,6 +262,7 @@ func validateReferenceOrder(root Node, defined map[int]struct{}) error {
 			if _, ok := current[value.Index]; !ok {
 				return nil, fmt.Errorf("backreference %d appears before capture", value.Index)
 			}
+		default:
 		}
 		return clone(current), nil
 	}
@@ -267,11 +270,12 @@ func validateReferenceOrder(root Node, defined map[int]struct{}) error {
 	return err
 }
 
+// SupportedUnicodeProperty 判断属性名是否被 Unicode 属性表支持。
 func SupportedUnicodeProperty(name string) bool {
 	name = normalizeUnicodeProperty(name)
 	for _, prefix := range []string{"script=", "sc=", "script:", "generalcategory=", "gc="} {
-		if strings.HasPrefix(name, prefix) {
-			name = strings.TrimPrefix(name, prefix)
+		if after, ok := strings.CutPrefix(name, prefix); ok {
+			name = after
 			break
 		}
 	}
@@ -281,6 +285,7 @@ func SupportedUnicodeProperty(name string) bool {
 	switch name {
 	case "l", "letter", "alpha", "n", "number", "nd", "z", "space", "whitespace", "lu", "uppercaseletter", "ll", "lowercaseletter", "lt", "lm", "lo", "m", "mark", "p", "punct", "s", "symbol", "cc", "control", "ascii", "any", "assigned", "unassigned":
 		return true
+	default:
 	}
 	_, ok := unicodePropertyNames[name]
 	return ok
@@ -307,16 +312,16 @@ func fixedWidth(n Node) (int, int) {
 	case Group:
 		return fixedWidth(v.Child)
 	case Sequence:
-		min, max := 0, 0
+		minWidth, maxWidth := 0, 0
 		for _, c := range v.Elements {
 			a, b := fixedWidth(c)
 			if a < 0 {
 				return -1, -1
 			}
-			min = safeAddInt(min, a)
-			max = safeAddInt(max, b)
+			minWidth = safeAddInt(minWidth, a)
+			maxWidth = safeAddInt(maxWidth, b)
 		}
-		return min, max
+		return minWidth, maxWidth
 	case Alternation:
 		if len(v.Options) == 0 {
 			return 0, 0
@@ -357,13 +362,14 @@ func safeMulInt(a, b int) int {
 	return a * b
 }
 
-func FixedWidth(n Node) (min, max int, ok bool) {
-	min, max = fixedWidth(n)
-	return min, max, min >= 0 && max >= 0
+// FixedWidth 返回节点的固定字节宽度；宽度不确定时 ok 为 false。
+func FixedWidth(n Node) (minWidth, maxWidth int, ok bool) {
+	minWidth, maxWidth = fixedWidth(n)
+	return minWidth, maxWidth, minWidth >= 0 && maxWidth >= 0
 }
 
-// widthRange 返回表达式可能消耗的字节范围；max 为 -1 表示无上界。
-func widthRange(n Node) (min, max int, ok bool) {
+// widthRange 返回表达式可能消耗的字节范围；maxWidth 为 -1 表示无上界。
+func widthRange(n Node) (minWidth, maxWidth int, ok bool) {
 	switch v := n.(type) {
 	case Literal:
 		return len(v.Value), len(v.Value), true
@@ -378,65 +384,65 @@ func widthRange(n Node) (min, max int, ok bool) {
 	case Group:
 		return widthRange(v.Child)
 	case Sequence:
-		min, max = 0, 0
+		minWidth, maxWidth = 0, 0
 		for _, child := range v.Elements {
 			a, b, childOK := widthRange(child)
 			if !childOK {
 				return 0, 0, false
 			}
-			min = safeAddInt(min, a)
-			if max < 0 || b < 0 {
-				max = -1
+			minWidth = safeAddInt(minWidth, a)
+			if maxWidth < 0 || b < 0 {
+				maxWidth = -1
 			} else {
-				max = safeAddInt(max, b)
+				maxWidth = safeAddInt(maxWidth, b)
 			}
 		}
-		return min, max, min >= 0
+		return minWidth, maxWidth, minWidth >= 0
 	case Alternation:
 		if len(v.Options) == 0 {
 			return 0, 0, true
 		}
-		min, max, _ = widthRange(v.Options[0])
+		minWidth, maxWidth, _ = widthRange(v.Options[0])
 		for _, child := range v.Options[1:] {
 			a, b, childOK := widthRange(child)
 			if !childOK {
 				return 0, 0, false
 			}
-			if a < min {
-				min = a
+			if a < minWidth {
+				minWidth = a
 			}
-			if max < 0 || b < 0 {
-				max = -1
-			} else if b > max {
-				max = b
+			if maxWidth < 0 || b < 0 {
+				maxWidth = -1
+			} else if b > maxWidth {
+				maxWidth = b
 			}
 		}
-		return min, max, min >= 0
+		return minWidth, maxWidth, minWidth >= 0
 	case Repeat:
 		a, b, childOK := widthRange(v.Child)
 		if !childOK {
 			return 0, 0, false
 		}
-		min = safeMulInt(a, v.Min)
+		minWidth = safeMulInt(a, v.Min)
 		if v.Max < 0 || b < 0 {
-			max = -1
+			maxWidth = -1
 		} else {
-			max = safeMulInt(b, v.Max)
+			maxWidth = safeMulInt(b, v.Max)
 		}
-		return min, max, min >= 0
+		return minWidth, maxWidth, minWidth >= 0
 	default:
 		return 0, 0, false
 	}
 }
 
 // FixedWidthUTF8 返回 UTF-8 字节流中的固定宽度；无法证明固定宽度时返回失败。
-func FixedWidthUTF8(n Node) (min, max int, ok bool) {
-	min, max, ok = fixedWidthUTF8(n)
-	return min, max, ok && min >= 0 && max >= 0
+func FixedWidthUTF8(n Node) (minWidth, maxWidth int, ok bool) {
+	minWidth, maxWidth, ok = fixedWidthUTF8(n)
+	return minWidth, maxWidth, ok && minWidth >= 0 && maxWidth >= 0
 }
 
 // WidthRangeUTF8 返回 UTF-8 字节宽度上下界，不要求上下界相等。
-func WidthRangeUTF8(n Node) (min, max int, ok bool) { return fixedWidthUTF8(n) }
+func WidthRangeUTF8(n Node) (minWidth, maxWidth int, ok bool) { return fixedWidthUTF8(n) }
 
 func fixedWidthUTF8(n Node) (int, int, bool) {
 	switch v := n.(type) {
@@ -459,18 +465,18 @@ func fixedWidthUTF8(n Node) (int, int, bool) {
 	case Group:
 		return fixedWidthUTF8(v.Child)
 	case Sequence:
-		min, max := 0, 0
+		minWidth, maxWidth := 0, 0
 		for _, child := range v.Elements {
 			a, b, ok := fixedWidthUTF8(child)
 			if !ok {
 				return -1, -1, false
 			}
-			min, max = safeAddInt(min, a), safeAddInt(max, b)
-			if min < 0 || max < 0 {
+			minWidth, maxWidth = safeAddInt(minWidth, a), safeAddInt(maxWidth, b)
+			if minWidth < 0 || maxWidth < 0 {
 				return -1, -1, false
 			}
 		}
-		return min, max, true
+		return minWidth, maxWidth, true
 	case Alternation:
 		if len(v.Options) == 0 {
 			return 0, 0, true

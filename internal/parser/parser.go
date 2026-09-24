@@ -11,50 +11,49 @@ func Parse(pattern string) (Node, error) {
 	extended := false
 	var globalSet, globalClear GroupFlag
 	for strings.HasPrefix(pattern, "(?") {
-		close := strings.IndexByte(pattern, ')')
-		if close < 0 {
+		closeIdx := strings.IndexByte(pattern, ')')
+		if closeIdx < 0 {
 			break
 		}
-		body := pattern[2:close]
+		body := pattern[2:closeIdx]
 		if body == "" || strings.ContainsAny(body, ":<>=!'(") {
 			break
 		}
 		enable, changed, valid := true, false, true
 		for _, value := range body {
+			var flag GroupFlag
 			switch value {
 			case '-':
 				enable = false
-			case 'i', 's', 'm', 'x':
-				changed = true
-				var flag GroupFlag
-				switch value {
-				case 'i':
-					flag = GroupFlagCaseless
-				case 's':
-					flag = GroupFlagDotAll
-				case 'm':
-					flag = GroupFlagMultiline
-				case 'x':
-					flag = GroupFlagExtended
-				}
-				if enable {
-					globalSet |= flag
-					globalClear &^= flag
-				} else {
-					globalClear |= flag
-					globalSet &^= flag
-				}
-				if value == 'x' {
-					extended = enable
-				}
+				continue
+			case 'i':
+				flag = GroupFlagCaseless
+			case 's':
+				flag = GroupFlagDotAll
+			case 'm':
+				flag = GroupFlagMultiline
+			case 'x':
+				flag = GroupFlagExtended
 			default:
 				valid = false
+				continue
+			}
+			changed = true
+			if enable {
+				globalSet |= flag
+				globalClear &^= flag
+			} else {
+				globalClear |= flag
+				globalSet &^= flag
+			}
+			if value == 'x' {
+				extended = enable
 			}
 		}
 		if !changed || !valid {
 			break
 		}
-		pattern = pattern[close+1:]
+		pattern = pattern[closeIdx+1:]
 	}
 	node, err := ParseWithExtended(pattern, extended)
 	if err != nil {
@@ -121,9 +120,9 @@ func (p *state) parseCaptureName() (string, error) {
 	}
 }
 
-func (p *state) parseCaptureNameBody(close byte) (string, error) {
+func (p *state) parseCaptureNameBody(closing byte) (string, error) {
 	start := p.pos
-	for p.pos < len(p.input) && p.peek() != close {
+	for p.pos < len(p.input) && p.peek() != closing {
 		value := p.peek()
 		valid := value == '_' || value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
 		if !valid {
@@ -131,7 +130,7 @@ func (p *state) parseCaptureNameBody(close byte) (string, error) {
 		}
 		p.pos++
 	}
-	if p.pos == start || p.peek() != close {
+	if p.pos == start || p.peek() != closing {
 		return "", p.errorf("invalid capture name")
 	}
 	name := string(p.input[start:p.pos])
@@ -145,7 +144,7 @@ func (p *state) peek() byte {
 	return p.input[p.pos]
 }
 func (p *state) parseAlternation() (Node, error) {
-	options := []Node{}
+	var options []Node
 	for {
 		p.skipExtended()
 		n, err := p.parseSequence()
@@ -165,7 +164,7 @@ func (p *state) parseAlternation() (Node, error) {
 	return Alternation{Options: options}, nil
 }
 func (p *state) parseSequence() (Node, error) {
-	items := []Node{}
+	var items []Node
 	for {
 		p.skipExtended()
 		if p.pos >= len(p.input) || p.peek() == ')' || p.peek() == '|' {
@@ -276,11 +275,11 @@ func (p *state) parseAtom() (Node, error) {
 		var lookaround LookaroundKind
 		var setFlags, clearFlags GroupFlag
 		previousExtended := p.extended
-		if set, clear, scoped, err := p.parseScopedFlags(); err != nil {
+		if set, unset, scoped, err := p.parseScopedFlags(); err != nil {
 			return nil, err
 		} else if scoped {
 			capture = false
-			setFlags, clearFlags = set, clear
+			setFlags, clearFlags = set, unset
 		} else if p.peek() == '?' && p.pos+1 < len(p.input) {
 			switch p.input[p.pos+1] {
 			case '#':
@@ -435,6 +434,7 @@ func (p *state) parseAtom() (Node, error) {
 			if err != nil {
 				return nil, err
 			}
+		default:
 		}
 		if r, ok := n.(Repeat); ok && p.pos < len(p.input) {
 			switch p.peek() {
@@ -445,6 +445,7 @@ func (p *state) parseAtom() (Node, error) {
 			case '+':
 				p.pos++
 				n = Group{Child: r, Atomic: true}
+			default:
 			}
 		}
 	}
@@ -461,7 +462,7 @@ func (p *state) parseScopedFlags() (GroupFlag, GroupFlag, bool, error) {
 		return 0, 0, false, nil
 	}
 	p.pos++
-	var set, clear GroupFlag
+	var set, unset GroupFlag
 	disabled := false
 	seen := false
 	for p.pos < len(p.input) {
@@ -471,7 +472,7 @@ func (p *state) parseScopedFlags() (GroupFlag, GroupFlag, bool, error) {
 				return 0, 0, false, p.errorf("empty scoped flags")
 			}
 			p.pos++
-			return set, clear, true, nil
+			return set, unset, true, nil
 		}
 		if value == '-' {
 			if disabled {
@@ -495,11 +496,11 @@ func (p *state) parseScopedFlags() (GroupFlag, GroupFlag, bool, error) {
 			return 0, 0, false, p.errorf("invalid scoped flags")
 		}
 		if disabled {
-			clear |= flag
+			unset |= flag
 			set &^= flag
 		} else {
 			set |= flag
-			clear &^= flag
+			unset &^= flag
 		}
 		seen = true
 		p.pos++
@@ -564,16 +565,16 @@ func (p *state) parseEscape() (Node, error) {
 		if p.peek() != '<' && p.peek() != '{' {
 			return nil, p.errorf("invalid named backreference")
 		}
-		close := byte('>')
+		closing := byte('>')
 		if p.peek() == '{' {
-			close = '}'
+			closing = '}'
 		}
 		p.pos++
 		start := p.pos
-		for p.pos < len(p.input) && p.peek() != close {
+		for p.pos < len(p.input) && p.peek() != closing {
 			p.pos++
 		}
-		if p.pos == start || p.peek() != close {
+		if p.pos == start || p.peek() != closing {
 			return nil, p.errorf("invalid named backreference")
 		}
 		name := string(p.input[start:p.pos])
@@ -741,7 +742,7 @@ func (p *state) parseClass() (Node, error) {
 		negate = true
 		p.pos++
 	}
-	ranges := []Range{}
+	var ranges []Range
 	readChar := func() (byte, error) {
 		if p.pos >= len(p.input) {
 			return 0, p.errorf("unterminated character class")
@@ -797,6 +798,7 @@ func (p *state) parseClass() (Node, error) {
 				return '\f', nil
 			case 'v':
 				return '\v', nil
+			default:
 			}
 			if esc >= '1' && esc <= '7' {
 				v := int(esc - '0')
@@ -860,6 +862,7 @@ func (p *state) parseClass() (Node, error) {
 				p.pos += 2
 				ranges = append(ranges, complementRanges(verticalSpaceRanges())...)
 				continue
+			default:
 			}
 		}
 		lo, err := readChar()
@@ -1014,18 +1017,18 @@ func (p *state) parseCounted(child Node) (Node, error) {
 		}
 		return n, ok
 	}
-	min, ok := read()
+	minCount, ok := read()
 	if !ok {
 		return nil, p.errorf("invalid repeat at %d", start)
 	}
-	max := min
+	maxCount := minCount
 	if p.peek() == ',' {
 		p.pos++
 		if p.peek() == '}' {
-			max = -1
+			maxCount = -1
 		} else {
 			var ok bool
-			max, ok = read()
+			maxCount, ok = read()
 			if !ok {
 				return nil, p.errorf("invalid repeat upper bound")
 			}
@@ -1035,11 +1038,11 @@ func (p *state) parseCounted(child Node) (Node, error) {
 		return nil, p.errorf("missing repeat close")
 	}
 	p.pos++
-	if max >= 0 && max < min {
+	if maxCount >= 0 && maxCount < minCount {
 		return nil, p.errorf("repeat upper bound below lower bound")
 	}
-	if min > 1<<20 || max > 1<<20 {
+	if minCount > 1<<20 || maxCount > 1<<20 {
 		return nil, p.errorf("repeat bound exceeds limit")
 	}
-	return Repeat{Child: child, Min: min, Max: max, Greedy: true}, nil
+	return Repeat{Child: child, Min: minCount, Max: maxCount, Greedy: true}, nil
 }

@@ -1,8 +1,9 @@
 package combination
 
 import (
-	"github.com/smartwalle/scankit/internal/parser"
 	"testing"
+
+	"github.com/smartwalle/scankit/internal/parser"
 )
 
 func TestAccumulatorCompilationAndShortCircuit(t *testing.T) {

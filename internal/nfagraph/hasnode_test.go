@@ -1,8 +1,9 @@
 package nfagraph
 
 import (
-	"github.com/smartwalle/scankit/internal/parser"
 	"testing"
+
+	"github.com/smartwalle/scankit/internal/parser"
 )
 
 func TestHasNode(t *testing.T) {

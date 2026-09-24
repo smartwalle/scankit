@@ -16,19 +16,19 @@ func bytesetSets() [][4]uint64 {
 		{^uint64(0), ^uint64(0), ^uint64(0), ^uint64(0)},
 	}
 	// 每个高半字节行单独置位，覆盖 lo/hi 行选择的两侧。
-	for h := 0; h < 16; h++ {
+	for h := range 16 {
 		var set [4]uint64
 		set[h>>2] |= uint64(0xFFFF) << (uint(h&3) * 16)
 		sets = append(sets, set)
 	}
 	// 每个字节单独成集。
-	for b := 0; b < 256; b++ {
+	for b := range 256 {
 		var set [4]uint64
 		set[b/64] = 1 << uint(b%64)
 		sets = append(sets, set)
 	}
 	rng := rand.New(rand.NewSource(4242))
-	for i := 0; i < 128; i++ {
+	for range 128 {
 		var set [4]uint64
 		for w := range set {
 			set[w] = rng.Uint64()
@@ -43,8 +43,8 @@ func TestNativeByteSetMaskMatchesGeneric(t *testing.T) {
 	for _, raw := range bytesetSets() {
 		set := simd.NewByteSet(raw)
 		// 单字节向量：把每个字节放到每个 lane，逐位核对。
-		for b := 0; b < 256; b++ {
-			for lane := 0; lane < generic.Width; lane++ {
+		for b := range 256 {
+			for lane := range generic.Width {
 				var v generic.Vector
 				v[lane] = byte(b)
 				want := generic.ByteSetMask(v, raw)
@@ -61,7 +61,7 @@ func TestNativeByteSetMaskMatchesGeneric(t *testing.T) {
 func TestNativeByteSetMaskRandomVectors(t *testing.T) {
 	rng := rand.New(rand.NewSource(99))
 	sets := bytesetSets()
-	for i := 0; i < 20000; i++ {
+	for range 20000 {
 		raw := sets[rng.Intn(len(sets))]
 		set := simd.NewByteSet(raw)
 		var v generic.Vector

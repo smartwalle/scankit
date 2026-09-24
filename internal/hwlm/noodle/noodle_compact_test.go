@@ -11,7 +11,7 @@ import (
 // 都能给出正确的子节点判定，覆盖位图分组与 popcount 定位的边界。
 func TestFrozenChildLookupCoversAllBytes(t *testing.T) {
 	literals := make([]hwlm.Literal, 0, 256)
-	for value := 0; value < 256; value++ {
+	for value := range 256 {
 		literals = append(literals, hwlm.Literal{ID: uint32(value + 1), Value: []byte{byte(value)}})
 	}
 	// 逆序插入，迫使冻结阶段依赖字节序而不是插入顺序重建索引。
@@ -22,7 +22,7 @@ func TestFrozenChildLookupCoversAllBytes(t *testing.T) {
 	if matcher.sensitive == nil {
 		t.Fatal("missing frozen root")
 	}
-	for value := 0; value < 256; value++ {
+	for value := range 256 {
 		child := matcher.sensitive.child(byte(value))
 		if child == nil {
 			t.Fatalf("child for byte %d is missing", value)
@@ -68,7 +68,7 @@ func TestCompressedTrieMatchesReference(t *testing.T) {
 // referenceMatches 逐位置逐文字做朴素扫描，作为压缩前缀树的行为基准。
 func referenceMatches(literals []hwlm.Literal, data []byte) []Match {
 	out := make([]Match, 0)
-	for from := 0; from < len(data); from++ {
+	for from := range data {
 		for _, literal := range literals {
 			value := literal.Value
 			if from+len(value) > len(data) {

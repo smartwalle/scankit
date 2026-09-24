@@ -2,8 +2,9 @@ package engine
 
 import (
 	"fmt"
-	"github.com/smartwalle/scankit/internal/nfagraph"
 	"reflect"
+
+	"github.com/smartwalle/scankit/internal/nfagraph"
 )
 
 // ConformanceInput 描述后端一致性验证输入。

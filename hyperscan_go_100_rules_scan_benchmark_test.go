@@ -83,11 +83,7 @@ func BenchmarkEngineScan(b *testing.B) {
 				//
 				// 这样可以避免 benchmark 因为 []Match 扩容，
 				// 把“扫描性能”和“slice 扩容性能”混在一起。
-				matchCapacity := actualMatches
-
-				if matchCapacity < 16 {
-					matchCapacity = 16
-				}
+				matchCapacity := max(actualMatches, 16)
 
 				b.SetBytes(int64(len(data)))
 				b.ReportAllocs()
@@ -237,7 +233,7 @@ func buildNoise(size int) []byte {
 	if len(data) < size {
 		remaining := size - len(data)
 
-		for i := 0; i < remaining; i++ {
+		for range remaining {
 			data = append(data, alphabet[0])
 		}
 	}
@@ -275,7 +271,7 @@ func TestEngineScanStable(t *testing.T) {
 	for _, c := range cases {
 		data := buildBenchmarkCorpus(c.size, c.density)
 		// warm up pool: 10 scans bring ctx to steady state
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			matches = matches[:0]
 			matches, _ = scanner.scanInto(data, matches)
 		}

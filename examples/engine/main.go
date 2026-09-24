@@ -1,3 +1,4 @@
+// Package main 演示使用 scankit 的 Engine 接口扫描并脱敏文本。
 package main
 
 import (
@@ -25,7 +26,7 @@ func main() {
 
 	var msg = []byte("ts=2026-08-19 level=info user=42 phone=13800138000 12345678@qq.com email=alice.smith42@example.cn invalid=12345678901 path=/api/profile")
 
-	engine.Mask(msg, func(match scankit.Match, matched []byte) {
+	if err = engine.Mask(msg, func(match scankit.Match, matched []byte) {
 		switch match.Id {
 		case 1:
 			for i := 3; i < 7; i++ {
@@ -35,7 +36,10 @@ func main() {
 			for i := 3; i < min(bytes.IndexByte(matched, '@'), 7); i++ {
 				matched[i] = '*'
 			}
+		default:
 		}
-	})
+	}); err != nil {
+		log.Fatal(err)
+	}
 	fmt.Println(string(msg))
 }

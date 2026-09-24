@@ -2,6 +2,7 @@ package combination
 
 import (
 	"fmt"
+
 	"github.com/smartwalle/scankit/internal/parser"
 )
 

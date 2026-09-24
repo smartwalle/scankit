@@ -97,7 +97,7 @@ func (st *blockScanState) confirmIndexed(index *startByteIndex) {
 	width := index.width
 	for start := 0; start <= len(st.data); start++ {
 		row := index.rulesAt(index.groupOf(st.data, start))
-		for word := 0; word < width; word++ {
+		for word := range width {
 			remaining := row[word]
 			for remaining != 0 {
 				slot := word*64 + bits.TrailingZeros64(remaining)

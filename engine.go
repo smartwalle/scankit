@@ -38,36 +38,44 @@ func (engine *Engine) Replace(data []byte, fn ReplaceFunc) ([]byte, error) {
 	if engine == nil || engine.scanner == nil {
 		return append([]byte(nil), data...), nil
 	}
-	matches, err := engine.scanIntoReusableMatches(data)
+	slot, err := engine.scanIntoReusableMatches(data)
 	if err != nil {
-		engine.recycleMatches(matches)
+		engine.recycleMatches(slot)
 		return nil, err
 	}
-	result := Replace(data, matches, fn)
-	engine.recycleMatches(matches)
+	result := Replace(data, *slot, fn)
+	engine.recycleMatches(slot)
 	return result, nil
 }
 
-// Mask 使用 fn 原地修改 data 中的命中片段，并返回 data。
-func (engine *Engine) Mask(data []byte, fn MaskFunc) ([]byte, error) {
+// Mask 使用 fn 原地修改 data 中的命中片段，结果直接写在 data 上。
+func (engine *Engine) Mask(data []byte, fn MaskFunc) error {
 	if engine == nil || engine.scanner == nil {
-		return data, nil
+		return nil
 	}
-	matches, err := engine.scanIntoReusableMatches(data)
+	slot, err := engine.scanIntoReusableMatches(data)
 	if err != nil {
-		engine.recycleMatches(matches)
-		return data, err
+		engine.recycleMatches(slot)
+		return err
 	}
-	result := Mask(data, matches, fn)
-	engine.recycleMatches(matches)
-	return result, nil
+	Mask(data, *slot, fn)
+	engine.recycleMatches(slot)
+	return nil
 }
 
-func (engine *Engine) scanIntoReusableMatches(data []byte) ([]Match, error) {
-	matches, _ := engine.matches.Get().([]Match)
-	return engine.scanner.ScanInto(data, matches[:0])
+// scanIntoReusableMatches 取回池中的匹配切片槽位并完成一次扫描，匹配结果写在
+// 槽位里；槽位保存扫描增长后的实际容量，池按指针存取，切片头不再装箱进池。
+func (engine *Engine) scanIntoReusableMatches(data []byte) (*[]Match, error) {
+	slot, _ := engine.matches.Get().(*[]Match)
+	if slot == nil {
+		slot = new([]Match)
+	}
+	matches, err := engine.scanner.ScanInto(data, (*slot)[:0])
+	*slot = matches
+	return slot, err
 }
 
-func (engine *Engine) recycleMatches(matches []Match) {
-	engine.matches.Put(matches[:0])
+func (engine *Engine) recycleMatches(slot *[]Match) {
+	*slot = (*slot)[:0]
+	engine.matches.Put(slot)
 }

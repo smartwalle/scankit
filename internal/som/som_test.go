@@ -24,8 +24,8 @@ func TestTrackerRangeCopyAndMerge(t *testing.T) {
 	a.Set(1, 8)
 	b := New(3)
 	b.Set(0, 2)
-	copy := a.CopyRange(1, 3)
-	if copy.Len() != 2 {
+	dup := a.CopyRange(1, 3)
+	if dup.Len() != 2 {
 		t.Fatal("区间复制失败")
 	}
 	a.MergeRange(b, 0, 1, 2)

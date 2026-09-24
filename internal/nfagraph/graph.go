@@ -3,12 +3,15 @@ package nfagraph
 
 import (
 	"fmt"
+	"reflect"
+	"slices"
+	"sort"
+
 	"github.com/smartwalle/scankit/internal/graph"
 	"github.com/smartwalle/scankit/internal/parser"
-	"reflect"
-	"sort"
 )
 
+// NodeKind 标识 NFA 图节点的语义类别。
 type NodeKind uint8
 
 func (k NodeKind) String() string {
@@ -19,6 +22,7 @@ func (k NodeKind) String() string {
 	return "unknown"
 }
 
+// KindStart 表示图起点，其余常量按语义依次对应接受、文字、字符类等节点。
 const (
 	KindStart NodeKind = iota + 1
 	KindAccept
@@ -31,6 +35,7 @@ const (
 	KindJoin
 )
 
+// Node 是 NFA 图的节点，负载字段按 Kind 生效。
 type Node struct {
 	ID        graph.Vertex
 	Kind      NodeKind
@@ -58,6 +63,7 @@ func (n Node) Equal(other Node) bool {
 	return *n.Unicode == *other.Unicode
 }
 
+// Clone 返回节点副本，并复制负载中的可变切片。
 func (n Node) Clone() Node {
 	n.Literal = append([]byte(nil), n.Literal...)
 	n.Class.Ranges = append([]parser.Range(nil), n.Class.Ranges...)
@@ -68,17 +74,21 @@ func (n Node) Clone() Node {
 	return n
 }
 
+// Graph 是 NFA 中间表示：Flow 保存拓扑，Nodes 保存节点负载。
 type Graph struct {
 	Flow  *graph.Directed
 	Nodes map[graph.Vertex]*Node
 	Start graph.Vertex
 }
 
+// New 创建只包含起点节点的空图。
 func New() *Graph {
 	g := &Graph{Flow: graph.NewDirected(), Nodes: make(map[graph.Vertex]*Node), Start: 0}
 	g.AddNode(Node{ID: 0, Kind: KindStart})
 	return g
 }
+
+// AddNode 写入节点负载，已存在的同 ID 节点会被覆盖。
 func (g *Graph) AddNode(node Node) {
 	if g == nil {
 		return
@@ -93,6 +103,8 @@ func (g *Graph) AddNode(node Node) {
 	copyNode := node.Clone()
 	g.Nodes[node.ID] = &copyNode
 }
+
+// AddEdge 添加一条有向边，重复边会被忽略。
 func (g *Graph) AddEdge(from, to graph.Vertex) {
 	if g != nil {
 		if g.Flow == nil {
@@ -101,6 +113,8 @@ func (g *Graph) AddEdge(from, to graph.Vertex) {
 		g.Flow.AddEdge(from, to)
 	}
 }
+
+// Node 返回节点负载，节点不存在时 ok 为 false。
 func (g *Graph) Node(id graph.Vertex) (Node, bool) {
 	if g == nil {
 		return Node{}, false
@@ -111,20 +125,26 @@ func (g *Graph) Node(id graph.Vertex) (Node, bool) {
 	}
 	return *n, true
 }
+
+// Accepts 返回全部接受顶点的升序快照。
 func (g *Graph) Accepts() []graph.Vertex {
 	if g == nil {
 		return nil
 	}
-	out := []graph.Vertex{}
+	var out []graph.Vertex
 	for id, n := range g.Nodes {
 		if n != nil && n.Kind == KindAccept {
 			out = append(out, id)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
-func (g *Graph) HasAccept() bool  { return len(g.Accepts()) > 0 }
+
+// HasAccept 判断图中是否存在接受顶点。
+func (g *Graph) HasAccept() bool { return len(g.Accepts()) > 0 }
+
+// AcceptCount 返回接受顶点的数量。
 func (g *Graph) AcceptCount() int { return len(g.Accepts()) }
 
 // HasUnicode 判断图中是否存在 Unicode 字符类节点。
@@ -142,12 +162,16 @@ func (g *Graph) HasUnicode() bool {
 
 // ByteOnly 判断图是否可完全按字节字符语义执行。
 func (g *Graph) ByteOnly() bool { return g != nil && !g.HasUnicode() }
+
+// StartNode 返回起点节点的负载，起点缺失时 ok 为 false。
 func (g *Graph) StartNode() (Node, bool) {
 	if g == nil {
 		return Node{}, false
 	}
 	return g.Node(g.Start)
 }
+
+// NodesCopy 按顶点编号升序返回节点负载的副本。
 func (g *Graph) NodesCopy() []Node {
 	if g == nil {
 		return nil
@@ -161,11 +185,13 @@ func (g *Graph) NodesCopy() []Node {
 	}
 	return out
 }
+
+// EdgePairs 按起点、终点升序返回全部边的端点对。
 func (g *Graph) EdgePairs() [][2]graph.Vertex {
 	if g == nil || g.Flow == nil {
 		return nil
 	}
-	out := [][2]graph.Vertex{}
+	var out [][2]graph.Vertex
 	for _, from := range g.Flow.Vertices() {
 		for _, to := range g.Flow.Successors(from) {
 			out = append(out, [2]graph.Vertex{from, to})
@@ -179,23 +205,24 @@ func (g *Graph) EdgePairs() [][2]graph.Vertex {
 	})
 	return out
 }
+
+// NodeIDs 返回顶点编号的升序快照。
 func (g *Graph) NodeIDs() []graph.Vertex {
 	if g == nil || g.Flow == nil {
 		return nil
 	}
 	return g.Flow.Vertices()
 }
+
+// Reachable 判断顶点能否从起点到达。
 func (g *Graph) Reachable(id graph.Vertex) bool {
 	if g == nil || g.Flow == nil || !g.HasNode(id) {
 		return false
 	}
-	for _, v := range g.Flow.BFS(g.Start) {
-		if v == id {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(g.Flow.BFS(g.Start), id)
 }
+
+// EdgeCount 返回有向边数量，空图返回 0。
 func (g *Graph) EdgeCount() int {
 	if g == nil || g.Flow == nil {
 		return 0
@@ -237,6 +264,8 @@ func (g *Graph) Predecessors(id graph.Vertex) []graph.Vertex {
 	}
 	return g.Flow.Predecessors(id)
 }
+
+// HasNode 判断顶点是否已登记节点负载。
 func (g *Graph) HasNode(id graph.Vertex) bool {
 	if g == nil {
 		return false
@@ -244,6 +273,8 @@ func (g *Graph) HasNode(id graph.Vertex) bool {
 	_, ok := g.Nodes[id]
 	return ok
 }
+
+// Clone 深度拷贝图，节点负载中的切片同样被复制。
 func (g *Graph) Clone() *Graph {
 	if g == nil {
 		return nil
@@ -395,6 +426,7 @@ func (g *Graph) Validate() error {
 			if n.Unicode != nil || len(n.Class.Ranges) != 0 || len(n.Literal) != 0 {
 				return fmt.Errorf("repeat node %d has character payload", id)
 			}
+		default:
 		}
 	}
 	if accepts == 0 {
@@ -403,6 +435,7 @@ func (g *Graph) Validate() error {
 	return nil
 }
 
+// Builder 负责把 Parser AST 逐步降低为 NFA 图，并分配顶点编号。
 type Builder struct {
 	graph *Graph
 	next  graph.Vertex
@@ -410,13 +443,18 @@ type Builder struct {
 
 type fragment struct{ entry, exit graph.Vertex }
 
+// NewBuilder 创建带空图的构建器，顶点编号从 1 开始分配。
 func NewBuilder() *Builder { return &Builder{graph: New(), next: 1} }
+
+// Reset 丢弃当前图并重置顶点编号分配器。
 func (b *Builder) Reset() {
 	if b != nil {
 		b.graph = New()
 		b.next = 1
 	}
 }
+
+// Graph 返回构建中的图，空构建器返回 nil。
 func (b *Builder) Graph() *Graph {
 	if b == nil {
 		return nil
@@ -429,6 +467,8 @@ func (b *Builder) newNode(kind NodeKind) graph.Vertex {
 	b.graph.AddNode(Node{ID: id, Kind: kind})
 	return id
 }
+
+// Build 将 AST 降低为 NFA 图，root 为 nil 时返回错误。
 func (b *Builder) Build(root parser.Node) (*Graph, error) {
 	if root == nil {
 		return nil, fmt.Errorf("nil AST")

@@ -3,6 +3,7 @@ package nfa
 import (
 	"bytes"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 
@@ -164,11 +165,8 @@ func (p *castleProgram) validate() error {
 				return fmt.Errorf("castle closure is not strictly ordered")
 			}
 		}
-		for _, target := range closure {
-			if target == source {
-				found = true
-				break
-			}
+		if slices.Contains(closure, source) {
+			found = true
 		}
 		if !found {
 			return fmt.Errorf("castle closure misses source")
@@ -202,7 +200,7 @@ func (p *castleProgram) validate() error {
 			return fmt.Errorf("castle literal state mismatch")
 		}
 		if n.Kind == nfagraph.KindClass {
-			for value := 0; value < 256; value++ {
+			for value := range 256 {
 				want := castleMatches(n, byte(value))
 				got := p.classMasks[i][value/64]&(1<<uint(value%64)) != 0
 				if want != got {
@@ -330,9 +328,9 @@ func (p *castleProgram) validate() error {
 			seen[target] = struct{}{}
 		}
 		expected := append([]graph.Vertex(nil), p.graph.Successors(source)...)
-		sort.Slice(expected, func(i, j int) bool { return expected[i] < expected[j] })
+		slices.Sort(expected)
 		actual := append([]graph.Vertex(nil), targets...)
-		sort.Slice(actual, func(i, j int) bool { return actual[i] < actual[j] })
+		slices.Sort(actual)
 		if len(expected) != len(actual) {
 			return fmt.Errorf("castle transition mismatch")
 		}
@@ -377,7 +375,7 @@ func newCastleProgram(g *nfagraph.Graph) *castleProgram {
 		if n.Kind == nfagraph.KindLiteral && len(n.Literal) == 1 {
 			p.literals[i] = n.Literal[0]
 		} else if n.Kind == nfagraph.KindClass {
-			for value := 0; value < 256; value++ {
+			for value := range 256 {
 				if castleMatches(n, byte(value)) {
 					p.classMasks[i][value/64] |= 1 << uint(value%64)
 				}
@@ -390,7 +388,7 @@ func newCastleProgram(g *nfagraph.Graph) *castleProgram {
 			p.closureIndex[i] = append(p.closureIndex[i], p.index[target])
 		}
 		p.transitions[v] = append([]graph.Vertex(nil), g.Successors(v)...)
-		sort.Slice(p.transitions[v], func(a, b int) bool { return p.transitions[v][a] < p.transitions[v][b] })
+		slices.Sort(p.transitions[v])
 		if len(p.transitions[v]) > 1 {
 			uniq := p.transitions[v][:1]
 			for _, target := range p.transitions[v][1:] {
@@ -406,7 +404,7 @@ func newCastleProgram(g *nfagraph.Graph) *castleProgram {
 			p.transitionIndex[i] = append(p.transitionIndex[i], p.index[target])
 		}
 		predecessors := append([]graph.Vertex(nil), g.Predecessors(v)...)
-		sort.Slice(predecessors, func(a, b int) bool { return predecessors[a] < predecessors[b] })
+		slices.Sort(predecessors)
 		predecessors = dedupVertices(predecessors)
 		for _, previous := range predecessors {
 			if index, ok := p.index[previous]; ok {
@@ -561,6 +559,7 @@ func (p *castleProgram) reverseAccepts(data []byte, start, end int) bool {
 				matched = p.literals[id] == data[pos]
 			case nfagraph.KindClass:
 				matched = p.classMasks[id][data[pos]/64]&(1<<uint(data[pos]%64)) != 0
+			default:
 			}
 			if !matched {
 				continue
@@ -674,21 +673,6 @@ func (p *castleProgram) matchAtBudgetUncheckedInto(data []byte, start, maxSteps,
 }
 
 // filterCastleDead 在闭包展开后移除无法到达接受节点的状态。
-func filterCastleDead(states []graph.Vertex, dead map[graph.Vertex]bool) []graph.Vertex {
-	if len(states) == 0 || len(dead) == 0 {
-		return states
-	}
-	write := 0
-	for _, id := range states {
-		if dead[id] {
-			continue
-		}
-		states[write] = id
-		write++
-	}
-	return states[:write]
-}
-
 // filterCastleDeadIndex 在整数状态布局中移除无法到达接受节点的状态。
 func filterCastleDeadIndex(states []int, dead []bool) []int {
 	write := 0
@@ -700,18 +684,6 @@ func filterCastleDeadIndex(states []int, dead []bool) []int {
 		write++
 	}
 	return states[:write]
-}
-
-func equalVertices(a, b []graph.Vertex) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // castleRuntimeShapeCached 是扫描热路径上的布局门禁：每次调用只做 O(1) 规模
@@ -839,67 +811,6 @@ func (p *castleProgram) Spans(data []byte, limit int) []Span {
 	return out
 }
 
-func (p *castleProgram) closure(seed []graph.Vertex) []graph.Vertex {
-	if len(p.closureTable) > 0 {
-		seen := make(map[graph.Vertex]struct{}, len(seed))
-		for _, v := range seed {
-			for _, item := range p.closureTable[v] {
-				seen[item] = struct{}{}
-			}
-		}
-		out := make([]graph.Vertex, 0, len(seen))
-		for v := range seen {
-			out = append(out, v)
-		}
-		sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-		return out
-	}
-	seen := make(map[graph.Vertex]struct{})
-	queue := append([]graph.Vertex(nil), seed...)
-	for len(queue) > 0 {
-		v := queue[0]
-		queue = queue[1:]
-		if _, ok := seen[v]; ok {
-			continue
-		}
-		seen[v] = struct{}{}
-		n := p.graph.Nodes[v]
-		if n == nil || n.Kind == nfagraph.KindLiteral || n.Kind == nfagraph.KindClass {
-			continue
-		}
-		queue = append(queue, p.graph.Successors(v)...)
-	}
-	out := make([]graph.Vertex, 0, len(seen))
-	for v := range seen {
-		out = append(out, v)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out
-}
-
-func (p *castleProgram) closureWithWork(seed []graph.Vertex, marks []uint32, generation *uint32, out []graph.Vertex) []graph.Vertex {
-	if len(seed) == 0 {
-		return nil
-	}
-	*generation++
-	if *generation == 0 {
-		clear(marks)
-		*generation = 1
-	}
-	out = out[:0]
-	for _, v := range seed {
-		for _, item := range p.closureTable[v] {
-			index, ok := p.index[item]
-			if !ok || marks[index] == *generation {
-				continue
-			}
-			marks[index] = *generation
-			out = append(out, item)
-		}
-	}
-	return out
-}
-
 // closureIndexWithWork 合并预计算的整数闭包，避免扫描热路径访问顶点映射。
 func (p *castleProgram) closureIndexWithWork(seed []int, marks []uint32, generation *uint32, out []int) []int {
 	if len(seed) == 0 {
@@ -946,7 +857,7 @@ func (p *castleProgram) computeClosure(seed graph.Vertex) []graph.Vertex {
 	for v := range seen {
 		out = append(out, v)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 

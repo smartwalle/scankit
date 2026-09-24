@@ -3,9 +3,12 @@ package report
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 )
 
+// Event 是一条匹配事件，SOM 为匹配起点，未启用时为 0。
 type Event struct {
 	ID            uint32
 	From, To, SOM uint64
@@ -15,11 +18,13 @@ type Event struct {
 // Span 返回事件的起止偏移。
 func (e Event) Span() (uint64, uint64) { return e.From, e.To }
 
+// FlagSingleMatch 表示单次匹配事件，FlagQuiet 表示静默丢弃事件。
 const (
 	FlagSingleMatch uint32 = 1 << 3
 	FlagQuiet       uint32 = 1 << 10
 )
 
+// Manager 收集事件、抑制重复并按稳定顺序输出报告。
 type Manager struct {
 	events     []Event
 	seen       map[uint32]bool
@@ -29,6 +34,7 @@ type Manager struct {
 	MaxEvents  int
 }
 
+// Validate 检查事件偏移是否满足 From ≤ To 且 SOM ≤ To。
 func (e Event) Validate() error {
 	if e.From > e.To {
 		return fmt.Errorf("invalid event range")
@@ -38,16 +44,25 @@ func (e Event) Validate() error {
 	}
 	return nil
 }
+
+// Length 返回事件的字节长度，偏移翻转时返回 0。
 func (e Event) Length() uint64 {
 	if e.To < e.From {
 		return 0
 	}
 	return e.To - e.From
 }
-func (e Event) Empty() bool            { return e.From == e.To }
+
+// Empty 判断事件是否为长度为零的空匹配。
+func (e Event) Empty() bool { return e.From == e.To }
+
+// Equal 判断两个事件的字段是否完全一致。
 func (e Event) Equal(other Event) bool { return e == other }
 
+// New 创建空的事件管理器。
 func New() *Manager { return &Manager{seen: map[uint32]bool{}, duplicates: map[Event]struct{}{}} }
+
+// Clone 深拷贝管理器，包含已收集事件和去重状态。
 func (m *Manager) Clone() *Manager {
 	if m == nil {
 		return nil
@@ -57,20 +72,22 @@ func (m *Manager) Clone() *Manager {
 	o.callback = m.callback
 	o.stopped = m.stopped
 	o.events = append([]Event(nil), m.events...)
-	for id, seen := range m.seen {
-		o.seen[id] = seen
-	}
+	maps.Copy(o.seen, m.seen)
 	for event := range m.duplicates {
 		o.duplicates[event] = struct{}{}
 	}
 	return o
 }
+
+// SetCallback 设置事件回调，回调返回 false 时后续事件会被丢弃。
 func (m *Manager) SetCallback(fn func(Event) bool) {
 	if m != nil {
 		m.callback = fn
 		m.stopped = false
 	}
 }
+
+// Add 追加一条事件，非法、静默或重复的事件返回 false。
 func (m *Manager) Add(e Event) bool {
 	if m == nil {
 		return false
@@ -164,6 +181,7 @@ func (m *Manager) AddAll(events []Event) int {
 	return added
 }
 
+// SetMaxEvents 设置保留事件上限，负数表示恢复为不限制。
 func (m *Manager) SetMaxEvents(limit int) {
 	if m == nil {
 		return
@@ -189,6 +207,8 @@ func (m *Manager) SetMaxEvents(limit int) {
 	}
 	m.rebuildIndexes()
 }
+
+// Events 返回按起点、规则编号和终点稳定排序的事件副本。
 func (m *Manager) Events() []Event {
 	if m == nil {
 		return nil
@@ -271,6 +291,8 @@ func (m *Manager) Sort() {
 		return m.events[i].SOM < m.events[j].SOM
 	})
 }
+
+// Reset 清空已收集事件与去重状态，保留回调配置。
 func (m *Manager) Reset() {
 	if m == nil {
 		return
@@ -291,6 +313,8 @@ func (m *Manager) Reset() {
 
 // Stopped 返回回调是否请求停止后续报告。
 func (m *Manager) Stopped() bool { return m != nil && m.stopped }
+
+// Deduplicate 按编号和起止偏移原地去除重复事件。
 func (m *Manager) Deduplicate() {
 	if m == nil {
 		return
@@ -308,6 +332,8 @@ func (m *Manager) Deduplicate() {
 	m.events = out
 	m.rebuildIndexes()
 }
+
+// Len 返回已收集的事件数量。
 func (m *Manager) Len() int {
 	if m == nil {
 		return 0
@@ -315,17 +341,20 @@ func (m *Manager) Len() int {
 	return len(m.events)
 }
 
+// Snapshot 返回当前事件的稳定排序快照。
 func (m *Manager) Snapshot() []Event {
 	if m == nil {
 		return nil
 	}
 	return m.Events()
 }
+
+// EventsFor 返回指定规则编号的稳定排序事件副本。
 func (m *Manager) EventsFor(id uint32) []Event {
 	if m == nil {
 		return nil
 	}
-	out := []Event{}
+	var out []Event
 	for _, e := range m.events {
 		if e.ID == id {
 			out = append(out, e)
@@ -538,7 +567,7 @@ func (m *Manager) IDs() []uint32 {
 	for id := range seen {
 		out = append(out, id)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 
@@ -574,6 +603,8 @@ func (m *Manager) LastFor(id uint32) (Event, bool) {
 	}
 	return events[len(events)-1], true
 }
+
+// HasID 判断是否已收集到指定规则编号的事件。
 func (m *Manager) HasID(id uint32) bool {
 	if m == nil {
 		return false
@@ -634,7 +665,7 @@ func (m *Manager) IDsRange(from, to uint64) []uint32 {
 	for id := range ids {
 		out = append(out, id)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 

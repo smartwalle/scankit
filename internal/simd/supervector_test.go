@@ -1,8 +1,9 @@
 package simd
 
 import (
-	"github.com/smartwalle/scankit/internal/simd/generic"
 	"testing"
+
+	"github.com/smartwalle/scankit/internal/simd/generic"
 )
 
 func TestSuperVectorLoadStoreAndMasks(t *testing.T) {

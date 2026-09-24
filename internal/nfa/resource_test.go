@@ -1,6 +1,7 @@
 package nfa
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/smartwalle/scankit/internal/nfagraph"
@@ -27,7 +28,7 @@ func TestResourceLimitsMatchCompiledLayout(t *testing.T) {
 	if err := e.CheckLimits(ResourceLimits{States: u.States, Edges: u.Edges, Memory: u.Memory}); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.CheckLimits(ResourceLimits{Memory: u.Memory - 1}); err != ErrMemoryLimit {
+	if err := e.CheckLimits(ResourceLimits{Memory: u.Memory - 1}); !errors.Is(err, ErrMemoryLimit) {
 		t.Fatalf("应拒绝超出内存限制: %v", err)
 	}
 	if err := e.CheckDefaultLimits(); err != nil {
@@ -36,10 +37,10 @@ func TestResourceLimitsMatchCompiledLayout(t *testing.T) {
 }
 
 func TestExecutionResourceLimitsRejectExceededBudget(t *testing.T) {
-	if err := CheckExecutionLimits(Context{Steps: 3, Results: 2}, ResourceLimits{Steps: 2}); err != ErrExecutionLimit {
+	if err := CheckExecutionLimits(Context{Steps: 3, Results: 2}, ResourceLimits{Steps: 2}); !errors.Is(err, ErrExecutionLimit) {
 		t.Fatalf("步骤超限未拒绝: %v", err)
 	}
-	if err := CheckExecutionLimits(Context{Results: 3}, ResourceLimits{Results: 2}); err != ErrExecutionLimit {
+	if err := CheckExecutionLimits(Context{Results: 3}, ResourceLimits{Results: 2}); !errors.Is(err, ErrExecutionLimit) {
 		t.Fatalf("结果超限未拒绝: %v", err)
 	}
 }
@@ -53,10 +54,10 @@ func TestCompileEngineWithLimitsChecksEdgesBeforeLayout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := CompileEngineWithLimits(g, EngineSheng, ResourceLimits{Edges: 1}); err != ErrEdgeLimit {
+	if _, err := CompileEngineWithLimits(g, EngineSheng, ResourceLimits{Edges: 1}); !errors.Is(err, ErrEdgeLimit) {
 		t.Fatalf("边数限制错误: %v", err)
 	}
-	if _, err := CompileEngineWithLimits(g, EngineSheng, ResourceLimits{States: 1}); err != ErrStateLimit {
+	if _, err := CompileEngineWithLimits(g, EngineSheng, ResourceLimits{States: 1}); !errors.Is(err, ErrStateLimit) {
 		t.Fatalf("状态限制错误: %v", err)
 	}
 }

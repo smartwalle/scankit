@@ -100,7 +100,7 @@ func ParseEnvOverrides(lookup func(string) (string, bool)) (EnvOverrides, error)
 	}
 	var out EnvOverrides
 	if raw, ok := lookup(EnvDisableBackends); ok {
-		for _, item := range strings.Split(raw, ",") {
+		for item := range strings.SplitSeq(raw, ",") {
 			item = strings.TrimSpace(item)
 			if item == "" {
 				continue

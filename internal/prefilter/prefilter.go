@@ -9,6 +9,7 @@ import (
 	"github.com/smartwalle/scankit/internal/nfagraph"
 )
 
+// Filter 是以固定文字为候选条件的过滤器，Literal 为空时不产生候选。
 type Filter struct{ Literal []byte }
 
 // New 创建不可变文字候选过滤器。
@@ -65,10 +66,7 @@ func graphPrefix(g *nfagraph.Graph, id graph.Vertex, visiting map[graph.Vertex]s
 	}
 	common := paths[0]
 	for _, path := range paths[1:] {
-		n := len(common)
-		if len(path) < n {
-			n = len(path)
-		}
+		n := min(len(path), len(common))
 		for i := 0; i < n; i++ {
 			if common[i] != path[i] {
 				n = i
@@ -116,6 +114,8 @@ func CandidateAll(filters []Filter, data []byte) bool {
 	}
 	return true
 }
+
+// Find 返回文字在 data 中全部出现的起始偏移；文字为空时返回单个 0。
 func (f Filter) Find(data []byte) []int {
 	if len(f.Literal) == 0 {
 		return []int{0}
@@ -134,12 +134,7 @@ func (f Filter) FindFold(data []byte) []int {
 	return hwlm.FindAll(data, hwlm.Literal{Value: f.Literal, CaseInsensitive: true})
 }
 
-func foldASCII(c byte) byte {
-	if c >= 'A' && c <= 'Z' {
-		return c + ('a' - 'A')
-	}
-	return c
-}
+// FindFrom 返回从 start 起文字全部出现的起始偏移。
 func (f Filter) FindFrom(data []byte, start int) []int {
 	if start < 0 {
 		start = 0
@@ -184,6 +179,8 @@ func (f Filter) CandidateFrom(data []byte, start int) bool {
 func (f Filter) CandidateFoldFrom(data []byte, start int) bool {
 	return len(f.FindFoldFrom(data, start)) > 0
 }
+
+// FindLimit 返回最多 limit 个候选起始偏移，limit 为零时表示不限制。
 func (f Filter) FindLimit(data []byte, limit int) []int {
 	if limit < 0 {
 		return nil
@@ -291,7 +288,12 @@ func (f Filter) Count(data []byte) int { return len(f.Find(data)) }
 
 // CountFold 返回忽略 ASCII 大小写的候选数量。
 func (f Filter) CountFold(data []byte) int { return len(f.FindFold(data)) }
-func (f Filter) Empty() bool               { return len(f.Literal) == 0 }
 
-func (f Filter) Len() int      { return len(f.Literal) }
+// Empty 判断过滤器是否缺少候选文字。
+func (f Filter) Empty() bool { return len(f.Literal) == 0 }
+
+// Len 返回候选文字的字节长度。
+func (f Filter) Len() int { return len(f.Literal) }
+
+// Clone 返回过滤器的独立副本。
 func (f Filter) Clone() Filter { return New(f.Literal) }

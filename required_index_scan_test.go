@@ -6,7 +6,6 @@ import (
 	"math/rand/v2"
 	"regexp"
 	"slices"
-	"sort"
 	"strings"
 	"testing"
 
@@ -456,8 +455,8 @@ func TestGuardRunStartsMatchesScalar(t *testing.T) {
 		if len(got) != len(want) {
 			t.Fatalf("%s: 候选数量不一致 got=%d want=%d", name, len(got), len(want))
 		}
-		sort.Slice(got, func(i, j int) bool { return got[i] < got[j] })
-		sort.Slice(want, func(i, j int) bool { return want[i] < want[j] })
+		slices.Sort(got)
+		slices.Sort(want)
 		for index := range got {
 			if got[index] != want[index] {
 				t.Fatalf("%s: 第 %d 个候选不一致 got=%v want=%v", name, index, got[index], want[index])
@@ -793,7 +792,7 @@ func TestRequiredIndexCollapseMatchesRegexp(t *testing.T) {
 	}
 	filler := " \t=,:;中文\nlevel=INFO service=payment "
 	hits := 0
-	for round := 0; round < 4000; round++ {
+	for range 4000 {
 		var builder strings.Builder
 		for part := rng.IntN(3) + 1; part > 0; part-- {
 			builder.WriteString(pick(filler, 4))
@@ -853,7 +852,7 @@ func TestGuardRunStartsRandomizedMatchesScalar(t *testing.T) {
 	backend := dispatch.DefaultBackend()
 	const limit = 1 << 20
 
-	for round := 0; round < 3000; round++ {
+	for round := range 3000 {
 		// 随机字节集合：偶数轮从 256 个取值里抽 1~10 个，覆盖稀疏掩码；奇数轮从
 		// 3~6 个字节的小字母表里取值，构造"窗口内几乎全是成员、连续段只有几个
 		// 字节"的密集掩码——这正是日志语料上的真实形态（单词由分隔符切开），也是
@@ -878,7 +877,7 @@ func TestGuardRunStartsRandomizedMatchesScalar(t *testing.T) {
 		runCount := rng.IntN(3) + 1
 		runs := make([]guardRun, 0, runCount)
 		minLength := 0
-		for index := 0; index < runCount; index++ {
+		for index := range runCount {
 			length := []int{1, 2, 3, 4, 8, 9, 16, 17, 63, 64, 65}[rng.IntN(11)]
 			runs = append(runs, guardRun{
 				ruleIndex: index,

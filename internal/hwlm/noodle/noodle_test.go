@@ -20,8 +20,8 @@ func TestMatcherRangeAndClone(t *testing.T) {
 		t.Fatalf("range matches: %#v", matches)
 	}
 	clone := m.Clone()
-	copy := clone.Literals()
-	copy[0].Value[0] = 'z'
+	dup := clone.Literals()
+	dup[0].Value[0] = 'z'
 	if len(m.Find([]byte("aa"))) != 1 {
 		t.Fatal("matcher clone leaked literals")
 	}

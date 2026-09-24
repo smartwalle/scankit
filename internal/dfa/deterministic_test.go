@@ -1,9 +1,10 @@
 package dfa
 
 import (
+	"testing"
+
 	"github.com/smartwalle/scankit/internal/nfagraph"
 	"github.com/smartwalle/scankit/internal/parser"
-	"testing"
 )
 
 func TestIsDeterministic(t *testing.T) {

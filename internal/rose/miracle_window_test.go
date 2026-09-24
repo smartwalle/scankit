@@ -10,7 +10,7 @@ import (
 // bruteForceStates 用逐偏移逐角色比较给出候选结果参考，作为窗口批量枚举的独立对照。
 func bruteForceStates(roles []Role, data []byte) []State {
 	var out []State
-	for off := 0; off < len(data); off++ {
+	for off := range data {
 		for _, role := range roles {
 			if off+len(role.Literal) > len(data) {
 				continue
@@ -120,7 +120,7 @@ func BenchmarkMiracleWindowCandidates(b *testing.B) {
 	copy(data[30<<10:], "beta")
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if got := program.FindMatches(data); len(got) == 0 {
 			b.Fatal("没有候选命中")
 		}

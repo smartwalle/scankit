@@ -3,11 +3,12 @@ package nfa
 import (
 	"errors"
 	"fmt"
+	"strings"
+	"testing"
+
 	"github.com/smartwalle/scankit/internal/graph"
 	"github.com/smartwalle/scankit/internal/nfagraph"
 	"github.com/smartwalle/scankit/internal/parser"
-	"strings"
-	"testing"
 )
 
 func TestCompileEngineWithBudgetsRejectsStateAndMemoryOverflow(t *testing.T) {
@@ -290,6 +291,7 @@ func TestSpecializedStartMetadataRejectsCorruption(t *testing.T) {
 			e.rangeNFA.firstMask[0] ^= 1
 		case EngineShufti, EngineTruffle:
 			e.nibbleNFA.firstMask[0] ^= 1
+		default:
 		}
 		if err := e.Validate(); err == nil {
 			t.Fatalf("%s 未拒绝损坏的起始元数据", kind)
@@ -616,6 +618,7 @@ func TestCorruptDedicatedLayoutFallsBackToGenericMatcher(t *testing.T) {
 				e.rangeNFA.closures[0] = nil
 			case EngineShufti, EngineTruffle:
 				e.nibbleNFA.closures[0] = nil
+			default:
 			}
 			if got := e.MatchAt([]byte("ab"), 0); len(got) != 1 || got[0] != 2 {
 				t.Fatalf("损坏专用布局未安全回退: %v", got)
@@ -960,7 +963,7 @@ func BenchmarkByteNFA(b *testing.B) {
 	data := []byte("ab a7 ab a3 ab")
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = e.MatchAt(data, 0)
 	}
 }
@@ -997,7 +1000,7 @@ func BenchmarkSelectEngineKind(b *testing.B) {
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = SelectEngineKind(g)
 	}
 }
@@ -1535,7 +1538,7 @@ func TestRepeatEngineUsesDedicatedProgram(t *testing.T) {
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("结果=%v, want=%v", got, want)
 	}
-	if e.SupportsGraph(g) == false {
+	if !e.SupportsGraph(g) {
 		t.Fatal("重复图未被接受")
 	}
 }
@@ -1792,8 +1795,8 @@ func TestByteTransitionCacheMatchesReferenceAcrossBytes(t *testing.T) {
 	g, _ := nfagraph.NewBuilder().Build(r)
 	e, _ := CompileEngine(g, EngineLimEx)
 	ref, _ := CompileEngine(g, EngineCastle)
-	for a := byte(0); a < 128; a++ {
-		for b := byte(0); b < 128; b++ {
+	for a := range byte(128) {
+		for b := range byte(128) {
 			input := []byte{a, b}
 			if fmt.Sprint(e.MatchAt(input, 0)) != fmt.Sprint(ref.MatchAt(input, 0)) {
 				t.Fatalf("输入=%v", input)
@@ -2290,9 +2293,9 @@ func TestEngineCapabilitiesExposeExecutionShape(t *testing.T) {
 }
 
 func TestSaturatingMemoryArithmetic(t *testing.T) {
-	max := ^uint64(0)
-	if saturatingAdd(max-1, 2) != max || saturatingMul(max, 2) != max {
-		t.Fatalf("内存估算溢出未饱和: add=%d mul=%d", saturatingAdd(max-1, 2), saturatingMul(max, 2))
+	maxValue := ^uint64(0)
+	if saturatingAdd(maxValue-1, 2) != maxValue || saturatingMul(maxValue, 2) != maxValue {
+		t.Fatalf("内存估算溢出未饱和: add=%d mul=%d", saturatingAdd(maxValue-1, 2), saturatingMul(maxValue, 2))
 	}
 }
 
@@ -2508,7 +2511,7 @@ func FuzzEngineFamiliesNeverPanic(f *testing.F) {
 	f.Add("ab", "ab")
 	f.Add("a7", "a7")
 	f.Add("", "")
-	f.Fuzz(func(t *testing.T, pattern, input string) {
+	f.Fuzz(func(_ *testing.T, pattern, input string) {
 		r, err := parser.Parse(pattern)
 		if err != nil {
 			return

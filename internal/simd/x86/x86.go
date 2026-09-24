@@ -10,6 +10,7 @@ import (
 // Tier 表示 x86 后端允许使用的最低能力层级。
 type Tier uint8
 
+// TierScalar 表示纯标量展开路径，其余常量对应逐级提升的 x86 指令集层级。
 const (
 	TierScalar Tier = iota
 	TierSSE
@@ -264,8 +265,11 @@ func (b Backend) LessMask(a, c generic.Vector) uint16 {
 	return mask
 }
 
+// AnyGreater 判断是否存在 a 大于 c 的字节位置。
 func (b Backend) AnyGreater(a, c generic.Vector) bool { return b.GreaterMask(a, c) != 0 }
-func (b Backend) AnyLess(a, c generic.Vector) bool    { return b.LessMask(a, c) != 0 }
+
+// AnyLess 判断是否存在 a 小于 c 的字节位置。
+func (b Backend) AnyLess(a, c generic.Vector) bool { return b.LessMask(a, c) != 0 }
 
 // New 返回固定使用标量展开路径的 x86 后端，用于对照原生实现的结果。
 func New() simd.Backend { return Backend{tier: TierScalar, resolved: TierScalar} }

@@ -2,8 +2,9 @@ package nfagraph
 
 import (
 	"encoding/json"
-	"github.com/smartwalle/scankit/internal/parser"
 	"testing"
+
+	"github.com/smartwalle/scankit/internal/parser"
 )
 
 func TestBuildGraph(t *testing.T) {
@@ -118,7 +119,7 @@ func BenchmarkBuildGraph(b *testing.B) {
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if _, err := NewBuilder().Build(root); err != nil {
 			b.Fatal(err)
 		}

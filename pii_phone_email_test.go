@@ -33,7 +33,7 @@ func TestScannerConcurrentScan(t *testing.T) {
 	data := []byte("x123 y1456")
 	const workers = 8
 	done := make(chan error, workers)
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go func() {
 			got, e := s.Scan(data)
 			if e == nil && len(got) != 2 {
@@ -42,7 +42,7 @@ func TestScannerConcurrentScan(t *testing.T) {
 			done <- e
 		}()
 	}
-	for i := 0; i < workers; i++ {
+	for range workers {
 		if e := <-done; e != nil {
 			t.Fatal(e)
 		}

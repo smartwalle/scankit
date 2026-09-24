@@ -41,7 +41,7 @@ func wideKernelsReady(tier Tier) (useVBMI, useBW bool) {
 func verifyWideKernel(kernel func([]byte, *[32]byte) uint64) bool {
 	var sets [3][4][4]uint64
 	sets[1] = [4][4]uint64{{^uint64(0), ^uint64(0), ^uint64(0), ^uint64(0)}}
-	for h := 0; h < 16; h++ {
+	for h := range 16 {
 		for _, low := range []uint{0, 3, 7, 8, 12, 15} {
 			v := uint(h<<4) | low
 			sets[2][0][v/64] |= 1 << uint(v%64)

@@ -37,6 +37,7 @@ import (
 	"github.com/smartwalle/scankit/internal/smallwrite"
 )
 
+// Match 是一条匹配结果：规则编号与左闭右开区间 [From, To)。
 type Match struct {
 	Id   uint32
 	From uint64
@@ -1198,7 +1199,7 @@ func (scanner *Scanner) scanRoseInto(data []byte, dst []Match) []Match {
 			continue
 		}
 		startFrom := 0
-		if rule.info.MaxLength != math.MaxUint64 && rule.info.MaxLength <= uint64(event.To) {
+		if rule.info.MaxLength != math.MaxUint64 && rule.info.MaxLength <= event.To {
 			startFrom = int(event.To - rule.info.MaxLength)
 		}
 		for start := startFrom; start <= int(event.From); start++ {
@@ -1348,6 +1349,7 @@ func requiresEndOfData(root parser.Node) bool {
 		case parser.End, parser.EndAbsolute, parser.EndBeforeFinalNewline:
 			requires = true
 			return false
+		default:
 		}
 		return true
 	})
@@ -1371,9 +1373,9 @@ func hasLiteralSelfOverlap(literal []byte) bool {
 }
 
 func uint32ToInt(value uint32) int {
-	max := uint64(^uint(0) >> 1)
-	if uint64(value) > max {
-		return int(max)
+	maxInt := uint64(^uint(0) >> 1)
+	if uint64(value) > maxInt {
+		return int(maxInt)
 	}
 	return int(value)
 }
@@ -1493,7 +1495,7 @@ func (ctx *scanContext) retainedBytes() int {
 		cap(ctx.requiredStartCounts)*int(unsafe.Sizeof(uint32(0))) +
 		cap(ctx.directMatches)*int(unsafe.Sizeof(match)) +
 		cap(ctx.literalCandidates)*int(unsafe.Sizeof(candidate)) +
-		cap(ctx.ruleMatchBuf)*int(unsafe.Sizeof(int(0)))
+		cap(ctx.ruleMatchBuf)*int(unsafe.Sizeof(0))
 }
 
 func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) {
@@ -2019,15 +2021,15 @@ func newCollapseHead(rule compiledRule) *collapseHead {
 	if instr.op != confirmOpSetRepeat {
 		return nil
 	}
-	repeat := confirm.repeats[instr.index]
-	if repeat.min < 0 || repeat.max < 0 {
+	rep := confirm.repeats[instr.index]
+	if rep.min < 0 || rep.max < 0 {
 		return nil
 	}
 	// 重复必须与候选窗口一一对应：窗口就是重复的所有合法消费长度。
-	if int(repeat.min) != variant.MinOffset || int(repeat.max) != variant.MaxOffset {
+	if int(rep.min) != variant.MinOffset || int(rep.max) != variant.MaxOffset {
 		return nil
 	}
-	set := &confirm.sets[repeat.set]
+	set := &confirm.sets[rep.set]
 	head := variant.Value[0]
 	if set.match(head) {
 		// 入口文字首字节属于重复集合时重复不会停在命中位置，窗口不再成立。
@@ -2044,7 +2046,7 @@ func newCollapseHead(rule compiledRule) *collapseHead {
 			return nil
 		}
 	}
-	return &collapseHead{set: set, min: int(repeat.min), max: int(repeat.max)}
+	return &collapseHead{set: set, min: int(rep.min), max: int(rep.max)}
 }
 
 // runEnd 返回从 start 起连续属于重复集合的第一个位置。连续段长于重复上界时重复
@@ -2340,10 +2342,7 @@ func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte) ([]uin
 			// 偏移上界为负表示无上界，此时起点只受数据左边界约束。
 			from, to := 0, hit.pos-entry.min
 			if entry.max >= 0 {
-				from = hit.pos - entry.max
-				if from < 0 {
-					from = 0
-				}
+				from = max(hit.pos-entry.max, 0)
 			}
 			if to < 0 || to > len(data) {
 				continue
@@ -2453,7 +2452,7 @@ func (group *guardRunGroup) appendStarts(backend simd.Backend, data []byte, star
 	if off < len(data) {
 		width := len(data) - off
 		var mask uint64
-		for index := 0; index < width; index++ {
+		for index := range width {
 			if group.member(data[off+index]) {
 				mask |= uint64(1) << uint(index)
 			}
@@ -2481,10 +2480,7 @@ type guardRunEmitter struct {
 // emitRun 把一个连续段 [from, to) 覆盖的窗口起点整段展开成候选键。
 func (emitter *guardRunEmitter) emitRun(run *guardRun, from, to int) {
 	// 窗口 [start+offset, start+offset+length) 必须落在 [from, to) 内。
-	first := from - run.offset
-	if first < 0 {
-		first = 0
-	}
+	first := max(from-run.offset, 0)
 	last := to - run.length - run.offset
 	count := last - first + 1
 	if count <= 0 {
@@ -2505,7 +2501,7 @@ func (emitter *guardRunEmitter) emitRun(run *guardRun, from, to int) {
 	base := len(starts)
 	starts = starts[:base+count]
 	ruleKey := uint64(uint32(run.ruleIndex))
-	for index := 0; index < count; index++ {
+	for index := range count {
 		starts[base+index] = uint64(uint32(first+index))<<32 | ruleKey
 	}
 	emitter.starts = starts
@@ -2612,20 +2608,14 @@ func (window *guardRunWindow) skipPairing(off, width int, mask uint64, edgeOut b
 	if window.runStart >= 0 {
 		carry = off - window.runStart
 	}
-	lead := bits.TrailingZeros64(^mask)
-	if lead > width {
-		lead = width
-	}
+	lead := min(bits.TrailingZeros64(^mask), width)
 	if carry+lead >= minLength {
 		return false
 	}
 	if hasGuardRun(mask, minLength) {
 		return false
 	}
-	trail := bits.LeadingZeros64(^(mask << uint(64-width)))
-	if trail > width {
-		trail = width
-	}
+	trail := min(bits.LeadingZeros64(^(mask << uint(64-width))), width)
 	if trail == 0 || !edgeOut {
 		// 段在窗口内结束（或本窗口就是数据尾部）：接力状态清空。
 		window.runStart = -1
@@ -2694,10 +2684,7 @@ func (group *guardRunGroup) appendStartsScalar(data []byte, starts []uint64, lim
 			continue
 		}
 		for _, run := range group.runs {
-			first := runStart - run.offset
-			if first < 0 {
-				first = 0
-			}
+			first := max(runStart-run.offset, 0)
 			last := index - run.length - run.offset
 			for start := first; start <= last; start++ {
 				if len(starts) >= limit {
@@ -2745,14 +2732,11 @@ func (scanner *Scanner) sortRequiredStarts(ctx *scanContext, starts []uint64, da
 	} else {
 		ctx.requiredSortScratch = ctx.requiredSortScratch[:keyCount]
 	}
-	scratch := ctx.requiredSortScratch
+	sortScratch := ctx.requiredSortScratch
 	// 桶数目标先取候选数（平均每桶一到两个候选，桶内插入排序摊到常数代价），
 	// 再受计数表内存上限约束。语料越长桶跨度越大，桶数始终不超过目标值，
 	// 所以计数表规模只跟候选数走，不会随语料长度线性增长。
-	target := keyCount
-	if target > requiredCountingSortMaxBuckets {
-		target = requiredCountingSortMaxBuckets
-	}
+	target := min(keyCount, requiredCountingSortMaxBuckets)
 	shift := 0
 	for dataLen>>(shift+1) > target/2 {
 		shift++
@@ -2771,7 +2755,7 @@ func (scanner *Scanner) sortRequiredStarts(ctx *scanContext, starts []uint64, da
 	sortByCount(counts)
 	for _, key := range starts {
 		bucket := key >> 32 >> shift
-		scratch[counts[bucket]] = key
+		sortScratch[counts[bucket]] = key
 		counts[bucket]++
 	}
 	// 每个桶覆盖至多 2^shift 个相邻起点，桶内按完整键排序即可得到
@@ -2781,22 +2765,22 @@ func (scanner *Scanner) sortRequiredStarts(ctx *scanContext, starts []uint64, da
 	for index := range buckets {
 		end := int(counts[index])
 		if end-begin > requiredBucketSortCutoff {
-			slices.Sort(scratch[begin:end])
+			slices.Sort(sortScratch[begin:end])
 			begin = end
 			continue
 		}
 		for current := begin + 1; current < end; current++ {
-			key := scratch[current]
+			key := sortScratch[current]
 			position := current - 1
-			for position >= begin && scratch[position] > key {
-				scratch[position+1] = scratch[position]
+			for position >= begin && sortScratch[position] > key {
+				sortScratch[position+1] = sortScratch[position]
 				position--
 			}
-			scratch[position+1] = key
+			sortScratch[position+1] = key
 		}
 		begin = end
 	}
-	copy(starts, scratch)
+	copy(starts, sortScratch)
 }
 
 // sortByCount 把直方图原地转换为各桶的写入位置。
@@ -3047,15 +3031,6 @@ func combinationReferencesActive(root parser.Node, active map[uint32]bool) bool 
 	return false
 }
 
-func (scanner *Scanner) findSingleLiteralEnds(data []byte) map[int]map[uint32]int {
-	if scanner == nil {
-		return nil
-	}
-	ends := make(map[int]map[uint32]int)
-	scanner.fillSingleLiteralEnds(data, ends)
-	return ends
-}
-
 // resetLiteralEnds 清空起点到规则结束偏移的映射内容，保留内层 map 以便复用。
 // refreshLiteralEnds 用共享文字索引重建逐起点过滤表；内层 map 跨扫描复用，
 // 只清空内容，避免候选密集时每次扫描都重建哈希表。
@@ -3117,32 +3092,6 @@ func (scanner *Scanner) fillSingleLiteralEnds(data []byte, ends map[int]map[uint
 	}
 }
 
-func hasNonGreedy(n parser.Node) bool {
-	switch v := n.(type) {
-	case parser.Repeat:
-		return !v.Greedy || hasNonGreedy(v.Child)
-	case parser.Lookaround:
-		return hasNonGreedy(v.Child)
-	case parser.Conditional:
-		return hasNonGreedy(v.Yes) || hasNonGreedy(v.No)
-	case parser.Group:
-		return hasNonGreedy(v.Child)
-	case parser.Sequence:
-		for _, c := range v.Elements {
-			if hasNonGreedy(c) {
-				return true
-			}
-		}
-	case parser.Alternation:
-		for _, c := range v.Options {
-			if hasNonGreedy(c) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // firstRepeatPreference 返回从左到右遇到的第一个重复节点的贪婪策略。
 // 没有重复节点时默认选择最长结果。
 func firstRepeatPreference(n parser.Node) bool {
@@ -3172,6 +3121,7 @@ func firstRepeatPreference(n parser.Node) bool {
 				return value, true
 			}
 			return walk(v.No)
+		default:
 		}
 		return false, false
 	}
@@ -3251,7 +3201,7 @@ func matchRuleIntoArena(rule *compiledRule, data []byte, start int, endsBuf []in
 		}
 		patterns := literalAlternatives(rule.root)
 		if len(patterns) > 0 {
-			out := []int{}
+			var out []int
 			for _, literal := range patterns {
 				if rule.ext.Flags&ExtFlagHammingDistance != 0 {
 					end := start + len(literal)
@@ -3278,22 +3228,19 @@ func matchRuleIntoArena(rule *compiledRule, data []byte, start int, endsBuf []in
 					max64 = maxWindow
 				}
 				maxInt := int(^uint(0) >> 1)
-				max := maxInt
+				maxDistance := maxInt
 				if max64 < uint64(maxInt) {
-					max = int(max64)
+					maxDistance = int(max64)
 				}
-				low := len(literal) - max
-				if low < 0 {
-					low = 0
-				}
+				low := max(len(literal)-maxDistance, 0)
 				high := len(data) - start
-				if max <= maxInt-len(literal) && len(literal)+max < high {
-					high = len(literal) + max
+				if maxDistance <= maxInt-len(literal) && len(literal)+maxDistance < high {
+					high = len(literal) + maxDistance
 				}
 				for n := low; n <= high; n++ {
-					within := fuzzy.WithinEdit(literal, data[start:start+n], max)
+					within := fuzzy.WithinEdit(literal, data[start:start+n], maxDistance)
 					if rule.flags&FlagCaseless != 0 {
-						within = fuzzy.WithinEditFoldASCII(literal, data[start:start+n], max)
+						within = fuzzy.WithinEditFoldASCII(literal, data[start:start+n], maxDistance)
 					}
 					if within {
 						out = append(out, start+n)
@@ -3542,10 +3489,7 @@ func matchEditAtoms(atoms []fuzzyAtom, data []byte, start, maxDistance int, flag
 	if len(atoms) == 0 || maxDistance < 0 || flags&(FlagUTF8|FlagUCP) != 0 || start < 0 || start > len(data) {
 		return nil, false
 	}
-	minLen := len(atoms) - maxDistance
-	if minLen < 0 {
-		minLen = 0
-	}
+	minLen := max(len(atoms)-maxDistance, 0)
 	available := len(data) - start
 	maxLen := available
 	if maxDistance <= available-len(atoms) {
@@ -3591,14 +3535,8 @@ func matchEditAtoms(atoms []fuzzyAtom, data []byte, start, maxDistance int, flag
 		if i+1 <= maxDistance {
 			cur[0] = i + 1
 		}
-		lo := i + 1 - maxDistance
-		if lo < 1 {
-			lo = 1
-		}
-		hi := i + 1 + maxDistance
-		if hi > maxLen {
-			hi = maxLen
-		}
+		lo := max(i+1-maxDistance, 1)
+		hi := min(i+1+maxDistance, maxLen)
 		for width := lo; width <= hi; width++ {
 			cost := 1
 			if fuzzyAtomMatches(atom, data[start+width-1], flags) {
@@ -3615,36 +3553,6 @@ func matchEditAtoms(atoms []fuzzyAtom, data []byte, start, maxDistance int, flag
 		}
 	}
 	return ends, true
-}
-
-func editAtomsWithin(atoms []fuzzyAtom, data []byte, maxDistance int, flags CompileFlag) bool {
-	prev := make([]int, len(data)+1)
-	cur := make([]int, len(data)+1)
-	return editAtomsWithinBuffer(atoms, data, maxDistance, flags, prev, cur)
-}
-
-// editAtomsWithinBuffer 使用调用方提供的双行缓冲区确认编辑距离，避免候选宽度循环重复分配。
-func editAtomsWithinBuffer(atoms []fuzzyAtom, data []byte, maxDistance int, flags CompileFlag, prev, cur []int) bool {
-	if maxDistance < 0 || len(data) == int(^uint(0)>>1) || len(prev) < len(data)+1 || len(cur) < len(data)+1 {
-		return false
-	}
-	prev = prev[:len(data)+1]
-	cur = cur[:len(data)+1]
-	for j := range prev {
-		prev[j] = j
-	}
-	for i, atom := range atoms {
-		cur[0] = i + 1
-		for j, b := range data {
-			cost := 1
-			if fuzzyAtomMatches(atom, b, flags) {
-				cost = 0
-			}
-			cur[j+1] = minInt(prev[j+1]+1, cur[j]+1, prev[j]+cost)
-		}
-		prev, cur = cur, prev
-	}
-	return prev[len(data)] <= maxDistance
 }
 
 func fuzzyAtomMatches(atom fuzzyAtom, value byte, flags CompileFlag) bool {
@@ -3688,13 +3596,13 @@ func minInt(values ...int) int {
 	if len(values) == 0 {
 		return 0
 	}
-	min := values[0]
+	smallest := values[0]
 	for _, value := range values[1:] {
-		if value < min {
-			min = value
+		if value < smallest {
+			smallest = value
 		}
 	}
-	return min
+	return smallest
 }
 
 func containsConditional(n parser.Node) bool {
@@ -3704,21 +3612,18 @@ func containsConditional(n parser.Node) bool {
 	case parser.Group:
 		return containsConditional(v.Child)
 	case parser.Sequence:
-		for _, child := range v.Elements {
-			if containsConditional(child) {
-				return true
-			}
+		if slices.ContainsFunc(v.Elements, containsConditional) {
+			return true
 		}
 	case parser.Alternation:
-		for _, child := range v.Options {
-			if containsConditional(child) {
-				return true
-			}
+		if slices.ContainsFunc(v.Options, containsConditional) {
+			return true
 		}
 	case parser.Repeat:
 		return containsConditional(v.Child)
 	case parser.Lookaround:
 		return containsConditional(v.Child)
+	default:
 	}
 	return false
 }
@@ -3730,21 +3635,18 @@ func containsAny(n parser.Node) bool {
 	case parser.Group:
 		return containsAny(v.Child)
 	case parser.Sequence:
-		for _, child := range v.Elements {
-			if containsAny(child) {
-				return true
-			}
+		if slices.ContainsFunc(v.Elements, containsAny) {
+			return true
 		}
 	case parser.Alternation:
-		for _, child := range v.Options {
-			if containsAny(child) {
-				return true
-			}
+		if slices.ContainsFunc(v.Options, containsAny) {
+			return true
 		}
 	case parser.Repeat:
 		return containsAny(v.Child)
 	case parser.Lookaround:
 		return containsAny(v.Child)
+	default:
 	}
 	return false
 }
@@ -3756,7 +3658,7 @@ func literalPattern(n parser.Node) ([]byte, bool) {
 	case parser.Group:
 		return literalPattern(v.Child)
 	case parser.Sequence:
-		out := []byte{}
+		var out []byte
 		for _, c := range v.Elements {
 			p, ok := literalPattern(c)
 			if !ok {
@@ -3998,7 +3900,7 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 		positive := v.Kind == parser.Lookahead || v.Kind == parser.Lookbehind
 		if v.Kind == parser.Lookbehind || v.Kind == parser.NegativeLookbehind {
 			found := false
-			starts := []int{}
+			var starts []int
 			width, _, ok := parser.FixedWidth(v.Child)
 			if flags&FlagUTF8 != 0 {
 				width, _, ok = parser.FixedWidthUTF8(v.Child)
@@ -4013,11 +3915,8 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 				}
 			}
 			for _, start := range starts {
-				for _, e := range matchNodeBody(v.Child, data, start, flags) {
-					if e == pos {
-						found = true
-						break
-					}
+				if slices.Contains(matchNodeBody(v.Child, data, start, flags), pos) {
+					found = true
 				}
 			}
 			if found == positive {
@@ -4063,20 +3962,17 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 			return ends
 		}
 		positions := []int{pos}
-		results := []int{}
+		var results []int
 		if v.Min == 0 {
 			results = append(results, pos)
 		}
 		maxCount := v.Max
-		budget := len(data) - pos + 1
-		if budget < 1 {
-			budget = 1
-		}
+		budget := max(len(data)-pos+1, 1)
 		if maxCount < 0 || maxCount > budget {
 			maxCount = budget
 		}
 		for count := 1; count <= maxCount; count++ {
-			next := []int{}
+			var next []int
 			for _, p := range positions {
 				next = append(next, matchNodeBody(v.Child, data, p, flags)...)
 			}
@@ -4142,6 +4038,7 @@ func byteRepeatAtom(n parser.Node, flags CompileFlag) bool {
 		return true
 	case parser.Class:
 		return true
+	default:
 	}
 	return false
 }
@@ -4157,6 +4054,7 @@ func matchByteAtom(n parser.Node, value byte, flags CompileFlag) bool {
 		return value != '\n' || flags&FlagDotAll != 0
 	case parser.Class:
 		return classByteMatch(v, value, flags)
+	default:
 	}
 	return false
 }
@@ -4174,10 +4072,7 @@ func matchByteRepeatInto(v parser.Repeat, data []byte, pos int, flags CompileFla
 	if !byteRepeatAtom(v.Child, flags) {
 		return nil, false
 	}
-	limit := len(data) - pos
-	if limit < 0 {
-		limit = 0
-	}
+	limit := max(len(data)-pos, 0)
 	maxCount := v.Max
 	if maxCount < 0 || maxCount > limit {
 		maxCount = limit
@@ -4241,6 +4136,7 @@ func unicodeShorthandClass(value rune, kind parser.ClassKind) bool {
 		return value == '\t' || value == ' ' || value == 0x00a0 || value == 0x1680 || value >= 0x2000 && value <= 0x200a || value == 0x202f || value == 0x205f || value == 0x3000
 	case parser.ClassVerticalSpace:
 		return value == '\n' || value == '\r' || value == '\v' || value == '\f' || value == 0x0085 || value == 0x2028 || value == 0x2029
+	default:
 	}
 	return false
 }
@@ -4280,8 +4176,8 @@ func matchUTF8Literal(literal, data []byte, pos int) []int {
 func unicodeProperty(r rune, name string) bool {
 	name = normalizeScannerUnicodeProperty(name)
 	for _, prefix := range []string{"script=", "sc=", "script:", "generalcategory=", "gc="} {
-		if strings.HasPrefix(name, prefix) {
-			name = strings.TrimPrefix(name, prefix)
+		if after, ok := strings.CutPrefix(name, prefix); ok {
+			name = after
 			break
 		}
 	}
@@ -4331,14 +4227,6 @@ func unicodeProperty(r rune, name string) bool {
 	}
 }
 
-func hasCaptureReference(s parser.Sequence) bool {
-	for _, n := range s.Elements {
-		if containsCaptureSemantics(n) {
-			return true
-		}
-	}
-	return false
-}
 func containsCaptureSemantics(n parser.Node) bool {
 	switch v := n.(type) {
 	case parser.Backreference, parser.Conditional:
@@ -4346,19 +4234,16 @@ func containsCaptureSemantics(n parser.Node) bool {
 	case parser.Group:
 		return containsCaptureSemantics(v.Child)
 	case parser.Sequence:
-		for _, c := range v.Elements {
-			if containsCaptureSemantics(c) {
-				return true
-			}
+		if slices.ContainsFunc(v.Elements, containsCaptureSemantics) {
+			return true
 		}
 	case parser.Alternation:
-		for _, c := range v.Options {
-			if containsCaptureSemantics(c) {
-				return true
-			}
+		if slices.ContainsFunc(v.Options, containsCaptureSemantics) {
+			return true
 		}
 	case parser.Repeat, parser.Lookaround:
 		return containsCaptureSemantics(childNode(v))
+	default:
 	}
 	return false
 }
@@ -4368,6 +4253,7 @@ func childNode(n parser.Node) parser.Node {
 		return v.Child
 	case parser.Lookaround:
 		return v.Child
+	default:
 	}
 	return nil
 }
@@ -4376,29 +4262,18 @@ func containsBackreference(n parser.Node) bool {
 	case parser.Backreference:
 		return true
 	case parser.Sequence:
-		for _, c := range v.Elements {
-			if containsBackreference(c) {
-				return true
-			}
+		if slices.ContainsFunc(v.Elements, containsBackreference) {
+			return true
 		}
 	case parser.Group:
 		return containsBackreference(v.Child)
 	case parser.Alternation:
-		for _, c := range v.Options {
-			if containsBackreference(c) {
-				return true
-			}
+		if slices.ContainsFunc(v.Options, containsBackreference) {
+			return true
 		}
+	default:
 	}
 	return false
-}
-func matchSequenceCaptures(s parser.Sequence, data []byte, pos int, flags CompileFlag) []int {
-	states := matchCaptured(s, data, pos, flags, map[int][]byte{})
-	out := make([]int, 0, len(states))
-	for _, state := range states {
-		out = append(out, state.pos)
-	}
-	return dedup(out)
 }
 
 type captureState struct {
@@ -4450,10 +4325,7 @@ func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, ca
 			out = append(out, states...)
 		}
 		maxCount := value.Max
-		budget := len(data) - pos + 1
-		if budget < 1 {
-			budget = 1
-		}
+		budget := max(len(data)-pos+1, 1)
 		if maxCount < 0 || maxCount > budget {
 			maxCount = budget
 		}
@@ -4556,7 +4428,7 @@ func clearCaptureScope(caps map[int][]byte, group parser.Group) {
 
 // selectAtomicState 保留原子分组首次确定的路径，避免后续回溯改写选择。
 func selectAtomicState(states []captureState, child parser.Node) captureState {
-	if repeat, ok := child.(parser.Repeat); ok && repeat.Greedy {
+	if rep, ok := child.(parser.Repeat); ok && rep.Greedy {
 		return states[len(states)-1]
 	}
 	return states[0]
@@ -4577,16 +4449,21 @@ func dedupCaptureStates(states []captureState) []captureState {
 }
 
 func captureStateKey(state captureState) string {
-	key := strconv.Itoa(state.pos) + ":"
+	var key strings.Builder
+	key.WriteString(strconv.Itoa(state.pos))
+	key.WriteByte(':')
 	indexes := make([]int, 0, len(state.caps))
 	for index := range state.caps {
 		indexes = append(indexes, index)
 	}
 	sort.Ints(indexes)
 	for _, index := range indexes {
-		key += strconv.Itoa(index) + "=" + strconv.Quote(string(state.caps[index])) + ";"
+		key.WriteString(strconv.Itoa(index))
+		key.WriteByte('=')
+		key.WriteString(strconv.Quote(string(state.caps[index])))
+		key.WriteByte(';')
 	}
-	return key
+	return key.String()
 }
 func cloneCaps(in map[int][]byte) map[int][]byte {
 	out := make(map[int][]byte, len(in))
@@ -4624,6 +4501,7 @@ func assertionHolds(kind parser.AssertionKind, data []byte, pos int, flags Compi
 		left := wordBefore(data, pos, flags)
 		right := wordAfter(data, pos, flags)
 		return left != right == (kind == parser.WordBoundary)
+	default:
 	}
 	return false
 }
@@ -4670,10 +4548,7 @@ func (arena *byteChainArena) markSeen(generation int32, pos int) (bool, bool) {
 		return false, false
 	}
 	if pos >= len(arena.marks) {
-		size := len(arena.marks)
-		if size < 64 {
-			size = 64
-		}
+		size := max(len(arena.marks), 64)
 		for size <= pos {
 			size *= 2
 		}
@@ -4814,6 +4689,7 @@ func (arena *byteChainArena) eval(node parser.Node, data []byte, pos int, flags 
 		return arena.evalAlternation(v.Options, data, pos, flags)
 	case parser.Repeat:
 		return arena.evalRepeat(v, data, pos, flags)
+	default:
 	}
 	return nil, false
 }
@@ -4934,10 +4810,7 @@ func (arena *byteChainArena) evalRepeat(v parser.Repeat, data []byte, pos int, f
 		results[0] = pos
 		written = 1
 	}
-	budget := len(data) - pos + 1
-	if budget < 1 {
-		budget = 1
-	}
+	budget := max(len(data)-pos+1, 1)
 	maxCount := v.Max
 	if maxCount < 0 || maxCount > budget {
 		maxCount = budget

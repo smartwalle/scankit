@@ -60,7 +60,7 @@ func conformanceMatrixCorpus() []byte {
 	corpus := "token needle NeEdLe ab cd 123-4567 user@host.example xx xxxx " +
 		"0123456789abcdefghijklmnop ÜNÏCODE word alphabet "
 	// 追加长度跨越多个向量窗口的长前缀，触发窗口与尾部混合路径。
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		corpus += "0123456789abcdef"
 	}
 	corpus += "done"

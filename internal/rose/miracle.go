@@ -79,19 +79,22 @@ func foldASCII(value byte) byte {
 	return value
 }
 
-func (m *Miracle) Find(data []byte) []State                    { return m.find(data, 0, len(data), 0) }
-func (m *Miracle) FindLimit(data []byte, limit int) []State    { return m.find(data, 0, len(data), limit) }
+// Find 返回 data 中全部通过筛选的角色候选。
+func (m *Miracle) Find(data []byte) []State { return m.find(data, 0, len(data), 0) }
+
+// FindLimit 返回最多 limit 个候选，limit 为零时表示不限制。
+func (m *Miracle) FindLimit(data []byte, limit int) []State { return m.find(data, 0, len(data), limit) }
+
+// FindRange 返回 [from, to) 区间内的全部候选。
 func (m *Miracle) FindRange(data []byte, from, to int) []State { return m.find(data, from, to, 0) }
 
+// FindEndRange 返回结束偏移落在 [from, to) 内的候选，最多 limit 个。
 func (m *Miracle) FindEndRange(data []byte, from, to, limit int) []State {
 	if m == nil || from < 0 || to < from || to > len(data) || limit < 0 {
 		return nil
 	}
 	width := len(m.role.Literal)
-	start := from - width
-	if start < 0 {
-		start = 0
-	}
+	start := max(from-width, 0)
 	out := make([]State, 0)
 	for _, state := range m.find(data, start, to, 0) {
 		finish := int(state.Offset) + width

@@ -20,6 +20,7 @@ import (
 	"github.com/smartwalle/scankit/internal/smallengine"
 )
 
+// CompileFlag 是编译期标志位集合，控制匹配语义和输出行为。
 type CompileFlag uint32
 
 // String 返回组合标志名称，未知位以十六进制保留。
@@ -49,10 +50,13 @@ func (f CompileFlag) String() string {
 	return out
 }
 
+// Valid 判断标志位是否只包含已定义的编译标志。
 func (f CompileFlag) Valid() bool {
 	known := FlagCaseless | FlagDotAll | FlagMultiline | FlagSingleMatch | FlagAllowEmpty | FlagUTF8 | FlagUCP | FlagPrefilter | FlagSOMLeftmost | FlagCombination | FlagQuiet
 	return f&^known == 0
 }
+
+// Has 判断指定标志位是否已启用。
 func (f CompileFlag) Has(flag CompileFlag) bool { return f&flag != 0 }
 
 func validateCompileFlags(flags CompileFlag) error {
@@ -68,54 +72,38 @@ func validateCompileFlags(flags CompileFlag) error {
 		return fmt.Errorf("prefilter is not supported with som-leftmost")
 	case flags&FlagCombination != 0 && flags&^(FlagCombination|FlagQuiet|FlagSingleMatch) != 0:
 		return fmt.Errorf("only quiet and singlematch are supported with combination")
+	default:
 	}
 	return nil
 }
 
-// ParseCompileFlag 解析以 | 分隔的公开标志名称。
-func ParseCompileFlag(value string) (CompileFlag, error) {
-	if strings.TrimSpace(value) == "" || strings.TrimSpace(value) == "0" {
-		return 0, nil
-	}
-	var out CompileFlag
-	for _, part := range strings.Split(value, "|") {
-		part = strings.TrimSpace(strings.ToLower(part))
-		found := false
-		for _, item := range []struct {
-			name string
-			flag CompileFlag
-		}{{"caseless", FlagCaseless}, {"dotall", FlagDotAll}, {"multiline", FlagMultiline}, {"singlematch", FlagSingleMatch}, {"allowempty", FlagAllowEmpty}, {"utf8", FlagUTF8}, {"ucp", FlagUCP}, {"prefilter", FlagPrefilter}, {"som-leftmost", FlagSOMLeftmost}, {"combination", FlagCombination}, {"quiet", FlagQuiet}} {
-			if part == item.name {
-				out |= item.flag
-				found = true
-				break
-			}
-		}
-		if !found {
-			return 0, fmt.Errorf("unknown compile flag %q", part)
-		}
-	}
-	if !out.Valid() {
-		return 0, fmt.Errorf("invalid compile flag combination")
-	}
-	return out, nil
-}
-
-// CompileFlag 定义表达式编译选项的位标志。
+// 编译标志的位定义，可按位或组合后写入 [Expression.Flags]，未定义位由 [CompileFlag.Valid] 判定。
 const (
-	FlagCaseless    CompileFlag = 1
-	FlagDotAll      CompileFlag = 2
-	FlagMultiline   CompileFlag = 4
+	// FlagCaseless 忽略大小写：默认按 ASCII 折叠，配合 [FlagUTF8] 时按 Unicode 简单折叠。
+	FlagCaseless CompileFlag = 1
+	// FlagDotAll 让 `.` 匹配换行符。
+	FlagDotAll CompileFlag = 2
+	// FlagMultiline 让 `^` 与 `$` 额外匹配行首和行尾，`\A` 与 `\z` 仍是数据的绝对边界。
+	FlagMultiline CompileFlag = 4
+	// FlagSingleMatch 每条规则只报告首个匹配，之后不再报告该规则的结果。
 	FlagSingleMatch CompileFlag = 8
-	FlagAllowEmpty  CompileFlag = 16
-	FlagUTF8        CompileFlag = 32
-	FlagUCP         CompileFlag = 64
-	FlagPrefilter   CompileFlag = 128
+	// FlagAllowEmpty 放行匹配空串的规则，未开启时 [Compile] 直接报错，同时关闭前缀守卫优化。
+	FlagAllowEmpty CompileFlag = 16
+	// FlagUTF8 按 UTF-8 码位解释模式与输入，匹配起点不会落在续字节上。
+	FlagUTF8 CompileFlag = 32
+	// FlagUCP 让 `\b`、`\w` 这类字符判定按 Unicode 码点而非字节进行，通常与 [FlagUTF8] 同时开启。
+	FlagUCP CompileFlag = 64
+	// FlagPrefilter 启用编译期推导的候选文字做起点过滤，未开启时不建立起点表。
+	FlagPrefilter CompileFlag = 128
+	// FlagSOMLeftmost 同一规则在每个结束偏移只保留起点最早的匹配。
 	FlagSOMLeftmost CompileFlag = 256
+	// FlagCombination 表示模式是布尔组合表达式而非正则，只允许搭配偏移类扩展。
 	FlagCombination CompileFlag = 512
-	FlagQuiet       CompileFlag = 1024
+	// FlagQuiet 只参与内部判定，不向调用方报告该规则的匹配。
+	FlagQuiet CompileFlag = 1024
 )
 
+// Expression 是一条待编译的规则：编号、正则模式和编译标志。
 type Expression struct {
 	Id      uint32
 	Pattern string
@@ -131,68 +119,24 @@ func (e Expression) Validate() error {
 	return e.Ext.Validate()
 }
 
+// ExpressionExtFlag 是扩展约束的标志位集合。
 type ExpressionExtFlag uint64
 
-func (f ExpressionExtFlag) String() string {
-	if f == 0 {
-		return "0"
-	}
-	parts := ""
-	for _, item := range []struct {
-		flag ExpressionExtFlag
-		name string
-	}{{ExtFlagMinOffset, "min-offset"}, {ExtFlagMaxOffset, "max-offset"}, {ExtFlagMinLength, "min-length"}, {ExtFlagEditDistance, "edit-distance"}, {ExtFlagHammingDistance, "hamming-distance"}} {
-		if f&item.flag != 0 {
-			if parts != "" {
-				parts += "|"
-			}
-			parts += item.name
-		}
-	}
-	if unknown := uint64(f &^ (ExtFlagMinOffset | ExtFlagMaxOffset | ExtFlagMinLength | ExtFlagEditDistance | ExtFlagHammingDistance)); unknown != 0 {
-		if parts != "" {
-			parts += "|"
-		}
-		parts += "0x" + strconv.FormatUint(unknown, 16)
-	}
-	return parts
-}
-
-// ParseExpressionExtFlag 解析扩展参数标志名称。
-func ParseExpressionExtFlag(value string) (ExpressionExtFlag, error) {
-	if strings.TrimSpace(value) == "" || strings.TrimSpace(value) == "0" {
-		return 0, nil
-	}
-	var out ExpressionExtFlag
-	for _, part := range strings.Split(value, "|") {
-		part = strings.TrimSpace(strings.ToLower(part))
-		found := false
-		for _, item := range []struct {
-			name string
-			flag ExpressionExtFlag
-		}{{"min-offset", ExtFlagMinOffset}, {"max-offset", ExtFlagMaxOffset}, {"min-length", ExtFlagMinLength}, {"edit-distance", ExtFlagEditDistance}, {"hamming-distance", ExtFlagHammingDistance}} {
-			if part == item.name {
-				out |= item.flag
-				found = true
-				break
-			}
-		}
-		if !found {
-			return 0, fmt.Errorf("unknown extension flag %q", part)
-		}
-	}
-	return out, nil
-}
-
-// ExpressionExtFlag 定义表达式扩展选项的位标志。
+// 表达式扩展标志的位定义，每一位决定 [ExpressionExt] 中对应字段是否参与校验。
 const (
-	ExtFlagMinOffset       ExpressionExtFlag = 1
-	ExtFlagMaxOffset       ExpressionExtFlag = 2
-	ExtFlagMinLength       ExpressionExtFlag = 4
-	ExtFlagEditDistance    ExpressionExtFlag = 8
+	// ExtFlagMinOffset 启用 [ExpressionExt.MinOffset]：匹配结束偏移不得小于该值，值为 0 时不产生约束。
+	ExtFlagMinOffset ExpressionExtFlag = 1
+	// ExtFlagMaxOffset 启用 [ExpressionExt.MaxOffset]：匹配结束偏移不得大于该值，未启用时上界无界。
+	ExtFlagMaxOffset ExpressionExtFlag = 2
+	// ExtFlagMinLength 启用 [ExpressionExt.MinLength]：匹配长度不得小于该值。
+	ExtFlagMinLength ExpressionExtFlag = 4
+	// ExtFlagEditDistance 按编辑距离容错，上限取 [ExpressionExt.EditDistance]，与 [ExtFlagHammingDistance] 互斥。
+	ExtFlagEditDistance ExpressionExtFlag = 8
+	// ExtFlagHammingDistance 按汉明距离容错，上限取 [ExpressionExt.HammingDistance]，与 [ExtFlagEditDistance] 互斥。
 	ExtFlagHammingDistance ExpressionExtFlag = 16
 )
 
+// ExpressionExt 保存偏移、长度与模糊匹配等扩展约束。
 type ExpressionExt struct {
 	Flags           ExpressionExtFlag
 	MinOffset       uint64
@@ -202,6 +146,7 @@ type ExpressionExt struct {
 	HammingDistance uint32
 }
 
+// Clone 返回扩展约束的副本，nil 输入返回 nil。
 func (e *ExpressionExt) Clone() *ExpressionExt {
 	if e == nil {
 		return nil
@@ -230,23 +175,25 @@ func (e *ExpressionExt) OffsetAllowed(offset uint64) bool {
 func (e *ExpressionExt) EndOffsetAllowed(offset uint64) bool { return e.OffsetAllowed(offset) }
 
 // OffsetRange 返回启用的结束偏移范围；未设置边界时返回无界标记。
-func (e *ExpressionExt) OffsetRange() (min, max uint64, bounded bool) {
+func (e *ExpressionExt) OffsetRange() (minOffset, maxOffset uint64, bounded bool) {
 	if e == nil {
 		return 0, 0, false
 	}
 	if e.Flags&ExtFlagMinOffset != 0 {
-		min = e.MinOffset
+		minOffset = e.MinOffset
 	}
 	if e.Flags&ExtFlagMaxOffset != 0 {
-		max, bounded = e.MaxOffset, true
+		maxOffset, bounded = e.MaxOffset, true
 	}
-	return min, max, bounded
+	return minOffset, maxOffset, bounded
 }
 
 // LengthAllowed 判断指定长度是否满足扩展最小长度约束。
 func (e *ExpressionExt) LengthAllowed(length uint64) bool {
 	return e == nil || e.Flags&ExtFlagMinLength == 0 || length >= e.MinLength
 }
+
+// Validate 检查扩展标志组合是否合法，例如偏移区间与模糊距离的互斥关系。
 func (e *ExpressionExt) Validate() error {
 	if e == nil {
 		return nil
@@ -298,7 +245,7 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 		if flags&FlagUTF8 != 0 && !utf8.ValidString(pattern) {
 			return nil, &compiler.CompileError{Kind: compiler.ErrorSyntax, Expression: i, Position: 0, Message: "pattern is not valid UTF-8"}
 		}
-		if err := validateCompileFlags(flags); err != nil {
+		if err = validateCompileFlags(flags); err != nil {
 			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}
 		}
 		if flags&FlagCombination != 0 && expression.Ext != nil && expression.Ext.Flags&^(ExtFlagMinOffset|ExtFlagMaxOffset) != 0 {
@@ -317,17 +264,17 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 		}
 		if err != nil {
 			position := 0
-			if parseErr, ok := err.(*parser.ParseError); ok {
+			if parseErr, ok := errors.AsType[*parser.ParseError](err); ok {
 				position = parseErr.Position
 			}
 			return nil, &compiler.CompileError{Kind: compiler.ErrorSyntax, Expression: i, Position: position, Message: err.Error()}
 		}
 		root = parser.Normalize(root)
 		if flags&FlagCombination != 0 {
-			if err := parser.Validate(root); err != nil {
+			if err = parser.Validate(root); err != nil {
 				return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}
 			}
-			if err := expression.Ext.Validate(); err != nil {
+			if err = expression.Ext.Validate(); err != nil {
 				return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}
 			}
 			var extCopy *ExpressionExt
@@ -339,7 +286,7 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			}
 			comboBytes := uint64(len(expression.Pattern))
 			totalUsage.Add(compiler.Usage{ProgramBytes: comboBytes, MemoryBytes: comboBytes})
-			if err := limits.Check(totalUsage); err != nil {
+			if err = limits.Check(totalUsage); err != nil {
 				return nil, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Message: err.Error()}
 			}
 			info := compiler.DeriveExpressionInfo(expression.Id, uint32(flags), uint64(extFlags), root, nil)
@@ -350,10 +297,10 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 		if parser.Nullable(root) && flags&FlagAllowEmpty == 0 {
 			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: "empty match requires allow-empty flag"}
 		}
-		if err := parser.Validate(root); err != nil {
+		if err = parser.Validate(root); err != nil {
 			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Position: 0, Message: err.Error()}
 		}
-		if err := expression.Ext.Validate(); err != nil {
+		if err = expression.Ext.Validate(); err != nil {
 			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}
 		}
 		ng, err := nfagraph.NewBuilder().Build(root)
@@ -368,7 +315,7 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			}
 			usage := compiler.Usage{ProgramBytes: uint64(len(pattern)), MemoryBytes: uint64(len(pattern))}
 			totalUsage.Add(usage)
-			if err := limits.Check(totalUsage); err != nil {
+			if err = limits.Check(totalUsage); err != nil {
 				return nil, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Position: 0, Message: err.Error()}
 			}
 			info := compiler.DeriveExpressionInfo(expression.Id, uint32(flags), uint64(extFlags), root, nil)
@@ -378,21 +325,19 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			rules = append(rules, compiledRule{id: expression.Id, root: root, flags: flags, ext: extCopy, info: info})
 			continue
 		}
-		optimized := true
-		var optimizeErr error
-		if _, err := nfagraph.Optimize(ng); err != nil {
+		var optimizeBailout string
+		if _, err = nfagraph.Optimize(ng); err != nil {
 			// 优化不收敛不应使合法表达式编译失败；Optimize 已恢复原图，
 			// 后续继续使用未优化图。optimization-fallback 元数据携带 Optimize
 			// 报告的 pass 粒度原因，便于调用方按 pass 排查震荡源。
-			optimized = false
-			optimizeErr = err
+			optimizeBailout = "optimization-fallback: " + err.Error()
 		}
-		if err := ctx.Err(); err != nil {
+		if err = ctx.Err(); err != nil {
 			return nil, &compiler.CompileError{Kind: compiler.ErrorCancelled, Expression: i, Message: "compile cancelled"}
 		}
 		graphEdges := uint64(ng.EdgeCount())
 		graphUsage := compiler.Usage{GraphVertices: uint64(ng.NodeCount()), GraphEdges: graphEdges}
-		if err := limits.Check(totalUsage.Merge(graphUsage)); err != nil {
+		if err = limits.Check(totalUsage.Merge(graphUsage)); err != nil {
 			return nil, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Position: 0, Message: err.Error()}
 		}
 		dfaLimit := 0
@@ -421,7 +366,7 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 		edges := uint64(0)
 		roles := uint64(0)
 		for _, id := range ng.Flow.Vertices() {
-			if err := ctx.Err(); err != nil {
+			if err = ctx.Err(); err != nil {
 				return nil, &compiler.CompileError{Kind: compiler.ErrorCancelled, Expression: i, Message: "compile cancelled"}
 			}
 			edges += uint64(len(ng.Flow.Successors(id)))
@@ -442,10 +387,11 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 				if autoProgram.NFA != nil {
 					usage.MemoryBytes = satAdd64(usage.MemoryBytes, autoProgram.NFA.MemoryBytes())
 				}
+			default:
 			}
 		}
 		totalUsage.Add(usage)
-		if err := limits.Check(totalUsage); err != nil {
+		if err = limits.Check(totalUsage); err != nil {
 			return nil, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Position: 0, Message: err.Error()}
 		}
 		extFlags := ExpressionExtFlag(0)
@@ -478,12 +424,8 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 		if autoProgram == nil && (features.Stateful || features.Assertions || features.UTF8 || features.UCP) {
 			info.SetBailout("feature-gate")
 		}
-		if !optimized {
-			if optimizeErr != nil {
-				info.SetBailout("optimization-fallback: " + optimizeErr.Error())
-			} else {
-				info.SetBailout("optimization-fallback")
-			}
+		if optimizeBailout != "" {
+			info.SetBailout(optimizeBailout)
 		}
 		rule := compiledRule{id: expression.Id, root: root, flags: flags, ext: extCopy, info: info, prefilter: candidate, program: autoProgram}
 		if extCopy == nil && !parser.HasScopedFlags(root) && flags&(FlagCaseless|FlagUTF8|FlagUCP|FlagMultiline|FlagDotAll) == 0 {
@@ -494,11 +436,12 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 						rule.smallWrite = small.Write
 					case smallengine.KindSmallBlock:
 						rule.smallBlock = small.Block
+					default:
 					}
 				}
 			}
-			if unit, min, max, greedy, ok := repeatedLiteralPattern(root); ok {
-				rule.repeat, err = repeat.New(unit, min, max, greedy)
+			if unit, minCount, maxCount, greedy, ok := repeatedLiteralPattern(root); ok {
+				rule.repeat, err = repeat.New(unit, minCount, maxCount, greedy)
 				if err != nil {
 					return nil, &compiler.CompileError{Kind: compiler.ErrorUnsupported, Expression: i, Position: 0, Message: err.Error()}
 				}
@@ -587,11 +530,11 @@ func applyExpressionAttributes(info *compiler.ExpressionInfo, flags CompileFlag,
 func consumeLeadingInlineFlags(pattern string, flags CompileFlag) (string, CompileFlag, bool, error) {
 	extended := false
 	for strings.HasPrefix(pattern, "(?") {
-		close := strings.IndexByte(pattern, ')')
-		if close < 0 {
+		closeIdx := strings.IndexByte(pattern, ')')
+		if closeIdx < 0 {
 			break
 		}
-		body := pattern[2:close]
+		body := pattern[2:closeIdx]
 		if body == "" || strings.ContainsAny(body, ":<>=!'(") {
 			break
 		}
@@ -599,30 +542,31 @@ func consumeLeadingInlineFlags(pattern string, flags CompileFlag) (string, Compi
 		valid := true
 		changed := false
 		for _, value := range body {
+			if value == 'x' {
+				changed = true
+				extended = enable
+				continue
+			}
+			var flag CompileFlag
 			switch value {
 			case '-':
 				enable = false
-			case 'i', 's', 'm':
-				changed = true
-				var flag CompileFlag
-				switch value {
-				case 'i':
-					flag = FlagCaseless
-				case 's':
-					flag = FlagDotAll
-				case 'm':
-					flag = FlagMultiline
-				}
-				if enable {
-					flags |= flag
-				} else {
-					flags &^= flag
-				}
-			case 'x':
-				changed = true
-				extended = enable
+				continue
+			case 'i':
+				flag = FlagCaseless
+			case 's':
+				flag = FlagDotAll
+			case 'm':
+				flag = FlagMultiline
 			default:
 				valid = false
+				continue
+			}
+			changed = true
+			if enable {
+				flags |= flag
+			} else {
+				flags &^= flag
 			}
 		}
 		if !changed {
@@ -631,7 +575,7 @@ func consumeLeadingInlineFlags(pattern string, flags CompileFlag) (string, Compi
 		if !valid {
 			return "", flags, extended, fmt.Errorf("unsupported inline flag")
 		}
-		pattern = pattern[close+1:]
+		pattern = pattern[closeIdx+1:]
 	}
 	return pattern, flags, extended, nil
 }
@@ -718,6 +662,7 @@ func literalPrefix(n parser.Node) ([]byte, bool) {
 		if v.Min > 0 {
 			return literalPrefix(v.Child)
 		}
+	default:
 	}
 	return nil, false
 }
@@ -755,6 +700,7 @@ func literalWhole(n parser.Node) ([]byte, bool) {
 			out = append(out, part...)
 		}
 		return out, true
+	default:
 	}
 	return nil, false
 }
@@ -769,38 +715,4 @@ func repeatedLiteralPattern(n parser.Node) ([]byte, int, int, bool, bool) {
 	default:
 		return nil, 0, 0, false, false
 	}
-}
-
-func literalAlternation(n parser.Node) ([][]byte, bool) {
-	switch v := n.(type) {
-	case parser.Group:
-		return literalAlternation(v.Child)
-	case parser.Alternation:
-		if len(v.Options) < 2 {
-			return nil, false
-		}
-		out := make([][]byte, 0, len(v.Options))
-		for _, option := range v.Options {
-			lit, ok := literalPattern(option)
-			if !ok || len(lit) == 0 {
-				return nil, false
-			}
-			out = append(out, lit)
-		}
-		return out, true
-	default:
-		return nil, false
-	}
-}
-
-func fixedLiteralAlternation(alts [][]byte) bool {
-	if len(alts) < 2 || len(alts[0]) == 0 {
-		return false
-	}
-	for _, alt := range alts[1:] {
-		if len(alt) != len(alts[0]) {
-			return false
-		}
-	}
-	return true
 }

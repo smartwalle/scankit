@@ -8,6 +8,7 @@ import (
 
 const maxScratchBytes = 64 << 20
 
+// Scratch 是单次扫描内复用的分区缓冲区集合。
 type Scratch struct {
 	Bytes  []byte
 	States []uint32
@@ -29,6 +30,7 @@ func (s *Scratch) Validate() error {
 	return nil
 }
 
+// Clone 返回各分区字节内容的深拷贝。
 func (s *Scratch) Clone() *Scratch {
 	if s == nil {
 		return nil
@@ -36,7 +38,10 @@ func (s *Scratch) Clone() *Scratch {
 	return &Scratch{Bytes: append([]byte(nil), s.Bytes...), States: append([]uint32(nil), s.States...), Report: append([]uint32(nil), s.Report...), Temp: append([]byte(nil), s.Temp...)}
 }
 
+// New 创建空的工作区，各分区在首次预留时才分配。
 func New() *Scratch { return &Scratch{} }
+
+// Reset 将各分区长度归零并保留已有容量。
 func (s *Scratch) Reset() {
 	if s == nil {
 		return
@@ -47,6 +52,7 @@ func (s *Scratch) Reset() {
 	s.Temp = s.Temp[:0]
 }
 
+// ReserveBytes 复用或扩容字节分区，并返回长度为 n 的切片。
 func (s *Scratch) ReserveBytes(n int) []byte {
 	if s == nil || n < 0 {
 		return nil
@@ -57,6 +63,8 @@ func (s *Scratch) ReserveBytes(n int) []byte {
 	s.Bytes = s.Bytes[:n]
 	return s.Bytes
 }
+
+// ReserveStates 复用或扩容状态分区，并返回长度为 n 的切片。
 func (s *Scratch) ReserveStates(n int) []uint32 {
 	if s == nil || n < 0 {
 		return nil
@@ -67,6 +75,8 @@ func (s *Scratch) ReserveStates(n int) []uint32 {
 	s.States = s.States[:n]
 	return s.States
 }
+
+// ReserveReport 复用或扩容报告分区，并返回长度为 n 的切片。
 func (s *Scratch) ReserveReport(n int) []uint32 {
 	if s == nil || n < 0 {
 		return nil
@@ -77,6 +87,8 @@ func (s *Scratch) ReserveReport(n int) []uint32 {
 	s.Report = s.Report[:n]
 	return s.Report
 }
+
+// ReserveTemp 复用或扩容临时分区，并返回长度为 n 的切片。
 func (s *Scratch) ReserveTemp(n int) []byte {
 	if s == nil || n < 0 {
 		return nil
@@ -87,6 +99,8 @@ func (s *Scratch) ReserveTemp(n int) []byte {
 	s.Temp = s.Temp[:n]
 	return s.Temp
 }
+
+// Capacity 返回字节分区与状态分区的容量。
 func (s *Scratch) Capacity() (int, int) {
 	if s == nil {
 		return 0, 0
@@ -109,24 +123,32 @@ func (s *Scratch) ReportCapacity() int {
 	}
 	return cap(s.Report)
 }
+
+// TempCapacity 返回临时分区的容量。
 func (s *Scratch) TempCapacity() int {
 	if s == nil {
 		return 0
 	}
 	return cap(s.Temp)
 }
+
+// StateCount 返回状态分区当前长度。
 func (s *Scratch) StateCount() int {
 	if s == nil {
 		return 0
 	}
 	return len(s.States)
 }
+
+// ReportCount 返回报告分区当前长度。
 func (s *Scratch) ReportCount() int {
 	if s == nil {
 		return 0
 	}
 	return len(s.Report)
 }
+
+// TempCount 返回临时分区当前长度。
 func (s *Scratch) TempCount() int {
 	if s == nil {
 		return 0
@@ -217,6 +239,8 @@ func (s *Scratch) Zero() {
 	}
 	s.Reset()
 }
+
+// ResetReport 只清空报告分区，保留其他分区内容。
 func (s *Scratch) ResetReport() {
 	if s != nil {
 		s.Report = s.Report[:0]
@@ -275,9 +299,13 @@ func (s *Scratch) CopyInto(dst *Scratch) bool {
 	return true
 }
 
+// Pool 复用工作区实例，降低高并发扫描的分配压力。
 type Pool struct{ pool sync.Pool }
 
+// NewPool 创建工作区对象池。
 func NewPool() *Pool { p := &Pool{}; p.pool.New = func() any { return New() }; return p }
+
+// Get 取出已重置的工作区，池为 nil 时退化为新建。
 func (p *Pool) Get() *Scratch {
 	if p == nil {
 		return New()
@@ -286,6 +314,8 @@ func (p *Pool) Get() *Scratch {
 	s.Reset()
 	return s
 }
+
+// Put 重置工作区后放回池中，非零长度的分区内容会被丢弃。
 func (p *Pool) Put(s *Scratch) {
 	if p != nil && s != nil {
 		s.Reset()

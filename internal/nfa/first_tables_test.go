@@ -33,13 +33,13 @@ func expectedNFAStarts(data []byte, first [4]uint64, acceptsEmpty bool) []int {
 	}
 	if byteMaskEmpty(first) {
 		out := make([]int, 0, len(data))
-		for start := 0; start < len(data); start++ {
+		for start := range data {
 			out = append(out, start)
 		}
 		return out
 	}
 	out := make([]int, 0, len(data))
-	for start := 0; start < len(data); start++ {
+	for start := range data {
 		if first[data[start]/64]&(1<<uint(data[start]%64)) != 0 {
 			out = append(out, start)
 		}

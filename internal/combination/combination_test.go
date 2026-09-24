@@ -1,8 +1,9 @@
 package combination
 
 import (
-	"github.com/smartwalle/scankit/internal/parser"
 	"testing"
+
+	"github.com/smartwalle/scankit/internal/parser"
 )
 
 func TestEvaluate(t *testing.T) {
@@ -80,7 +81,7 @@ func TestHitSetEqualIgnoresFalseEntries(t *testing.T) {
 
 func FuzzEvaluate(f *testing.F) {
 	f.Add("1|2", uint32(1))
-	f.Fuzz(func(t *testing.T, expr string, id uint32) {
+	f.Fuzz(func(_ *testing.T, expr string, id uint32) {
 		r, err := parser.ParseCombination(expr)
 		if err != nil {
 			return

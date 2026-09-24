@@ -1,8 +1,9 @@
 package rose
 
 import (
-	"github.com/smartwalle/scankit/internal/report"
 	"testing"
+
+	"github.com/smartwalle/scankit/internal/report"
 )
 
 func TestSchedulerOrderingAndSingleMatch(t *testing.T) {
@@ -181,7 +182,7 @@ func TestSchedulerRunStepLimitPreservesUnexecutedState(t *testing.T) {
 	s.SetMaxSteps(1)
 	s.Activate(State{RoleID: 1, Offset: 0})
 	s.Activate(State{RoleID: 2, Offset: 1})
-	s.Run(func(st State) []report.Event { return nil })
+	s.Run(func(_ State) []report.Event { return nil })
 	if s.QueueLen() != 1 || s.ActiveCount() != 1 {
 		t.Fatalf("步数限制丢失未执行状态: queue=%d active=%d", s.QueueLen(), s.ActiveCount())
 	}

@@ -5,14 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
+
 	"github.com/smartwalle/scankit/internal/dfa"
 	"github.com/smartwalle/scankit/internal/nfa"
 	"github.com/smartwalle/scankit/internal/nfagraph"
-	"sort"
 )
 
+// Kind 标识通用执行后端的类型。
 type Kind uint8
 
+// KindNFA 表示 NFA 后端，KindDFA 表示确定性后端。
 const (
 	KindNFA Kind = iota + 1
 	KindDFA
@@ -29,6 +33,7 @@ func (k Kind) String() string {
 	}
 }
 
+// Program 是后端程序的统一封装，同一时刻只承载 NFA 或 DFA 之一。
 type Program struct {
 	Kind Kind
 	NFA  *nfa.Program
@@ -72,8 +77,10 @@ func (p *Program) KindValue() Kind {
 // Empty 判断程序是否缺少可执行后端。
 func (p *Program) Empty() bool { return p == nil || (p.NFA == nil && p.DFA == nil) }
 
+// Version 是当前序列化格式的版本号。
 const Version = 2
 
+// Validate 检查后端类型与内部数据是否自洽。
 func (p *Program) Validate() error {
 	if p == nil {
 		return fmt.Errorf("nil engine program")
@@ -111,6 +118,8 @@ func (p *Program) Validate() error {
 	}
 	return nil
 }
+
+// Dump 将程序序列化为携带版本号和后端类型的 JSON 负载。
 func (p *Program) Dump() ([]byte, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
@@ -132,6 +141,8 @@ func (p *Program) Dump() ([]byte, error) {
 		Program []byte `json:"program"`
 	}{Version, p.Kind, raw})
 }
+
+// Load 从 JSON 负载恢复程序，并兼容版本 1 的图快照格式。
 func Load(data []byte) (*Program, error) {
 	if len(data) > 64<<20 {
 		return nil, fmt.Errorf("engine payload exceeds size limit")
@@ -173,6 +184,7 @@ func Load(data []byte) (*Program, error) {
 	}
 }
 
+// Build 使用默认预算构建指定后端的程序。
 func Build(g *nfagraph.Graph, kind Kind) (*Program, error) {
 	return BuildWithLimits(g, kind, 0)
 }
@@ -217,6 +229,7 @@ func BuildWithDFAOptions(g *nfagraph.Graph, kind Kind, options dfa.CompileOption
 	return Build(g, kind)
 }
 
+// Clone 深拷贝程序，结果与原程序不共享后端状态。
 func (p *Program) Clone() *Program {
 	if p == nil {
 		return nil
@@ -230,6 +243,8 @@ func (p *Program) Clone() *Program {
 	}
 	return out
 }
+
+// MatchAt 返回指定起点的全部结束偏移，不限制上界。
 func (p *Program) MatchAt(data []byte, start int) []int {
 	return p.MatchAtLimit(data, start, 0)
 }
@@ -246,12 +261,7 @@ func (p *Program) RunExact(data []byte) bool {
 	if p.NFA == nil {
 		return false
 	}
-	for _, end := range p.NFA.MatchAt(data, 0) {
-		if end == len(data) {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(p.NFA.MatchAt(data, 0), len(data))
 }
 
 // LongestMatchAt 返回指定起点的最长接受结束偏移。
@@ -326,11 +336,12 @@ func (p *Program) SpansRange(data []byte, from, to int) [][2]int {
 	return out
 }
 
+// Match 返回 data 全部起点的结束偏移，按数值升序去重。
 func (p *Program) Match(data []byte) []int {
 	if p == nil {
 		return nil
 	}
-	out := []int{}
+	var out []int
 	seen := map[int]struct{}{}
 	for i := 0; i <= len(data); i++ {
 		for _, end := range p.MatchAt(data, i) {
@@ -355,6 +366,8 @@ func (p *Program) MatchLimit(data []byte, limit int) []int {
 	}
 	return out
 }
+
+// MatchFirst 返回最早出现的匹配起点与结束偏移。
 func (p *Program) MatchFirst(data []byte) (start, end int, ok bool) {
 	if p == nil {
 		return 0, 0, false
@@ -447,12 +460,7 @@ func (p *Program) AcceptsAt(data []byte, start, end int) bool {
 	if p == nil || start < 0 || end < start || end > len(data) {
 		return false
 	}
-	for _, got := range p.MatchAt(data, start) {
-		if got == end {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(p.MatchAt(data, start), end)
 }
 
 // EquivalentResults 比较当前后端与另一后端在输入上的匹配区间。
@@ -516,6 +524,7 @@ func (p *Program) SpansRangeLimit(data []byte, from, to, limit int) [][2]int {
 	return out
 }
 
+// SelectKind 按确定化收益和状态爆炸风险选择后端类型。
 func SelectKind(g *nfagraph.Graph) Kind {
 	if g == nil || !dfa.ByteTableEligible(g) {
 		return KindNFA
@@ -603,6 +612,8 @@ func ExplainSelection(g *nfagraph.Graph) SelectionInfo {
 	}
 	return info
 }
+
+// SelectKindWithLimit 在确定性状态超出 limit 时回退到 NFA。
 func SelectKindWithLimit(g *nfagraph.Graph, limit int) Kind {
 	return SelectKindWithStateBudget(g, limit)
 }
@@ -621,6 +632,8 @@ func SelectKindWithStateBudget(g *nfagraph.Graph, limit int) Kind {
 	}
 	return KindDFA
 }
+
+// CompileAuto 按图特征自动选择后端并构建程序。
 func CompileAuto(g *nfagraph.Graph) (*Program, error) { return Build(g, SelectKind(g)) }
 
 // CompileAutoWithLimits 按图特征选择后端并应用确定性状态限制。
@@ -647,6 +660,8 @@ func CompileAutoWithFeatures(g *nfagraph.Graph, features SelectionFeatures, dfaL
 	}
 	return p, err
 }
+
+// BackendName 返回后端名称，空程序返回空字符串。
 func (p *Program) BackendName() string {
 	if p == nil {
 		return ""
@@ -656,6 +671,8 @@ func (p *Program) BackendName() string {
 	}
 	return "nfa"
 }
+
+// StateCount 返回后端的状态数量，空程序返回 0。
 func (p *Program) StateCount() int {
 	if p == nil {
 		return 0

@@ -12,7 +12,7 @@ func TestCloneGraph(t *testing.T) {
 
 func TestPostOrderHandlesDeepGraph(t *testing.T) {
 	g := NewDirected()
-	for i := 0; i < 10000; i++ {
+	for i := range 10000 {
 		g.AddVertex(Vertex(i))
 		if i > 0 {
 			g.AddEdge(Vertex(i-1), Vertex(i))

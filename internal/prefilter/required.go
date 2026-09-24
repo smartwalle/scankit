@@ -2,6 +2,7 @@ package prefilter
 
 import (
 	"math"
+	"slices"
 
 	"github.com/smartwalle/scankit/internal/parser"
 )
@@ -125,13 +126,13 @@ func sequencePlan(elements []parser.Node) (plan, bool) {
 	// 候选。类中可能包含 `e` 这类高频字节，单字节候选的命中密度与大块输入同阶，
 	// 合并后密度回落到与输入内容无关的水平；两个计划都参与打分，只有总分更高时
 	// 才会替换原候选，其余模式的提取结果保持不变。
-	consider := func(steps []literalStep, min, max int, back []byte, trail []literalStep, trailLen int) {
+	consider := func(steps []literalStep, minWidth, maxWidth int, back []byte, trail []literalStep, trailLen int) {
 		if len(steps) == 0 {
 			return
 		}
 		candidate := plan{variants: make([]planVariant, 0, len(steps))}
 		for _, step := range steps {
-			candidate.variants = append(candidate.variants, planVariant{value: step.value, min: min, max: max, back: back, class: step.class})
+			candidate.variants = append(candidate.variants, planVariant{value: step.value, min: minWidth, max: maxWidth, back: back, class: step.class})
 		}
 		if score := planScore(candidate); score > bestScore {
 			best, bestScore, found = candidate, score, true
@@ -139,10 +140,10 @@ func sequencePlan(elements []parser.Node) (plan, bool) {
 		if !classOnlySingleByte(candidate.variants) {
 			return
 		}
-		if len(trail) == 0 || trailLen <= 0 || min < trailLen || len(trail)*len(steps) > maxVariants {
+		if len(trail) == 0 || trailLen <= 0 || minWidth < trailLen || len(trail)*len(steps) > maxVariants {
 			return
 		}
-		mergedMin, mergedMax := min-trailLen, max
+		mergedMin, mergedMax := minWidth-trailLen, maxWidth
 		if mergedMax >= 0 {
 			mergedMax -= trailLen
 		}
@@ -197,16 +198,16 @@ func sequencePlan(elements []parser.Node) (plan, bool) {
 		if i == len(elements) {
 			break
 		}
-		min, max, ok := parser.WidthRange(elements[i])
+		minWidth, maxWidth, ok := parser.WidthRange(elements[i])
 		if !ok {
 			break
 		}
-		prefixMin += min
+		prefixMin += minWidth
 		if prefixMax >= 0 {
-			if max < 0 {
+			if maxWidth < 0 {
 				prefixMax = -1
 			} else {
-				prefixMax += max
+				prefixMax += maxWidth
 			}
 		}
 	}
@@ -373,6 +374,7 @@ func expandRepeatSteps(v parser.Repeat) ([][]literalStep, bool) {
 		return [][]literalStep{{{}}}, true
 	case v.Min < 1 || v.Max < 0:
 		return nil, false
+	default:
 	}
 	child := mustPrefix(v.Child)
 	if len(child) == 0 {
@@ -504,8 +506,8 @@ func dedupLiteralSteps(steps []literalStep) []literalStep {
 // 序列整体可空且找不到任何必现字节时返回 ok 为 false。
 func trailingLiterals(elements []parser.Node) ([]literalStep, bool) {
 	var out []literalStep
-	for index := len(elements) - 1; index >= 0; index-- {
-		element := elements[index]
+	for _, element := range slices.Backward(elements) {
+
 		if zeroWidthNode(element) {
 			// 零宽结构不消费字节，也不影响末尾字节来自哪个元素。
 			continue
@@ -757,7 +759,7 @@ func classBytes(class parser.Class) ([]byte, bool) {
 		}
 	}
 	out := make([]byte, 0, count)
-	for value := 0; value < 256; value++ {
+	for value := range 256 {
 		matched := set[value]
 		if class.Negated {
 			matched = !matched

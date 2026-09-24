@@ -4,7 +4,10 @@ package util
 // BitSet 是可增长的位集合。零值可直接使用。
 type BitSet struct{ words []uint64 }
 
+// Clone 返回位集合的副本，副本与原集合不共享底层字切片。
 func (b BitSet) Clone() BitSet { return BitSet{words: append([]uint64(nil), b.words...)} }
+
+// Any 判断位集合中是否存在置位。
 func (b BitSet) Any() bool {
 	for _, w := range b.words {
 		if w != 0 {
@@ -13,6 +16,8 @@ func (b BitSet) Any() bool {
 	}
 	return false
 }
+
+// Difference 从 b 中移除 other 已置位的部分。
 func (b *BitSet) Difference(other *BitSet) {
 	if b == nil || other == nil {
 		return
@@ -24,6 +29,7 @@ func (b *BitSet) Difference(other *BitSet) {
 	}
 }
 
+// Union 将 other 的置位并入 b。
 func (b *BitSet) Union(other *BitSet) {
 	if b == nil || other == nil {
 		return
@@ -35,6 +41,8 @@ func (b *BitSet) Union(other *BitSet) {
 		b.words[i] |= v
 	}
 }
+
+// Intersect 保留 b 与 other 同时置位的部分，other 为 nil 时清空 b。
 func (b *BitSet) Intersect(other *BitSet) {
 	if b == nil {
 		return
@@ -144,11 +152,8 @@ func (b BitSet) CountRange(from, to int) int {
 
 // Intersects 判断两个位集合是否存在公共位。
 func (b BitSet) Intersects(other BitSet) bool {
-	limit := len(b.words)
-	if len(other.words) < limit {
-		limit = len(other.words)
-	}
-	for i := 0; i < limit; i++ {
+	limit := min(len(other.words), len(b.words))
+	for i := range limit {
 		if b.words[i]&other.words[i] != 0 {
 			return true
 		}
@@ -178,7 +183,7 @@ func (b BitSet) NextSet(start int) (int, bool) {
 	word := b.words[wordIndex] &^ ((uint64(1) << (start & 63)) - 1)
 	for {
 		if word != 0 {
-			for bit := 0; bit < 64; bit++ {
+			for bit := range 64 {
 				if word&(uint64(1)<<bit) != 0 {
 					return wordIndex*64 + bit, true
 				}
@@ -251,12 +256,12 @@ func (b *BitSet) ClearRange(from, to int) {
 	if len(b.words) == 0 {
 		return
 	}
-	max := len(b.words)*64 - 1
-	if from > max {
+	maxBit := len(b.words)*64 - 1
+	if from > maxBit {
 		return
 	}
-	if to > max {
-		to = max
+	if to > maxBit {
+		to = maxBit
 	}
 	start, end := from>>6, to>>6
 	for i := start; i <= end; i++ {
@@ -283,17 +288,20 @@ func (b BitSet) All() bool {
 	}
 	return true
 }
-func (b BitSet) Len() int        { return len(b.words) * 64 }
-func (b BitSet) Empty() bool     { return !b.Any() }
+
+// Len 返回按 64 位字统计的位数，包含尾部未使用的位。
+func (b BitSet) Len() int { return len(b.words) * 64 }
+
+// Empty 判断位集合是否没有任何置位。
+func (b BitSet) Empty() bool { return !b.Any() }
+
+// Words 返回底层字切片的副本。
 func (b BitSet) Words() []uint64 { return append([]uint64(nil), b.words...) }
 
 // Equal 判断两个位集合的逻辑内容是否一致，忽略尾部零容量差异。
 func (b BitSet) Equal(other BitSet) bool {
-	limit := len(b.words)
-	if len(other.words) > limit {
-		limit = len(other.words)
-	}
-	for i := 0; i < limit; i++ {
+	limit := max(len(other.words), len(b.words))
+	for i := range limit {
 		var left, right uint64
 		if i < len(b.words) {
 			left = b.words[i]
@@ -355,6 +363,7 @@ func (b BitSet) Indices() []int {
 // CharReach 表示 256 个字节的字符集合。
 type CharReach struct{ bits [4]uint64 }
 
+// Clone 返回字符可达集合的副本。
 func (c CharReach) Clone() CharReach { return c }
 
 // Add 加入一个字节。
@@ -444,12 +453,16 @@ func (c CharReach) Count() int {
 	}
 	return count
 }
+
+// Complement 返回对整个字节域取反后的集合。
 func (c CharReach) Complement() CharReach {
 	for i := range c.bits {
 		c.bits[i] = ^c.bits[i]
 	}
 	return c
 }
+
+// Intersects 判断两个集合是否存在交集。
 func (c CharReach) Intersects(other CharReach) bool {
 	for i := range c.bits {
 		if c.bits[i]&other.bits[i] != 0 {
@@ -471,7 +484,7 @@ func (c CharReach) ContainsAll(other CharReach) bool {
 
 // First 返回集合中的最小字节。
 func (c CharReach) First() (byte, bool) {
-	for value := 0; value < 256; value++ {
+	for value := range 256 {
 		if c.Contains(byte(value)) {
 			return byte(value), true
 		}
@@ -497,7 +510,7 @@ func (c CharReach) IsFull() bool {
 // Bytes 返回集合中的全部字节。
 func (c CharReach) Bytes() []byte {
 	out := make([]byte, 0, c.Count())
-	for value := 0; value < 256; value++ {
+	for value := range 256 {
 		if c.Contains(byte(value)) {
 			out = append(out, byte(value))
 		}

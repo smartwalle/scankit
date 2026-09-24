@@ -1,10 +1,11 @@
 package engine
 
 import (
+	"testing"
+
 	"github.com/smartwalle/scankit/internal/dfa"
 	"github.com/smartwalle/scankit/internal/nfagraph"
 	"github.com/smartwalle/scankit/internal/parser"
-	"testing"
 )
 
 func TestProgramValidation(t *testing.T) {
@@ -57,5 +58,5 @@ func TestDFAMinimizedTableRoundTrip(t *testing.T) {
 }
 func FuzzProgramDump(f *testing.F) {
 	f.Add(uint8(1))
-	f.Fuzz(func(t *testing.T, k uint8) { p := &Program{Kind: Kind(k)}; _, _ = p.Dump() })
+	f.Fuzz(func(_ *testing.T, k uint8) { p := &Program{Kind: Kind(k)}; _, _ = p.Dump() })
 }

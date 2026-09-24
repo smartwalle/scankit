@@ -49,9 +49,9 @@ func RunConformance(cases []ConformanceCase) error {
 		if NodeKind(node) != item.Kind {
 			return fmt.Errorf("case %d (%s): kind=%d want=%d", index, item.Name, NodeKind(node), item.Kind)
 		}
-		min, max, ok := WidthRange(node)
-		if item.MinWidth >= 0 && (!ok || min != item.MinWidth || max != item.MaxWidth) {
-			return fmt.Errorf("case %d (%s): width=%d..%d", index, item.Name, min, max)
+		minWidth, maxWidth, ok := WidthRange(node)
+		if item.MinWidth >= 0 && (!ok || minWidth != item.MinWidth || maxWidth != item.MaxWidth) {
+			return fmt.Errorf("case %d (%s): width=%d..%d", index, item.Name, minWidth, maxWidth)
 		}
 	}
 	return nil

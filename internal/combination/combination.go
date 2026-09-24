@@ -3,11 +3,13 @@ package combination
 
 import (
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 
 	"github.com/smartwalle/scankit/internal/parser"
 )
 
+// HitSet 记录本次扫描中命中的规则编号集合。
 type HitSet map[uint32]bool
 
 // Program 是经过验证的组合表达式执行计划。
@@ -51,13 +53,7 @@ func (a *Accumulator) Add(id uint32) bool {
 	if a == nil || a.Program == nil {
 		return false
 	}
-	allowed := false
-	for _, dependency := range a.Program.IDs {
-		if dependency == id {
-			allowed = true
-			break
-		}
-	}
+	allowed := slices.Contains(a.Program.IDs, id)
 	if !allowed {
 		return false
 	}
@@ -80,26 +76,18 @@ func (a *Accumulator) EvaluateAfterAdd(id uint32) (bool, bool) {
 		return false, false
 	}
 	before := a.Program.Evaluate(a.Hits)
-	allowed := false
-	for _, dependency := range a.Program.IDs {
-		if dependency == id {
-			allowed = true
-			break
-		}
-	}
+	allowed := slices.Contains(a.Program.IDs, id)
 	if !allowed {
 		return before, false
 	}
-	wasPresent := a.Has(id)
-	if wasPresent {
+	if a.Has(id) {
 		return before, false
 	}
 	if a.Hits == nil {
 		a.Hits = make(HitSet)
 	}
 	a.Hits.Add(id)
-	after := a.Program.Evaluate(a.Hits)
-	return after, !wasPresent
+	return a.Program.Evaluate(a.Hits), true
 }
 
 // Reset 清除已累计的命中。
@@ -151,9 +139,7 @@ func (h HitSet) Clone() HitSet {
 		return nil
 	}
 	out := make(HitSet, len(h))
-	for id, hit := range h {
-		out[id] = hit
-	}
+	maps.Copy(out, h)
 	return out
 }
 
@@ -222,7 +208,7 @@ func (h HitSet) Snapshot() []uint32 {
 			out = append(out, id)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 
@@ -255,6 +241,7 @@ func (h HitSet) Filter(ids []uint32) HitSet {
 	return out
 }
 
+// Evaluate 按规则命中集合对组合表达式求值。
 func Evaluate(root parser.Node, hits HitSet) bool {
 	switch v := root.(type) {
 	case parser.Combination:
@@ -270,6 +257,7 @@ func Evaluate(root parser.Node, hits HitSet) bool {
 		}
 	case parser.CombinationNot:
 		return !Evaluate(v.Child, hits)
+	default:
 	}
 	return false
 }
@@ -302,6 +290,7 @@ func EvaluateTrace(root parser.Node, hits HitSet) (bool, []uint32) {
 			}
 		case parser.CombinationNot:
 			return !walk(v.Child)
+		default:
 		}
 		return false
 	}
@@ -310,15 +299,17 @@ func EvaluateTrace(root parser.Node, hits HitSet) (bool, []uint32) {
 	for id := range seen {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	return result, ids
 }
 
+// Validate 检查组合表达式的结构是否合法。
 func Validate(root parser.Node) error { return parser.Validate(root) }
 
+// IDs 返回组合表达式引用到的规则编号，按首次出现顺序排列。
 func IDs(root parser.Node) []uint32 {
 	seen := map[uint32]bool{}
-	out := []uint32{}
+	var out []uint32
 	var walk func(parser.Node)
 	walk = func(n parser.Node) {
 		switch v := n.(type) {
@@ -334,6 +325,7 @@ func IDs(root parser.Node) []uint32 {
 			walk(v.Right)
 		case parser.CombinationNot:
 			walk(v.Child)
+		default:
 		}
 	}
 	walk(root)
@@ -349,7 +341,7 @@ func DependencyCycle(dependencies map[uint32][]uint32) []uint32 {
 	for id := range dependencies {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	const (
 		unseen uint8 = iota
 		visiting
@@ -377,6 +369,7 @@ func DependencyCycle(dependencies map[uint32][]uint32) []uint32 {
 				if cycle := visit(child); len(cycle) > 0 {
 					return cycle
 				}
+			default:
 			}
 		}
 		path = path[:len(path)-1]
@@ -401,8 +394,9 @@ func ValidateDependencies(dependencies map[uint32][]uint32) error {
 	return nil
 }
 
+// Missing 返回组合表达式引用但尚未命中的规则编号。
 func Missing(root parser.Node, hits HitSet) []uint32 {
-	missing := []uint32{}
+	var missing []uint32
 	for _, id := range IDs(root) {
 		if !hits[id] {
 			missing = append(missing, id)
@@ -414,7 +408,7 @@ func Missing(root parser.Node, hits HitSet) []uint32 {
 // MissingSorted 返回按编号排序的未命中规则编号。
 func MissingSorted(root parser.Node, hits HitSet) []uint32 {
 	out := Missing(root, hits)
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 

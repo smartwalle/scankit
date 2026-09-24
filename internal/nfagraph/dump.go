@@ -7,8 +7,10 @@ import (
 	"github.com/smartwalle/scankit/internal/graph"
 )
 
+// Version 是当前 NFA 图序列化格式的版本号。
 const Version = 1
 
+// CurrentVersion 返回当前序列化格式的版本号。
 func CurrentVersion() int { return Version }
 
 type dumpGraph struct {
@@ -18,7 +20,10 @@ type dumpGraph struct {
 	Edges   [][2]int `json:"edges"`
 }
 
-func Marshal(g *Graph) ([]byte, error)      { return Dump(g) }
+// Marshal 是 Dump 的别名，返回图的 JSON 表示。
+func Marshal(g *Graph) ([]byte, error) { return Dump(g) }
+
+// Unmarshal 是 Load 的别名，从 JSON 表示恢复图。
 func Unmarshal(data []byte) (*Graph, error) { return Load(data) }
 
 // Dump 返回稳定的 JSON 表示，便于诊断和固定样例测试。
