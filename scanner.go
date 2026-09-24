@@ -414,7 +414,7 @@ func newScanner(rules []compiledRule) *Scanner {
 		index[rule.id] = i
 		order[rule.id] = i
 		hasCombo = hasCombo || rule.comb != nil
-		if rule.ext != nil || parser.HasScopedFlags(rule.root) || rule.flags&(FlagUTF8|FlagUCP|FlagMultiline|FlagDotAll) != 0 {
+		if rule.ext != nil || parser.HasScopedFlags(rule.root) || rule.flags&(CompileUTF8|CompileUCP|CompileMultiline|CompileDotAll) != 0 {
 			continue
 		}
 		candidate := rule.prefilter
@@ -427,8 +427,8 @@ func newScanner(rules []compiledRule) *Scanner {
 			continue
 		}
 		candidateIDs[rule.id] = struct{}{}
-		literals = append(literals, hwlm.Literal{ID: rule.id, Value: append([]byte(nil), candidate...), CaseInsensitive: rule.flags&FlagCaseless != 0})
-		if rule.flags&FlagCaseless == 0 {
+		literals = append(literals, hwlm.Literal{ID: rule.id, Value: append([]byte(nil), candidate...), CaseInsensitive: rule.flags&CompileCaseless != 0})
+		if rule.flags&CompileCaseless == 0 {
 			if literal, exact := literalPattern(rule.root); exact && bytes.Equal(candidate, literal) && (rule.smallWrite != nil || rule.smallBlock != nil) {
 				literalIDs[rule.id] = struct{}{}
 			}
@@ -447,7 +447,7 @@ func newScanner(rules []compiledRule) *Scanner {
 	simpleReports := !hasCombo
 	if simpleReports {
 		for _, rule := range copyRules {
-			if rule.flags&(FlagQuiet|FlagSingleMatch|FlagSOMLeftmost) != 0 {
+			if rule.flags&(CompileQuiet|CompileSingleMatch|CompileSOMLeftmost) != 0 {
 				simpleReports = false
 				break
 			}
@@ -469,7 +469,7 @@ func newScanner(rules []compiledRule) *Scanner {
 		len(candidateIDs) == len(copyRules) && len(literalIDs) == len(copyRules)
 	if scanner.fastLiteral {
 		for _, rule := range copyRules {
-			if rule.flags&(FlagQuiet|FlagSingleMatch) != 0 {
+			if rule.flags&(CompileQuiet|CompileSingleMatch) != 0 {
 				scanner.fastLiteral = false
 				break
 			}
@@ -498,7 +498,7 @@ func requiredIndexEligible(rule compiledRule) bool {
 	if len(rule.required) == 0 {
 		return false
 	}
-	if rule.flags&(FlagCaseless|FlagUTF8|FlagUCP) != 0 {
+	if rule.flags&(CompileCaseless|CompileUTF8|CompileUCP) != 0 {
 		return false
 	}
 	// 模糊匹配允许匹配文字本身发生变化，精确文字候选会漏报。
@@ -887,7 +887,7 @@ func (scanner *Scanner) buildRoseProgram() *rose.Program {
 					if rule.ext != nil && rule.ext.Flags&ExtFlagMinLength != 0 && rule.ext.MinLength > uint64(len(literal)) {
 						continue
 					}
-					role := rose.Role{ID: rule.id, Literal: literal, ReportID: rule.id, CaseInsensitive: rule.flags&FlagCaseless != 0, Confirm: true}
+					role := rose.Role{ID: rule.id, Literal: literal, ReportID: rule.id, CaseInsensitive: rule.flags&CompileCaseless != 0, Confirm: true}
 					if rule.ext != nil {
 						if rule.ext.Flags&ExtFlagMinOffset != 0 {
 							role.MinOffset = rule.ext.MinOffset
@@ -925,7 +925,7 @@ func (scanner *Scanner) buildRoseProgram() *rose.Program {
 				usedIDs[roleID] = struct{}{}
 				nextRoleID++
 			}
-			role := rose.Role{ID: roleID, Literal: literal, ReportID: rule.id, CaseInsensitive: rule.flags&FlagCaseless != 0, Anchored: anchored, EndOfData: endOfData, Confirm: confirm}
+			role := rose.Role{ID: roleID, Literal: literal, ReportID: rule.id, CaseInsensitive: rule.flags&CompileCaseless != 0, Anchored: anchored, EndOfData: endOfData, Confirm: confirm}
 			if rule.ext != nil {
 				if rule.ext.Flags&ExtFlagMinOffset != 0 {
 					role.MinOffset = rule.ext.MinOffset
@@ -1126,7 +1126,7 @@ func (scanner *Scanner) scanRoseInto(data []byte, dst []Match) []Match {
 			// 结果，使用对应规则的完整确认器重新验证当前起点。
 			if index, exists := scanner.ruleIndex[event.ID]; exists && index >= 0 && index < len(scanner.rules) {
 				rule := scanner.rules[index]
-				if rule.flags&FlagQuiet == 0 {
+				if rule.flags&CompileQuiet == 0 {
 					for _, end := range matchRule(rule, data, int(event.From)) {
 						if rule.ext != nil && (!rule.ext.OffsetAllowed(uint64(end)) || !rule.ext.LengthAllowed(uint64(end)-event.From)) {
 							continue
@@ -1146,7 +1146,7 @@ func (scanner *Scanner) scanRoseInto(data []byte, dst []Match) []Match {
 			continue
 		}
 		rule := scanner.rules[index]
-		if rule.flags&FlagQuiet != 0 {
+		if rule.flags&CompileQuiet != 0 {
 			continue
 		}
 		if !role.Confirm {
@@ -1189,7 +1189,7 @@ func (scanner *Scanner) scanRoseInto(data []byte, dst []Match) []Match {
 					seen[match] = struct{}{}
 					out = append(out, match)
 				}
-				if rule.flags&FlagSingleMatch != 0 {
+				if rule.flags&CompileSingleMatch != 0 {
 					singleSeen[rule.id] = true
 				}
 			}
@@ -1221,7 +1221,7 @@ func (scanner *Scanner) scanRoseInto(data []byte, dst []Match) []Match {
 				if _, exists := seen[match]; !exists {
 					seen[match] = struct{}{}
 					out = append(out, match)
-					if rule.flags&FlagSingleMatch != 0 {
+					if rule.flags&CompileSingleMatch != 0 {
 						singleSeen[rule.id] = true
 					}
 				}
@@ -1317,7 +1317,7 @@ func (scanner *Scanner) clone() *Scanner {
 
 // backendEligible 判断规则是否可以直接使用已编译后端完成单次扫描。
 func backendEligible(rule compiledRule) bool {
-	if rule.program == nil || rule.repeat != nil || rule.comb != nil || rule.ext != nil || rule.containsAny || rule.requiresEndOfData || rule.flags&FlagSOMLeftmost != 0 {
+	if rule.program == nil || rule.repeat != nil || rule.comb != nil || rule.ext != nil || rule.containsAny || rule.requiresEndOfData || rule.flags&CompileSOMLeftmost != 0 {
 		return false
 	}
 	// 末尾报告只能在数据末尾触发，字节状态表的普通匹配会提前误报，
@@ -1329,13 +1329,13 @@ func backendEligible(rule compiledRule) bool {
 		return false
 	}
 	if rule.nfaEngine != nil && rule.nfaEngine.Independent() && !rule.nfaEngine.HasUnicode() && !rule.info.RequiresStatefulRuntime() {
-		return rule.flags&(FlagCaseless|FlagUTF8|FlagUCP|FlagMultiline|FlagDotAll|FlagSingleMatch|FlagQuiet) == 0
+		return rule.flags&(CompileCaseless|CompileUTF8|CompileUCP|CompileMultiline|CompileDotAll|CompileSingleMatch|CompileQuiet) == 0
 	}
 	literal, ok := literalPattern(rule.root)
 	if !ok || len(literal) == 0 || hasLiteralSelfOverlap(literal) {
 		return false
 	}
-	return rule.flags&(FlagCaseless|FlagUTF8|FlagUCP|FlagMultiline|FlagDotAll|FlagSingleMatch|FlagQuiet) == 0 && !rule.info.RequiresStatefulRuntime()
+	return rule.flags&(CompileCaseless|CompileUTF8|CompileUCP|CompileMultiline|CompileDotAll|CompileSingleMatch|CompileQuiet) == 0 && !rule.info.RequiresStatefulRuntime()
 }
 
 func requiresEndOfData(root parser.Node) bool {
@@ -1687,15 +1687,15 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 		scanner.fillSingleLiteralEnds(data, literalEnds)
 	}
 	for _, rule := range scanner.rules {
-		// 编译期为所有规则推导出的候选文字只在调用方显式开启 FlagPrefilter 时
+		// 编译期为所有规则推导出的候选文字只在调用方显式开启 CompilePrefilter 时
 		// 参与起点过滤（见 verify），其余规则建立起点表属于无效工作。
-		if rule.flags&FlagPrefilter == 0 || len(rule.prefilter) == 0 || scanner.literalFind != nil {
+		if rule.flags&CompilePrefilter == 0 || len(rule.prefilter) == 0 || scanner.literalFind != nil {
 			continue
 		}
 		if _, indexed := scanner.candidateIDs[rule.id]; indexed && literalEnds != nil {
 			continue
 		}
-		positions := hwlm.FindAll(data, hwlm.Literal{Value: rule.prefilter, CaseInsensitive: rule.flags&FlagCaseless != 0})
+		positions := hwlm.FindAll(data, hwlm.Literal{Value: rule.prefilter, CaseInsensitive: rule.flags&CompileCaseless != 0})
 		if len(positions) == 0 {
 			prefilterStarts[rule.id] = nil
 			continue
@@ -1713,7 +1713,7 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 	// 单个精确文字规则无需创建扫描上下文，直接返回索引命中结果。
 	if !backendOnly && !scanner.hasCombo && len(scanner.rules) == 1 && len(scanner.literalIDs) == 1 && literalEnds != nil {
 		rule := scanner.rules[0]
-		if rule.flags&(FlagQuiet|FlagSingleMatch) == 0 {
+		if rule.flags&(CompileQuiet|CompileSingleMatch) == 0 {
 			for start, byRule := range literalEnds {
 				if end, ok := byRule[rule.id]; ok {
 					matches = append(matches, Match{Id: rule.id, From: uint64(start), To: uint64(end)})
@@ -2108,7 +2108,7 @@ func (scanner *Scanner) backendScanned(ri int, backendOnly, requiredDriven bool)
 // confirmArena 返回该规则可用于字节链快路径的工作区；返回 nil 表示规则
 // 携带捕获、扩展参数或 UTF-8 语义，必须走通用确认路径。
 func (st *blockScanState) confirmArena(rule *compiledRule) *byteChainArena {
-	if rule.hasCapture || rule.ext != nil || rule.flags&(FlagUTF8|FlagUCP) != 0 {
+	if rule.hasCapture || rule.ext != nil || rule.flags&(CompileUTF8|CompileUCP) != 0 {
 		return nil
 	}
 	return &st.ctx.chainArena
@@ -2129,12 +2129,12 @@ func (st *blockScanState) verify(ri int, start int) bool {
 	if start < st.blockedUntil[ri] {
 		return true
 	}
-	if rule.flags&FlagPrefilter != 0 && len(rule.prefilter) > 0 {
+	if rule.flags&CompilePrefilter != 0 && len(rule.prefilter) > 0 {
 		if starts, indexed := st.prefilterStarts[rule.id]; indexed {
 			if _, ok := starts[start]; !ok {
 				return true
 			}
-		} else if start+len(rule.prefilter) > len(st.data) || !hwlm.Contains(st.data[start:start+len(rule.prefilter)], hwlm.Literal{Value: rule.prefilter, CaseInsensitive: rule.flags&FlagCaseless != 0}) {
+		} else if start+len(rule.prefilter) > len(st.data) || !hwlm.Contains(st.data[start:start+len(rule.prefilter)], hwlm.Literal{Value: rule.prefilter, CaseInsensitive: rule.flags&CompileCaseless != 0}) {
 			return true
 		}
 	}
@@ -2256,7 +2256,7 @@ func (st *blockScanState) record(ri int, start int, ends []int) bool {
 			return true
 		}
 	}
-	if rule.flags&FlagSOMLeftmost != 0 {
+	if rule.flags&CompileSOMLeftmost != 0 {
 		if st.somSeen == nil {
 			st.somSeen = make(map[uint32]map[int]struct{})
 		}
@@ -2282,9 +2282,9 @@ func (st *blockScanState) record(ri int, start int, ends []int) bool {
 	if st.scanner.hasCombo {
 		st.comboTriggers = append(st.comboTriggers, report.Event{ID: rule.id, From: uint64(start), To: uint64(end), Flags: uint32(rule.flags)})
 	}
-	quiet := rule.flags&FlagQuiet != 0
+	quiet := rule.flags&CompileQuiet != 0
 	if quiet {
-		if rule.flags&FlagSingleMatch != 0 {
+		if rule.flags&CompileSingleMatch != 0 {
 			st.fired[ri] = true
 		}
 		return true
@@ -2293,7 +2293,7 @@ func (st *blockScanState) record(ri int, start int, ends []int) bool {
 	if end > start {
 		st.blockedUntil[ri] = end
 	}
-	if rule.flags&FlagSingleMatch != 0 {
+	if rule.flags&CompileSingleMatch != 0 {
 		st.fired[ri] = true
 	}
 	return true
@@ -2910,10 +2910,10 @@ func (scanner *Scanner) scanRoseDirectInto(data []byte, dst []Match) []Match {
 			continue
 		}
 		rule := scanner.rules[index]
-		if rule.flags&FlagQuiet != 0 {
+		if rule.flags&CompileQuiet != 0 {
 			continue
 		}
-		if rule.flags&FlagSingleMatch != 0 {
+		if rule.flags&CompileSingleMatch != 0 {
 			if _, exists := single[rule.id]; exists {
 				continue
 			}
@@ -3005,10 +3005,10 @@ func (scanner *Scanner) emitCombinationAt(reports *report.Manager, trigger repor
 			hits[rule.id] = true
 			active[rule.id] = true
 			changed = true
-			if rule.flags&FlagSingleMatch != 0 {
+			if rule.flags&CompileSingleMatch != 0 {
 				fired[rule.id] = true
 			}
-			if rule.flags&FlagQuiet != 0 || emitted[rule.id] || eod && emittedRule[rule.id] {
+			if rule.flags&CompileQuiet != 0 || emitted[rule.id] || eod && emittedRule[rule.id] {
 				continue
 			}
 			reports.Add(report.Event{ID: rule.id, From: trigger.From, To: trigger.To, SOM: trigger.From, Flags: uint32(rule.flags)})
@@ -3150,7 +3150,7 @@ func matchRuleIntoArena(rule *compiledRule, data []byte, start int, endsBuf []in
 		}
 		return dedup(out)
 	}
-	if rule.ext == nil && rule.flags&(FlagCaseless|FlagUTF8|FlagUCP|FlagMultiline|FlagDotAll) == 0 {
+	if rule.ext == nil && rule.flags&(CompileCaseless|CompileUTF8|CompileUCP|CompileMultiline|CompileDotAll) == 0 {
 		if rule.smallWrite != nil && rule.smallWrite.MatchAt(data, start) {
 			return []int{start + rule.smallWrite.Size()}
 		}
@@ -3177,7 +3177,7 @@ func matchRuleIntoArena(rule *compiledRule, data []byte, start int, endsBuf []in
 	if rule.ext != nil && rule.ext.Flags&(ExtFlagEditDistance|ExtFlagHammingDistance) != 0 {
 		// 只有每条分支都能降解为有限的字节原子时才走快速确认；
 		// 其余结构保留完整 AST 求值，避免候选路径造成误报。
-		if paths, ok := fuzzyAtomPaths(rule.root); ok && rule.flags&(FlagUTF8|FlagUCP) == 0 {
+		if paths, ok := fuzzyAtomPaths(rule.root); ok && rule.flags&(CompileUTF8|CompileUCP) == 0 {
 			if rule.ext.Flags&ExtFlagHammingDistance != 0 {
 				maxDistance := boundedDistance(uint64(rule.ext.HammingDistance), len(data)-start)
 				ends := make([]int, 0)
@@ -3209,7 +3209,7 @@ func matchRuleIntoArena(rule *compiledRule, data []byte, start int, endsBuf []in
 						continue
 					}
 					within := fuzzy.WithinHamming(literal, data[start:end], uint32ToInt(rule.ext.HammingDistance))
-					if rule.flags&FlagCaseless != 0 {
+					if rule.flags&CompileCaseless != 0 {
 						within = fuzzy.WithinHammingFoldASCII(literal, data[start:end], uint32ToInt(rule.ext.HammingDistance))
 					}
 					if within {
@@ -3239,7 +3239,7 @@ func matchRuleIntoArena(rule *compiledRule, data []byte, start int, endsBuf []in
 				}
 				for n := low; n <= high; n++ {
 					within := fuzzy.WithinEdit(literal, data[start:start+n], maxDistance)
-					if rule.flags&FlagCaseless != 0 {
+					if rule.flags&CompileCaseless != 0 {
 						within = fuzzy.WithinEditFoldASCII(literal, data[start:start+n], maxDistance)
 					}
 					if within {
@@ -3250,7 +3250,7 @@ func matchRuleIntoArena(rule *compiledRule, data []byte, start int, endsBuf []in
 			return dedup(out)
 		}
 	}
-	if rule.program != nil && !rule.eodReports && !rule.info.RequiresStatefulRuntime() && rule.flags&(FlagCaseless|FlagUTF8|FlagUCP|FlagMultiline|FlagDotAll) == 0 && !containsAny(rule.root) {
+	if rule.program != nil && !rule.eodReports && !rule.info.RequiresStatefulRuntime() && rule.flags&(CompileCaseless|CompileUTF8|CompileUCP|CompileMultiline|CompileDotAll) == 0 && !containsAny(rule.root) {
 		return rule.program.MatchAt(data, start)
 	}
 	return matchNode(rule.root, data, start, rule.flags)
@@ -3462,7 +3462,7 @@ func boundedDistance(value uint64, available int) int {
 }
 
 func matchHammingAtoms(atoms []fuzzyAtom, data []byte, start, maxDistance int, flags CompileFlag) ([]int, bool) {
-	if len(atoms) == 0 || maxDistance < 0 || flags&(FlagUTF8|FlagUCP) != 0 || start < 0 || start > len(data) || len(atoms) > len(data)-start {
+	if len(atoms) == 0 || maxDistance < 0 || flags&(CompileUTF8|CompileUCP) != 0 || start < 0 || start > len(data) || len(atoms) > len(data)-start {
 		return nil, false
 	}
 	distance := 0
@@ -3486,7 +3486,7 @@ func matchHammingAtoms(atoms []fuzzyAtom, data []byte, start, maxDistance int, f
 }
 
 func matchEditAtoms(atoms []fuzzyAtom, data []byte, start, maxDistance int, flags CompileFlag) ([]int, bool) {
-	if len(atoms) == 0 || maxDistance < 0 || flags&(FlagUTF8|FlagUCP) != 0 || start < 0 || start > len(data) {
+	if len(atoms) == 0 || maxDistance < 0 || flags&(CompileUTF8|CompileUCP) != 0 || start < 0 || start > len(data) {
 		return nil, false
 	}
 	minLen := max(len(atoms)-maxDistance, 0)
@@ -3557,7 +3557,7 @@ func matchEditAtoms(atoms []fuzzyAtom, data []byte, start, maxDistance int, flag
 
 func fuzzyAtomMatches(atom fuzzyAtom, value byte, flags CompileFlag) bool {
 	if atom.any {
-		return flags&FlagDotAll != 0 || value != '\n'
+		return flags&CompileDotAll != 0 || value != '\n'
 	}
 	if atom.literal != nil {
 		return equalByte(*atom.literal, value, flags)
@@ -3565,7 +3565,7 @@ func fuzzyAtomMatches(atom fuzzyAtom, value byte, flags CompileFlag) bool {
 	if atom.class == nil {
 		return false
 	}
-	if atom.hasMask && flags&FlagCaseless == 0 {
+	if atom.hasMask && flags&CompileCaseless == 0 {
 		return atom.mask[value/64]&(1<<uint(value%64)) != 0
 	}
 	matched := false
@@ -3575,7 +3575,7 @@ func fuzzyAtomMatches(atom fuzzyAtom, value byte, flags CompileFlag) bool {
 			break
 		}
 	}
-	if !matched && flags&FlagCaseless != 0 {
+	if !matched && flags&CompileCaseless != 0 {
 		folded := value
 		if folded >= 'A' && folded <= 'Z' {
 			folded += 'a' - 'A'
@@ -3790,18 +3790,18 @@ func matchNode(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
 func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
 	switch v := n.(type) {
 	case parser.Literal:
-		if flags&FlagUTF8 != 0 {
+		if flags&CompileUTF8 != 0 {
 			if !utf8.Valid(v.Value) || pos > 0 && pos < len(data) && data[pos]&0xc0 == 0x80 {
 				return nil
 			}
-			if flags&FlagCaseless != 0 {
+			if flags&CompileCaseless != 0 {
 				return matchUTF8Literal(v.Value, data, pos)
 			}
 		}
 		if pos+len(v.Value) > len(data) {
 			return nil
 		}
-		if flags&FlagUTF8 != 0 && !validUTF8LiteralAt(data, pos, len(v.Value)) {
+		if flags&CompileUTF8 != 0 && !validUTF8LiteralAt(data, pos, len(v.Value)) {
 			return nil
 		}
 		for i, c := range v.Value {
@@ -3811,10 +3811,10 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 		}
 		return []int{pos + len(v.Value)}
 	case parser.Any:
-		if pos >= len(data) || (data[pos] == '\n' && flags&FlagDotAll == 0) {
+		if pos >= len(data) || (data[pos] == '\n' && flags&CompileDotAll == 0) {
 			return nil
 		}
-		if flags&FlagUTF8 != 0 {
+		if flags&CompileUTF8 != 0 {
 			r, size := utf8.DecodeRune(data[pos:])
 			if r == utf8.RuneError && size == 1 && data[pos] >= 0x80 {
 				return nil
@@ -3829,7 +3829,7 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 		if pos >= len(data) {
 			return nil
 		}
-		if flags&FlagUCP != 0 && v.Kind != parser.ClassNormal {
+		if flags&CompileUCP != 0 && v.Kind != parser.ClassNormal {
 			runeValue, size := utf8.DecodeRune(data[pos:])
 			if size == 0 || runeValue == utf8.RuneError && size == 1 && data[pos] >= 0x80 {
 				return nil
@@ -3840,7 +3840,7 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 			}
 			return nil
 		}
-		if flags&FlagUTF8 != 0 {
+		if flags&CompileUTF8 != 0 {
 			runeValue, size := utf8.DecodeRune(data[pos:])
 			if size == 0 || runeValue == utf8.RuneError && size == 1 && data[pos] >= 0x80 {
 				return nil
@@ -3849,7 +3849,7 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 			if runeValue <= 0xff {
 				value := byte(runeValue)
 				for _, r := range v.Ranges {
-					if value >= r.Lo && value <= r.Hi || flags&FlagCaseless != 0 && ((value >= 'a' && value <= 'z' && value-'a'+'A' >= r.Lo && value-'a'+'A' <= r.Hi) || (value >= 'A' && value <= 'Z' && value-'A'+'a' >= r.Lo && value-'A'+'a' <= r.Hi)) {
+					if value >= r.Lo && value <= r.Hi || flags&CompileCaseless != 0 && ((value >= 'a' && value <= 'z' && value-'a'+'A' >= r.Lo && value-'a'+'A' <= r.Hi) || (value >= 'A' && value <= 'Z' && value-'A'+'a' >= r.Lo && value-'A'+'a' <= r.Hi)) {
 						matched = true
 						break
 					}
@@ -3865,7 +3865,7 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 		}
 		return nil
 	case parser.UnicodeClass:
-		if flags&FlagUTF8 == 0 || pos >= len(data) {
+		if flags&CompileUTF8 == 0 || pos >= len(data) {
 			return nil
 		}
 		r, size := utf8.DecodeRune(data[pos:])
@@ -3902,7 +3902,7 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 			found := false
 			var starts []int
 			width, _, ok := parser.FixedWidth(v.Child)
-			if flags&FlagUTF8 != 0 {
+			if flags&CompileUTF8 != 0 {
 				width, _, ok = parser.FixedWidthUTF8(v.Child)
 			}
 			if ok {
@@ -4012,7 +4012,7 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 func classByteMatch(v parser.Class, value byte, flags CompileFlag) bool {
 	matched := false
 	for _, r := range v.Ranges {
-		if value >= r.Lo && value <= r.Hi || flags&FlagCaseless != 0 && ((value >= 'a' && value <= 'z' && value-'a'+'A' >= r.Lo && value-'a'+'A' <= r.Hi) || (value >= 'A' && value <= 'Z' && value-'A'+'a' >= r.Lo && value-'A'+'a' <= r.Hi)) {
+		if value >= r.Lo && value <= r.Hi || flags&CompileCaseless != 0 && ((value >= 'a' && value <= 'z' && value-'a'+'A' >= r.Lo && value-'a'+'A' <= r.Hi) || (value >= 'A' && value <= 'Z' && value-'A'+'a' >= r.Lo && value-'A'+'a' <= r.Hi)) {
 			matched = true
 			break
 		}
@@ -4023,7 +4023,7 @@ func classByteMatch(v parser.Class, value byte, flags CompileFlag) bool {
 // byteRepeatAtom 判断重复的子节点在当前模式下是否恰好消费一个字节。
 // UTF-8/UCP 模式下字符类按码位消费 1~4 字节，不能按字节推进，因此显式排除。
 func byteRepeatAtom(n parser.Node, flags CompileFlag) bool {
-	if flags&(FlagUTF8|FlagUCP) != 0 {
+	if flags&(CompileUTF8|CompileUCP) != 0 {
 		return false
 	}
 	switch v := n.(type) {
@@ -4051,7 +4051,7 @@ func matchByteAtom(n parser.Node, value byte, flags CompileFlag) bool {
 	case parser.Literal:
 		return len(v.Value) == 1 && equalByte(v.Value[0], value, flags)
 	case parser.Any:
-		return value != '\n' || flags&FlagDotAll != 0
+		return value != '\n' || flags&CompileDotAll != 0
 	case parser.Class:
 		return classByteMatch(v, value, flags)
 	default:
@@ -4104,22 +4104,22 @@ func validUTF8LiteralAt(data []byte, pos, width int) bool {
 // scopedGroupFlags 将分组内的局部修饰符合并到当前匹配状态。
 func scopedGroupFlags(flags CompileFlag, group parser.Group) CompileFlag {
 	if group.SetFlags&parser.GroupFlagCaseless != 0 {
-		flags |= FlagCaseless
+		flags |= CompileCaseless
 	}
 	if group.SetFlags&parser.GroupFlagDotAll != 0 {
-		flags |= FlagDotAll
+		flags |= CompileDotAll
 	}
 	if group.SetFlags&parser.GroupFlagMultiline != 0 {
-		flags |= FlagMultiline
+		flags |= CompileMultiline
 	}
 	if group.ClearFlags&parser.GroupFlagCaseless != 0 {
-		flags &^= FlagCaseless
+		flags &^= CompileCaseless
 	}
 	if group.ClearFlags&parser.GroupFlagDotAll != 0 {
-		flags &^= FlagDotAll
+		flags &^= CompileDotAll
 	}
 	if group.ClearFlags&parser.GroupFlagMultiline != 0 {
-		flags &^= FlagMultiline
+		flags &^= CompileMultiline
 	}
 	return flags
 }
@@ -4368,7 +4368,7 @@ func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, ca
 		if value.Kind == parser.Lookbehind || value.Kind == parser.NegativeLookbehind {
 			matched := make([]captureState, 0)
 			starts := make([]int, 0)
-			if width, _, ok := parser.FixedWidth(value.Child); ok && flags&FlagUTF8 == 0 {
+			if width, _, ok := parser.FixedWidth(value.Child); ok && flags&CompileUTF8 == 0 {
 				if pos >= width {
 					starts = append(starts, pos-width)
 				}
@@ -4488,11 +4488,11 @@ func dedup(values []int) []int {
 func assertionHolds(kind parser.AssertionKind, data []byte, pos int, flags CompileFlag) bool {
 	switch kind {
 	case parser.Begin:
-		return pos == 0 || flags&FlagMultiline != 0 && pos > 0 && data[pos-1] == '\n'
+		return pos == 0 || flags&CompileMultiline != 0 && pos > 0 && data[pos-1] == '\n'
 	case parser.BeginAbsolute:
 		return pos == 0
 	case parser.End:
-		return pos == len(data) || flags&FlagMultiline != 0 && pos < len(data) && data[pos] == '\n'
+		return pos == len(data) || flags&CompileMultiline != 0 && pos < len(data) && data[pos] == '\n'
 	case parser.EndAbsolute:
 		return pos == len(data)
 	case parser.EndBeforeFinalNewline:
@@ -4628,7 +4628,7 @@ func (arena *byteChainArena) eval(node parser.Node, data []byte, pos int, flags 
 		if pos > len(data) || pos+len(v.Value) > len(data) {
 			return nil, true
 		}
-		if flags&FlagCaseless == 0 {
+		if flags&CompileCaseless == 0 {
 			// 大小写敏感文字交给标准比较，命中密集时比逐字节判定更快。
 			if !bytes.Equal(data[pos:pos+len(v.Value)], v.Value) {
 				return nil, true
@@ -4657,7 +4657,7 @@ func (arena *byteChainArena) eval(node parser.Node, data []byte, pos int, flags 
 		out[0] = pos + 1
 		return out, true
 	case parser.Any:
-		if pos >= len(data) || data[pos] == '\n' && flags&FlagDotAll == 0 {
+		if pos >= len(data) || data[pos] == '\n' && flags&CompileDotAll == 0 {
 			return nil, true
 		}
 		out, ok := arena.take(1)
@@ -4891,7 +4891,7 @@ func equalByte(a, b byte, flags CompileFlag) bool {
 	if a == b {
 		return true
 	}
-	if flags&FlagCaseless == 0 {
+	if flags&CompileCaseless == 0 {
 		return false
 	}
 	if a >= 'a' && a <= 'z' {
@@ -4910,10 +4910,10 @@ func wordBefore(data []byte, pos int, flags CompileFlag) bool {
 	if pos <= 0 {
 		return false
 	}
-	if flags&FlagUTF8 != 0 && pos < len(data) && data[pos]&0xc0 == 0x80 {
+	if flags&CompileUTF8 != 0 && pos < len(data) && data[pos]&0xc0 == 0x80 {
 		return false
 	}
-	if flags&FlagUCP == 0 {
+	if flags&CompileUCP == 0 {
 		return isWord(data[pos-1])
 	}
 	r, _ := utf8.DecodeLastRune(data[:pos])
@@ -4923,10 +4923,10 @@ func wordAfter(data []byte, pos int, flags CompileFlag) bool {
 	if pos >= len(data) {
 		return false
 	}
-	if flags&FlagUTF8 != 0 && data[pos]&0xc0 == 0x80 {
+	if flags&CompileUTF8 != 0 && data[pos]&0xc0 == 0x80 {
 		return false
 	}
-	if flags&FlagUCP == 0 {
+	if flags&CompileUCP == 0 {
 		return isWord(data[pos])
 	}
 	r, _ := utf8.DecodeRune(data[pos:])

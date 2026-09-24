@@ -6,14 +6,14 @@ import (
 )
 
 func TestCloneAndMetadata(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 1, Pattern: "a", Flags: FlagCaseless, Ext: &ExpressionExt{Flags: ExtFlagMinLength, MinLength: 1}}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: "a", Flags: CompileCaseless, Ext: &ExpressionExt{Flags: ExtFlagMinLength, MinLength: 1}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if clone := s.clone(); clone == nil || len(clone.ruleIDs()) != 1 {
 		t.Fatal("clone failed")
 	}
-	if flags, ok := s.ruleFlags(1); !ok || flags != FlagCaseless {
+	if flags, ok := s.ruleFlags(1); !ok || flags != CompileCaseless {
 		t.Fatalf("rule flags=%v %v", flags, ok)
 	}
 	ext, ok := s.ruleExtension(1)

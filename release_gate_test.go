@@ -7,7 +7,7 @@ import (
 )
 
 func TestSingleMatchAndInputImmutability(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 1, Pattern: "a+", Flags: FlagSingleMatch}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: "a+", Flags: CompileSingleMatch}})
 	if err != nil {
 		t.Fatal(err)
 	}

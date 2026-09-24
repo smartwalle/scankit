@@ -6,7 +6,7 @@ func TestCompileRejectsInvalidFlagsAndOffsets(t *testing.T) {
 	if _, err := Compile([]Expression{{Id: 1, Pattern: "x", Flags: CompileFlag(1 << 31)}}); err == nil {
 		t.Fatal("unknown compile flag accepted")
 	}
-	if _, err := Compile([]Expression{{Id: 1, Pattern: "x", Flags: FlagUCP}}); err != nil {
+	if _, err := Compile([]Expression{{Id: 1, Pattern: "x", Flags: CompileUCP}}); err != nil {
 		t.Fatalf("UCP without UTF8 rejected: %v", err)
 	}
 	if _, err := Compile([]Expression{{Id: 1, Pattern: "x", Ext: &ExpressionExt{Flags: ExtFlagMinOffset | ExtFlagMaxOffset, MinOffset: 8, MaxOffset: 2}}}); err == nil {
@@ -15,16 +15,16 @@ func TestCompileRejectsInvalidFlagsAndOffsets(t *testing.T) {
 	if _, err := Compile([]Expression{{Id: 1, Pattern: ""}}); err == nil {
 		t.Fatal("empty match accepted")
 	}
-	if _, err := Compile([]Expression{{Id: 1, Pattern: "", Flags: FlagAllowEmpty}}); err != nil {
+	if _, err := Compile([]Expression{{Id: 1, Pattern: "", Flags: CompileAllowEmpty}}); err != nil {
 		t.Fatalf("allow empty rejected: %v", err)
 	}
 }
 
 func TestCompileRejectsCombinationDependencyCycle(t *testing.T) {
 	_, err := Compile([]Expression{
-		{Id: 1, Pattern: "2", Flags: FlagCombination},
-		{Id: 2, Pattern: "3", Flags: FlagCombination},
-		{Id: 3, Pattern: "1", Flags: FlagCombination},
+		{Id: 1, Pattern: "2", Flags: CompileCombination},
+		{Id: 2, Pattern: "3", Flags: CompileCombination},
+		{Id: 3, Pattern: "1", Flags: CompileCombination},
 	})
 	if err == nil {
 		t.Fatal("combination dependency cycle accepted")
@@ -33,10 +33,10 @@ func TestCompileRejectsCombinationDependencyCycle(t *testing.T) {
 
 func TestCompileRejectsIncompatibleFlags(t *testing.T) {
 	cases := []CompileFlag{
-		FlagSingleMatch | FlagSOMLeftmost,
-		FlagQuiet | FlagSOMLeftmost,
-		FlagPrefilter | FlagSOMLeftmost,
-		FlagCombination | FlagCaseless,
+		CompileSingleMatch | CompileSOMLeftmost,
+		CompileQuiet | CompileSOMLeftmost,
+		CompilePrefilter | CompileSOMLeftmost,
+		CompileCombination | CompileCaseless,
 	}
 	for _, flags := range cases {
 		if _, err := Compile([]Expression{{Id: 1, Pattern: "a", Flags: flags}}); err == nil {
@@ -47,10 +47,10 @@ func TestCompileRejectsIncompatibleFlags(t *testing.T) {
 
 func TestCompileRejectsUnsupportedCombinationOperandsAndExtensions(t *testing.T) {
 	cases := [][]Expression{
-		{{Id: 1, Pattern: "a", Flags: FlagPrefilter}, {Id: 2, Pattern: "1", Flags: FlagCombination}},
-		{{Id: 1, Pattern: "a", Flags: FlagSOMLeftmost}, {Id: 2, Pattern: "1", Flags: FlagCombination}},
-		{{Id: 1, Pattern: "a"}, {Id: 2, Pattern: "1", Flags: FlagCombination}, {Id: 3, Pattern: "2", Flags: FlagCombination}},
-		{{Id: 1, Pattern: "1", Flags: FlagCombination, Ext: &ExpressionExt{Flags: ExtFlagMinLength, MinLength: 1}}},
+		{{Id: 1, Pattern: "a", Flags: CompilePrefilter}, {Id: 2, Pattern: "1", Flags: CompileCombination}},
+		{{Id: 1, Pattern: "a", Flags: CompileSOMLeftmost}, {Id: 2, Pattern: "1", Flags: CompileCombination}},
+		{{Id: 1, Pattern: "a"}, {Id: 2, Pattern: "1", Flags: CompileCombination}, {Id: 3, Pattern: "2", Flags: CompileCombination}},
+		{{Id: 1, Pattern: "1", Flags: CompileCombination, Ext: &ExpressionExt{Flags: ExtFlagMinLength, MinLength: 1}}},
 	}
 	for _, expressions := range cases {
 		if _, err := Compile(expressions); err == nil {

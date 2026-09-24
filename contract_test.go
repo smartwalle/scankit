@@ -8,17 +8,17 @@ func TestCompileFlagsValues(t *testing.T) {
 		value CompileFlag
 		want  CompileFlag
 	}{
-		{"caseless", FlagCaseless, 1},
-		{"dotall", FlagDotAll, 2},
-		{"multiline", FlagMultiline, 4},
-		{"singlematch", FlagSingleMatch, 8},
-		{"allowempty", FlagAllowEmpty, 16},
-		{"utf8", FlagUTF8, 32},
-		{"ucp", FlagUCP, 64},
-		{"prefilter", FlagPrefilter, 128},
-		{"som_leftmost", FlagSOMLeftmost, 256},
-		{"combination", FlagCombination, 512},
-		{"quiet", FlagQuiet, 1024},
+		{"caseless", CompileCaseless, 1},
+		{"dotall", CompileDotAll, 2},
+		{"multiline", CompileMultiline, 4},
+		{"singlematch", CompileSingleMatch, 8},
+		{"allowempty", CompileAllowEmpty, 16},
+		{"utf8", CompileUTF8, 32},
+		{"ucp", CompileUCP, 64},
+		{"prefilter", CompilePrefilter, 128},
+		{"som_leftmost", CompileSOMLeftmost, 256},
+		{"combination", CompileCombination, 512},
+		{"quiet", CompileQuiet, 1024},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

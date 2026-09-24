@@ -75,7 +75,7 @@ func TestContinuedUtilityContracts(t *testing.T) {
 }
 
 func TestContinuedUTF8CaselessLiteral(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 1, Pattern: "ÄBC", Flags: FlagUTF8 | FlagCaseless}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: "ÄBC", Flags: CompileUTF8 | CompileCaseless}})
 	if err != nil {
 		t.Fatal(err)
 	}

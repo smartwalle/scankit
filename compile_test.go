@@ -29,8 +29,8 @@ func TestCompileFuzzyLiteral(t *testing.T) {
 
 func TestCompileFuzzyCaselessLiteral(t *testing.T) {
 	cases := []Expression{
-		{Id: 1, Pattern: "Hello", Flags: FlagCaseless, Ext: &ExpressionExt{Flags: ExtFlagEditDistance, EditDistance: 1}},
-		{Id: 2, Pattern: "Hello", Flags: FlagCaseless, Ext: &ExpressionExt{Flags: ExtFlagHammingDistance, HammingDistance: 1}},
+		{Id: 1, Pattern: "Hello", Flags: CompileCaseless, Ext: &ExpressionExt{Flags: ExtFlagEditDistance, EditDistance: 1}},
+		{Id: 2, Pattern: "Hello", Flags: CompileCaseless, Ext: &ExpressionExt{Flags: ExtFlagHammingDistance, HammingDistance: 1}},
 	}
 	s, err := Compile(cases)
 	if err != nil {
@@ -127,13 +127,13 @@ func TestLeadingInlineFlagsApplyToCompiledRule(t *testing.T) {
 		t.Fatalf("inline flags mismatch: %v %#v", err, matches)
 	}
 	flags, ok := s.ruleFlags(1)
-	if !ok || flags&FlagCaseless == 0 {
+	if !ok || flags&CompileCaseless == 0 {
 		t.Fatalf("inline flag metadata missing: %v %v", flags, ok)
 	}
 }
 
 func TestLeadingInlineFlagsCanDisableExpressionFlag(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 1, Pattern: `(?-i)abc`, Flags: FlagCaseless}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: `(?-i)abc`, Flags: CompileCaseless}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestBackendSelectionMatrixUsesSafeFallbacks(t *testing.T) {
 		{Id: 3, Pattern: `a{2,4}`},
 		{Id: 4, Pattern: `(?:ab|cd)+`},
 		{Id: 5, Pattern: `(?<=a)b`},
-		{Id: 6, Pattern: `\p{L}+`, Flags: FlagUTF8},
+		{Id: 6, Pattern: `\p{L}+`, Flags: CompileUTF8},
 		{Id: 7, Pattern: `(a)\1`},
 	}
 	s, err := Compile(rules)
@@ -386,7 +386,7 @@ func TestScopedInlineFlags(t *testing.T) {
 		{Id: 1, Pattern: `a(?i:bc)d`},
 		{Id: 2, Pattern: `(?s:a.b)`},
 		{Id: 3, Pattern: `(?m:^a$)`},
-		{Id: 4, Pattern: `(?-i:ab)`, Flags: FlagCaseless},
+		{Id: 4, Pattern: `(?-i:ab)`, Flags: CompileCaseless},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -434,5 +434,89 @@ func TestExtendedInlineFlags(t *testing.T) {
 	matches, err := scanner.Scan([]byte("abc ab c"))
 	if err != nil || len(matches) != 2 || matches[0] != (Match{Id: 1, From: 0, To: 3}) || matches[1] != (Match{Id: 2, From: 4, To: 8}) {
 		t.Fatalf("extended matches: %v %#v", err, matches)
+	}
+}
+
+// TestCompileErrorsExposeSentinels 验证 [Compile] 在各种失败情况下都能通过 errors.Is
+// 命中对应的公开哨兵错误，保证调用方可以稳定做错误分类断言。
+func TestCompileErrorsExposeSentinels(t *testing.T) {
+	cases := []struct {
+		name string
+		expr []Expression
+		want error
+	}{
+		{
+			name: "empty",
+			expr: nil,
+			want: ErrEmptyExpressions,
+		},
+		{
+			name: "duplicate id",
+			expr: []Expression{
+				{Id: 1, Pattern: "abc"},
+				{Id: 1, Pattern: "def"},
+			},
+			want: ErrDuplicateExpression,
+		},
+		{
+			name: "unknown flag bit",
+			expr: []Expression{
+				{Id: 1, Pattern: "abc", Flags: CompileFlag(1 << 20)},
+			},
+			want: ErrUnsupportedFlag,
+		},
+		{
+			name: "unknown extension flag",
+			expr: []Expression{
+				{Id: 1, Pattern: "abc", Ext: &ExpressionExt{Flags: ExpressionExtFlag(1 << 20)}},
+			},
+			want: ErrInvalidExtension,
+		},
+		{
+			name: "invalid UTF-8 pattern",
+			expr: []Expression{
+				{Id: 1, Pattern: "abc\xff", Flags: CompileUTF8},
+			},
+			want: ErrInvalidUTF8,
+		},
+		{
+			name: "combination referencing self",
+			expr: []Expression{
+				{Id: 1, Pattern: "1", Flags: CompileCombination},
+			},
+			want: ErrInvalidCombination,
+		},
+		{
+			name: "singlematch with som-leftmost",
+			expr: []Expression{
+				{Id: 1, Pattern: "abc", Flags: CompileSingleMatch | CompileSOMLeftmost},
+			},
+			want: ErrUnsupportedFlag,
+		},
+		{
+			name: "edit and hamming distance are mutually exclusive",
+			expr: []Expression{
+				{Id: 1, Pattern: "abc", Ext: &ExpressionExt{Flags: ExtFlagEditDistance | ExtFlagHammingDistance, EditDistance: 1, HammingDistance: 1}},
+			},
+			want: ErrInvalidExtension,
+		},
+		{
+			name: "minimum length exceeds maximum offset",
+			expr: []Expression{
+				{Id: 1, Pattern: "abc", Ext: &ExpressionExt{Flags: ExtFlagMinLength | ExtFlagMaxOffset, MinLength: 100, MaxOffset: 10}},
+			},
+			want: ErrInvalidExtension,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := Compile(c.expr)
+			if err == nil {
+				t.Fatalf("期望错误，得到 nil")
+			}
+			if !errors.Is(err, c.want) {
+				t.Fatalf("errors.Is(err, %T) 未命中: err=%v", c.want, err)
+			}
+		})
 	}
 }

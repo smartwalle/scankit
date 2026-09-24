@@ -5,7 +5,7 @@ import "testing"
 func TestScanIntegratesRoseOnlyForFullyConvertibleRules(t *testing.T) {
 	direct, err := Compile([]Expression{
 		{Id: 1, Pattern: "ab"},
-		{Id: 2, Pattern: "bc", Flags: FlagCaseless},
+		{Id: 2, Pattern: "bc", Flags: CompileCaseless},
 	})
 	if err != nil {
 		t.Fatal(err)

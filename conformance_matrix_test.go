@@ -40,7 +40,7 @@ func backendMatrixEntries() []struct {
 func conformanceMatrixExpressions() []Expression {
 	return []Expression{
 		{Id: 1, Pattern: "needle"},
-		{Id: 2, Pattern: "NeEdLe", Flags: FlagCaseless},
+		{Id: 2, Pattern: "NeEdLe", Flags: CompileCaseless},
 		{Id: 3, Pattern: `ab|cd`},
 		{Id: 4, Pattern: `[0-9]{3}-[0-9]{4}`},
 		{Id: 5, Pattern: `[a-z]+@[a-z]+\.example`},
@@ -151,14 +151,14 @@ func conformanceMatrixFixtures() []struct {
 		data      []byte
 		compileOK bool
 	}{
-		{"utf8", Expression{Id: 1, Pattern: "é", Flags: FlagUTF8}, []byte("xé"), true},
+		{"utf8", Expression{Id: 1, Pattern: "é", Flags: CompileUTF8}, []byte("xé"), true},
 		{"boundary", Expression{Id: 2, Pattern: `\bcat\b`}, []byte("cat scatter"), true},
 		{"backref", Expression{Id: 3, Pattern: `(ab)\1`}, []byte("abab"), true},
 		{"repeat", Expression{Id: 4, Pattern: `a{2,3}`}, []byte("aaa"), true},
 		{"hamming", Expression{Id: 5, Pattern: "abcd", Ext: &ExpressionExt{Flags: ExtFlagHammingDistance, HammingDistance: 1}}, []byte("abxd"), true},
 		{"nul", Expression{Id: 6, Pattern: `\x00`}, []byte{0x00, 0x01}, true},
-		{"empty", Expression{Id: 7, Pattern: `a*`, Flags: FlagAllowEmpty}, []byte("ba"), true},
-		{"caseless-utf8", Expression{Id: 8, Pattern: "ÄÖÜ", Flags: FlagCaseless}, []byte("äöü ÄÖÜ"), true},
+		{"empty", Expression{Id: 7, Pattern: `a*`, Flags: CompileAllowEmpty}, []byte("ba"), true},
+		{"caseless-utf8", Expression{Id: 8, Pattern: "ÄÖÜ", Flags: CompileCaseless}, []byte("äöü ÄÖÜ"), true},
 		{"invalid-pattern", Expression{Id: 9, Pattern: `(`}, nil, false},
 	}
 }

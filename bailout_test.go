@@ -8,7 +8,7 @@ import (
 // TestBailoutReasonForGraphBuildFailure 验证图构建失败时规则被记录 graph-build
 // 失败原因，并保留空图占位以便运行时安全回退。
 func TestBailoutReasonForGraphBuildFailure(t *testing.T) {
-	scanner, err := Compile([]Expression{{Id: 1, Pattern: `\b.`, Flags: FlagUTF8}})
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: `\b.`, Flags: CompileUTF8}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func TestBailoutReasonForCombinedExpression(t *testing.T) {
 	scanner, err := Compile([]Expression{
 		{Id: 1, Pattern: `a`},
 		{Id: 2, Pattern: `b`},
-		{Id: 3, Pattern: `1&2`, Flags: FlagCombination},
+		{Id: 3, Pattern: `1&2`, Flags: CompileCombination},
 	})
 	if err != nil {
 		t.Fatal(err)

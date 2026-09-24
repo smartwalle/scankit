@@ -35,7 +35,7 @@ func TestLookaroundReportsConsumedSpanOnly(t *testing.T) {
 }
 
 func TestUTF8LookbehindUsesByteOffsets(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 1, Pattern: `(?<=\p{L})x`, Flags: FlagUTF8 | FlagUCP}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: `(?<=\p{L})x`, Flags: CompileUTF8 | CompileUCP}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func TestUTF8LookbehindUsesByteOffsets(t *testing.T) {
 }
 
 func TestUTF8LiteralRejectsInvalidDataAndContinuationStart(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 1, Pattern: "é", Flags: FlagUTF8}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: "é", Flags: CompileUTF8}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestUTF8LiteralRejectsInvalidDataAndContinuationStart(t *testing.T) {
 		t.Fatalf("valid UTF-8=%#v %v", got, err)
 	}
 	data := []byte("é")
-	if got := matchNode(parser.Literal{Value: []byte("é")}, data, 1, FlagUTF8); len(got) != 0 {
+	if got := matchNode(parser.Literal{Value: []byte("é")}, data, 1, CompileUTF8); len(got) != 0 {
 		t.Fatalf("续字节起点=%v", got)
 	}
 	if got, err := s.Scan([]byte{0xff, 'x'}); err != nil || len(got) != 0 {
@@ -103,7 +103,7 @@ func TestLookaroundVariableWidthAndWordBoundaryNegation(t *testing.T) {
 }
 
 func TestSOMLeftmostKeepsEarliestStartPerEnd(t *testing.T) {
-	scanner, err := Compile([]Expression{{Id: 1, Pattern: `a*`, Flags: FlagAllowEmpty | FlagSOMLeftmost}})
+	scanner, err := Compile([]Expression{{Id: 1, Pattern: `a*`, Flags: CompileAllowEmpty | CompileSOMLeftmost}})
 	if err != nil {
 		t.Fatal(err)
 	}

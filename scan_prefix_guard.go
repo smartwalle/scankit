@@ -29,10 +29,10 @@ func newPrefixGuard(rule compiledRule) *prefixGuard {
 		return nil
 	}
 	// 大小写折叠、UTF-8 与 Unicode 语义都会让字节级推导失效。
-	if rule.flags&(FlagCaseless|FlagUTF8|FlagUCP) != 0 || parser.HasScopedFlags(rule.root) {
+	if rule.flags&(CompileCaseless|CompileUTF8|CompileUCP) != 0 || parser.HasScopedFlags(rule.root) {
 		return nil
 	}
-	if rule.flags&FlagAllowEmpty != 0 {
+	if rule.flags&CompileAllowEmpty != 0 {
 		return nil
 	}
 	sets, _ := prefixSets(rule.root, prefixGuardLimit)

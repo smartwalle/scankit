@@ -132,7 +132,7 @@ func (c *confirmCompiler) setFromNode(node parser.Node) (confirmByteSet, bool) {
 		return set, true
 	case parser.Any:
 		for value := range 256 {
-			if byte(value) != '\n' || c.flags&FlagDotAll != 0 {
+			if byte(value) != '\n' || c.flags&CompileDotAll != 0 {
 				set[value>>6] |= uint64(1) << (value & 63)
 			}
 		}
@@ -260,7 +260,7 @@ func (p *confirmProgram) afterLeadingLiteral(literal []byte) (int32, bool) {
 }
 
 func compileConfirmProgram(root parser.Node, flags CompileFlag) *confirmProgram {
-	if root == nil || flags&(FlagUTF8|FlagUCP) != 0 {
+	if root == nil || flags&(CompileUTF8|CompileUCP) != 0 {
 		return nil
 	}
 	compiler := &confirmCompiler{flags: flags, ok: true}
@@ -510,9 +510,9 @@ func (p *confirmProgram) run(data []byte, entry int32, start int, flags CompileF
 	if len(stack) > confirmMaxStack {
 		stack = stack[:confirmMaxStack]
 	}
-	caseless := flags&FlagCaseless != 0
-	dotAll := flags&FlagDotAll != 0
-	unicodeWord := flags&(FlagUTF8|FlagUCP) != 0
+	caseless := flags&CompileCaseless != 0
+	dotAll := flags&CompileDotAll != 0
+	unicodeWord := flags&(CompileUTF8|CompileUCP) != 0
 	dataLen := len(data)
 	pc := entry
 	pos := start

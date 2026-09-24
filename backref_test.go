@@ -58,7 +58,7 @@ func TestCapturedAlternationBackreference(t *testing.T) {
 }
 
 func TestBackreferenceUsesCaselessComparison(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 1, Pattern: `(ab)\1`, Flags: FlagCaseless}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: `(ab)\1`, Flags: CompileCaseless}})
 	if err != nil {
 		t.Fatal(err)
 	}

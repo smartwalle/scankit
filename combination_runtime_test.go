@@ -3,13 +3,13 @@ package scankit
 import "testing"
 
 func TestCombinationRuntime(t *testing.T) {
-	if _, err := Compile([]Expression{{Id: 9, Pattern: "1", Flags: FlagCombination}}); err == nil {
+	if _, err := Compile([]Expression{{Id: 9, Pattern: "1", Flags: CompileCombination}}); err == nil {
 		t.Fatal("未检测到未知组合引用")
 	}
 	s, err := Compile([]Expression{
 		{Id: 1, Pattern: "cat"},
 		{Id: 2, Pattern: "dog"},
-		{Id: 3, Pattern: "1&2", Flags: FlagCombination},
+		{Id: 3, Pattern: "1&2", Flags: CompileCombination},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -25,7 +25,7 @@ func TestCombinationRuntime(t *testing.T) {
 	s, err = Compile([]Expression{
 		{Id: 1, Pattern: "a"},
 		{Id: 2, Pattern: "a"},
-		{Id: 3, Pattern: "1&2", Flags: FlagCombination},
+		{Id: 3, Pattern: "1&2", Flags: CompileCombination},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -35,8 +35,8 @@ func TestCombinationRuntime(t *testing.T) {
 		t.Fatalf("组合结果不正确: %#v, %v", matches, err)
 	}
 	s, err = Compile([]Expression{
-		{Id: 1, Pattern: "a", Flags: FlagQuiet},
-		{Id: 2, Pattern: "1", Flags: FlagCombination},
+		{Id: 1, Pattern: "a", Flags: CompileQuiet},
+		{Id: 2, Pattern: "1", Flags: CompileCombination},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -51,7 +51,7 @@ func TestCombinationRuntime(t *testing.T) {
 }
 
 func TestCombinationNegativeReportsAtEndOfData(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 1, Pattern: "a", Flags: FlagQuiet}, {Id: 2, Pattern: "!1", Flags: FlagCombination}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: "a", Flags: CompileQuiet}, {Id: 2, Pattern: "!1", Flags: CompileCombination}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,10 +67,10 @@ func TestCombinationNegativeReportsAtEndOfData(t *testing.T) {
 
 func TestCombinationOnlyReportsForRelevantOperands(t *testing.T) {
 	s, err := Compile([]Expression{
-		{Id: 1, Pattern: "a", Flags: FlagQuiet},
-		{Id: 2, Pattern: "b", Flags: FlagQuiet},
-		{Id: 3, Pattern: "c", Flags: FlagQuiet},
-		{Id: 4, Pattern: "1&2", Flags: FlagCombination},
+		{Id: 1, Pattern: "a", Flags: CompileQuiet},
+		{Id: 2, Pattern: "b", Flags: CompileQuiet},
+		{Id: 3, Pattern: "c", Flags: CompileQuiet},
+		{Id: 4, Pattern: "1&2", Flags: CompileCombination},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -84,8 +84,8 @@ func TestCombinationOnlyReportsForRelevantOperands(t *testing.T) {
 func TestCombinationSingleMatchAndExtensionGate(t *testing.T) {
 	s, err := Compile([]Expression{
 		{Id: 1, Pattern: "a"},
-		{Id: 2, Pattern: "1", Flags: FlagCombination | FlagQuiet | FlagSingleMatch},
-		{Id: 3, Pattern: "1", Flags: FlagCombination, Ext: &ExpressionExt{Flags: ExtFlagMinOffset, MinOffset: 2}},
+		{Id: 2, Pattern: "1", Flags: CompileCombination | CompileQuiet | CompileSingleMatch},
+		{Id: 3, Pattern: "1", Flags: CompileCombination, Ext: &ExpressionExt{Flags: ExtFlagMinOffset, MinOffset: 2}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -107,10 +107,10 @@ func TestCombinationSingleMatchAndExtensionGate(t *testing.T) {
 
 func TestNestedCombinationOperatorsPreservePositions(t *testing.T) {
 	scanner, err := Compile([]Expression{
-		{Id: 1, Pattern: "a", Flags: FlagQuiet},
-		{Id: 2, Pattern: "b", Flags: FlagQuiet},
-		{Id: 3, Pattern: "c", Flags: FlagQuiet},
-		{Id: 4, Pattern: "(1&2)|3", Flags: FlagCombination},
+		{Id: 1, Pattern: "a", Flags: CompileQuiet},
+		{Id: 2, Pattern: "b", Flags: CompileQuiet},
+		{Id: 3, Pattern: "c", Flags: CompileQuiet},
+		{Id: 4, Pattern: "(1&2)|3", Flags: CompileCombination},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -123,9 +123,9 @@ func TestNestedCombinationOperatorsPreservePositions(t *testing.T) {
 
 func TestCombinationPositiveBranchDoesNotRepeatAtEOD(t *testing.T) {
 	scanner, err := Compile([]Expression{
-		{Id: 1, Pattern: "a", Flags: FlagQuiet},
-		{Id: 2, Pattern: "b", Flags: FlagQuiet},
-		{Id: 3, Pattern: "1|!2", Flags: FlagCombination},
+		{Id: 1, Pattern: "a", Flags: CompileQuiet},
+		{Id: 2, Pattern: "b", Flags: CompileQuiet},
+		{Id: 3, Pattern: "1|!2", Flags: CompileCombination},
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -20,6 +20,43 @@ import (
 	"github.com/smartwalle/scankit/internal/smallengine"
 )
 
+var (
+	// ErrEmptyExpressions 表示传入的规则集为空，没有任何可编译的表达式。
+	ErrEmptyExpressions = errors.New("empty expressions")
+
+	// ErrDuplicateExpression 表示同一个 Scanner 中存在两个 Id 相同的表达式。
+	ErrDuplicateExpression = errors.New("duplicate expression")
+
+	// ErrInvalidExpression 表示单条表达式的 Flag/Pattern/Ext 组合不合法，例如包含未知位、
+	// 同时启用互斥的 Flag 组合，或者组合规则引用的 id 不存在。
+	ErrInvalidExpression = errors.New("invalid expression")
+
+	// ErrUnsupportedFlag 表示 [Expression.Flags] 中出现了未定义的编译位或不支持的组合。
+	ErrUnsupportedFlag = errors.New("unsupported compile flag")
+
+	// ErrInvalidUTF8 表示开启 [CompileUTF8] 的表达式收到了不合法 UTF-8 输入。
+	ErrInvalidUTF8 = errors.New("invalid UTF-8 input")
+
+	// ErrUnsupportedExpression 表示语法解析成功但当前实现尚未提供执行路径，例如某些
+	// 字符类断言或近似匹配在特定 Flag 组合下被拒绝。
+	ErrUnsupportedExpression = errors.New("unsupported expression")
+
+	// ErrRegexTooComplex 表示表达式的资源占用超出 [compiler.CompileLimits] 设定的上限，
+	// 例如状态数、缓存展开或字符类数量超过阈值。
+	ErrRegexTooComplex = errors.New("regular expression is too complex")
+
+	// ErrInvalidExtension 表示 [Expression.Ext] 的 Flags 与数值字段不一致，例如偏移区间非法。
+	ErrInvalidExtension = errors.New("invalid expression extension")
+
+	// ErrUnsupportedExtension 表示扩展请求在当前表达式形态下无法精确执行，
+	// 例如组合规则搭配了非偏移类扩展。
+	ErrUnsupportedExtension = errors.New("unsupported expression extension")
+
+	// ErrInvalidCombination 表示组合规则的语法或操作数引用不合法，例如空组合、引用未知
+	// id、组合规则引用另一个组合规则。
+	ErrInvalidCombination = errors.New("invalid combination")
+)
+
 // CompileFlag 是编译期标志位集合，控制匹配语义和输出行为。
 type CompileFlag uint32
 
@@ -31,7 +68,7 @@ func (f CompileFlag) String() string {
 	names := []struct {
 		flag CompileFlag
 		name string
-	}{{FlagCaseless, "caseless"}, {FlagDotAll, "dotall"}, {FlagMultiline, "multiline"}, {FlagSingleMatch, "singlematch"}, {FlagAllowEmpty, "allowempty"}, {FlagUTF8, "utf8"}, {FlagUCP, "ucp"}, {FlagPrefilter, "prefilter"}, {FlagSOMLeftmost, "som-leftmost"}, {FlagCombination, "combination"}, {FlagQuiet, "quiet"}}
+	}{{CompileCaseless, "caseless"}, {CompileDotAll, "dotall"}, {CompileMultiline, "multiline"}, {CompileSingleMatch, "singlematch"}, {CompileAllowEmpty, "allowempty"}, {CompileUTF8, "utf8"}, {CompileUCP, "ucp"}, {CompilePrefilter, "prefilter"}, {CompileSOMLeftmost, "som-leftmost"}, {CompileCombination, "combination"}, {CompileQuiet, "quiet"}}
 	out := ""
 	for _, item := range names {
 		if f&item.flag != 0 {
@@ -41,7 +78,7 @@ func (f CompileFlag) String() string {
 			out += item.name
 		}
 	}
-	if unknown := uint32(f &^ (FlagCaseless | FlagDotAll | FlagMultiline | FlagSingleMatch | FlagAllowEmpty | FlagUTF8 | FlagUCP | FlagPrefilter | FlagSOMLeftmost | FlagCombination | FlagQuiet)); unknown != 0 {
+	if unknown := uint32(f &^ (CompileCaseless | CompileDotAll | CompileMultiline | CompileSingleMatch | CompileAllowEmpty | CompileUTF8 | CompileUCP | CompilePrefilter | CompileSOMLeftmost | CompileCombination | CompileQuiet)); unknown != 0 {
 		if out != "" {
 			out += "|"
 		}
@@ -52,7 +89,7 @@ func (f CompileFlag) String() string {
 
 // Valid 判断标志位是否只包含已定义的编译标志。
 func (f CompileFlag) Valid() bool {
-	known := FlagCaseless | FlagDotAll | FlagMultiline | FlagSingleMatch | FlagAllowEmpty | FlagUTF8 | FlagUCP | FlagPrefilter | FlagSOMLeftmost | FlagCombination | FlagQuiet
+	known := CompileCaseless | CompileDotAll | CompileMultiline | CompileSingleMatch | CompileAllowEmpty | CompileUTF8 | CompileUCP | CompilePrefilter | CompileSOMLeftmost | CompileCombination | CompileQuiet
 	return f&^known == 0
 }
 
@@ -61,17 +98,17 @@ func (f CompileFlag) Has(flag CompileFlag) bool { return f&flag != 0 }
 
 func validateCompileFlags(flags CompileFlag) error {
 	if !flags.Valid() {
-		return fmt.Errorf("invalid compile flag")
+		return fmt.Errorf("%w: invalid compile flag", ErrUnsupportedFlag)
 	}
 	switch {
-	case flags&FlagSingleMatch != 0 && flags&FlagSOMLeftmost != 0:
-		return fmt.Errorf("singlematch is not supported with som-leftmost")
-	case flags&FlagQuiet != 0 && flags&FlagSOMLeftmost != 0:
-		return fmt.Errorf("quiet is not supported with som-leftmost")
-	case flags&FlagPrefilter != 0 && flags&FlagSOMLeftmost != 0:
-		return fmt.Errorf("prefilter is not supported with som-leftmost")
-	case flags&FlagCombination != 0 && flags&^(FlagCombination|FlagQuiet|FlagSingleMatch) != 0:
-		return fmt.Errorf("only quiet and singlematch are supported with combination")
+	case flags&CompileSingleMatch != 0 && flags&CompileSOMLeftmost != 0:
+		return fmt.Errorf("%w: singlematch is not supported with som-leftmost", ErrUnsupportedFlag)
+	case flags&CompileQuiet != 0 && flags&CompileSOMLeftmost != 0:
+		return fmt.Errorf("%w: quiet is not supported with som-leftmost", ErrUnsupportedFlag)
+	case flags&CompilePrefilter != 0 && flags&CompileSOMLeftmost != 0:
+		return fmt.Errorf("%w: prefilter is not supported with som-leftmost", ErrUnsupportedFlag)
+	case flags&CompileCombination != 0 && flags&^(CompileCombination|CompileQuiet|CompileSingleMatch) != 0:
+		return fmt.Errorf("%w: only quiet and singlematch are supported with combination", ErrUnsupportedFlag)
 	default:
 	}
 	return nil
@@ -79,38 +116,38 @@ func validateCompileFlags(flags CompileFlag) error {
 
 // 编译标志的位定义，可按位或组合后写入 [Expression.Flags]，未定义位由 [CompileFlag.Valid] 判定。
 const (
-	// FlagCaseless 忽略大小写：默认按 ASCII 折叠，配合 [FlagUTF8] 时按 Unicode 简单折叠。
-	FlagCaseless CompileFlag = 1
+	// CompileCaseless 忽略大小写：默认按 ASCII 折叠，配合 [CompileUTF8] 时按 Unicode 简单折叠。
+	CompileCaseless CompileFlag = 1
 
-	// FlagDotAll 让 `.` 匹配换行符。
-	FlagDotAll CompileFlag = 2
+	// CompileDotAll 让 `.` 匹配换行符。
+	CompileDotAll CompileFlag = 2
 
-	// FlagMultiline 让 `^` 与 `$` 额外匹配行首和行尾，`\A` 与 `\z` 仍是数据的绝对边界。
-	FlagMultiline CompileFlag = 4
+	// CompileMultiline 让 `^` 与 `$` 额外匹配行首和行尾，`\A` 与 `\z` 仍是数据的绝对边界。
+	CompileMultiline CompileFlag = 4
 
-	// FlagSingleMatch 每条规则只报告首个匹配，之后不再报告该规则的结果。
-	FlagSingleMatch CompileFlag = 8
+	// CompileSingleMatch 每条规则只报告首个匹配，之后不再报告该规则的结果。
+	CompileSingleMatch CompileFlag = 8
 
-	// FlagAllowEmpty 放行匹配空串的规则，未开启时 [Compile] 直接报错，同时关闭前缀守卫优化。
-	FlagAllowEmpty CompileFlag = 16
+	// CompileAllowEmpty 放行匹配空串的规则，未开启时 [Compile] 直接报错，同时关闭前缀守卫优化。
+	CompileAllowEmpty CompileFlag = 16
 
-	// FlagUTF8 按 UTF-8 码位解释模式与输入，匹配起点不会落在续字节上。
-	FlagUTF8 CompileFlag = 32
+	// CompileUTF8 按 UTF-8 码位解释模式与输入，匹配起点不会落在续字节上。
+	CompileUTF8 CompileFlag = 32
 
-	// FlagUCP 让 `\b`、`\w` 这类字符判定按 Unicode 码点而非字节进行，通常与 [FlagUTF8] 同时开启。
-	FlagUCP CompileFlag = 64
+	// CompileUCP 让 `\b`、`\w` 这类字符判定按 Unicode 码点而非字节进行，通常与 [CompileUTF8] 同时开启。
+	CompileUCP CompileFlag = 64
 
-	// FlagPrefilter 启用编译期推导的候选文字做起点过滤，未开启时不建立起点表。
-	FlagPrefilter CompileFlag = 128
+	// CompilePrefilter 启用编译期推导的候选文字做起点过滤，未开启时不建立起点表。
+	CompilePrefilter CompileFlag = 128
 
-	// FlagSOMLeftmost 同一规则在每个结束偏移只保留起点最早的匹配。
-	FlagSOMLeftmost CompileFlag = 256
+	// CompileSOMLeftmost 同一规则在每个结束偏移只保留起点最早的匹配。
+	CompileSOMLeftmost CompileFlag = 256
 
-	// FlagCombination 表示模式是布尔组合表达式而非正则，只允许搭配偏移类扩展。
-	FlagCombination CompileFlag = 512
+	// CompileCombination 表示模式是布尔组合表达式而非正则，只允许搭配偏移类扩展。
+	CompileCombination CompileFlag = 512
 
-	// FlagQuiet 只参与内部判定，不向调用方报告该规则的匹配。
-	FlagQuiet CompileFlag = 1024
+	// CompileQuiet 只参与内部判定，不向调用方报告该规则的匹配。
+	CompileQuiet CompileFlag = 1024
 )
 
 // Expression 是一条待编译的规则：编号、正则模式和编译标志。
@@ -214,16 +251,16 @@ func (e *ExpressionExt) Validate() error {
 	}
 	known := ExtFlagMinOffset | ExtFlagMaxOffset | ExtFlagMinLength | ExtFlagEditDistance | ExtFlagHammingDistance
 	if e.Flags&^known != 0 {
-		return fmt.Errorf("unknown extension flag")
+		return fmt.Errorf("%w: unknown extension flag", ErrInvalidExtension)
 	}
 	if e.Flags&ExtFlagEditDistance != 0 && e.Flags&ExtFlagHammingDistance != 0 {
-		return fmt.Errorf("edit and hamming distance are mutually exclusive")
+		return fmt.Errorf("%w: edit and hamming distance are mutually exclusive", ErrInvalidExtension)
 	}
 	if e.Flags&ExtFlagMinOffset != 0 && e.Flags&ExtFlagMaxOffset != 0 && e.MaxOffset < e.MinOffset {
-		return fmt.Errorf("maximum offset below minimum offset")
+		return fmt.Errorf("%w: maximum offset below minimum offset", ErrInvalidExtension)
 	}
 	if e.Flags&ExtFlagMinLength != 0 && e.Flags&ExtFlagMaxOffset != 0 && e.MinLength > e.MaxOffset {
-		return fmt.Errorf("minimum length exceeds maximum offset")
+		return fmt.Errorf("%w: minimum length exceeds maximum offset", ErrInvalidExtension)
 	}
 	return nil
 }
@@ -235,7 +272,7 @@ func Compile(expressions []Expression) (*Scanner, error) {
 
 func compileWithContext(ctx context.Context, expressions []Expression, limits compiler.CompileLimits) (*Scanner, error) {
 	if len(expressions) == 0 {
-		return nil, fmt.Errorf("no expressions")
+		return nil, fmt.Errorf("%w", ErrEmptyExpressions)
 	}
 	rules := make([]compiledRule, 0, len(expressions))
 	seen := make(map[uint32]struct{}, len(expressions))
@@ -245,29 +282,29 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			return nil, &compiler.CompileError{Kind: compiler.ErrorCancelled, Expression: i, Message: "compile cancelled"}
 		}
 		if _, ok := seen[expression.Id]; ok {
-			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Position: 0, Message: "duplicate expression id"}
+			return nil, fmt.Errorf("%w: expression %d: %w", ErrDuplicateExpression, i, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Position: 0, Message: "duplicate expression id"})
 		}
 		seen[expression.Id] = struct{}{}
 		if err := expression.Validate(); err != nil {
-			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Position: 0, Message: err.Error()}
+			return nil, fmt.Errorf("%w: expression %d: %w: %w", ErrInvalidExpression, i, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Position: 0, Message: err.Error()}, err)
 		}
 		flags := expression.Flags
 		pattern, flags, extended, err := consumeLeadingInlineFlags(expression.Pattern, flags)
 		if err != nil {
-			return nil, &compiler.CompileError{Kind: compiler.ErrorSyntax, Expression: i, Position: 0, Message: err.Error()}
+			return nil, fmt.Errorf("%w: expression %d: %w: %w", ErrUnsupportedExpression, i, &compiler.CompileError{Kind: compiler.ErrorSyntax, Expression: i, Position: 0, Message: err.Error()}, err)
 		}
-		if flags&FlagUTF8 != 0 && !utf8.ValidString(pattern) {
-			return nil, &compiler.CompileError{Kind: compiler.ErrorSyntax, Expression: i, Position: 0, Message: "pattern is not valid UTF-8"}
+		if flags&CompileUTF8 != 0 && !utf8.ValidString(pattern) {
+			return nil, fmt.Errorf("%w: expression %d: %w", ErrInvalidUTF8, i, &compiler.CompileError{Kind: compiler.ErrorSyntax, Expression: i, Position: 0, Message: "pattern is not valid UTF-8"})
 		}
 		if err = validateCompileFlags(flags); err != nil {
-			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}
+			return nil, fmt.Errorf("%w: expression %d: %w: %w", ErrUnsupportedFlag, i, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}, err)
 		}
-		if flags&FlagCombination != 0 && expression.Ext != nil && expression.Ext.Flags&^(ExtFlagMinOffset|ExtFlagMaxOffset) != 0 {
-			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: "only offset extensions are supported with combination"}
+		if flags&CompileCombination != 0 && expression.Ext != nil && expression.Ext.Flags&^(ExtFlagMinOffset|ExtFlagMaxOffset) != 0 {
+			return nil, fmt.Errorf("%w: expression %d: %w", ErrUnsupportedExtension, i, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: "only offset extensions are supported with combination"})
 		}
 		var root parser.Node
 		var combNode parser.Node
-		if flags&FlagCombination != 0 {
+		if flags&CompileCombination != 0 {
 			combNode, err = parser.ParseCombination(pattern)
 			if err == nil {
 				combNode = combination.Normalize(combNode)
@@ -281,15 +318,15 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			if parseErr, ok := errors.AsType[*parser.ParseError](err); ok {
 				position = parseErr.Position
 			}
-			return nil, &compiler.CompileError{Kind: compiler.ErrorSyntax, Expression: i, Position: position, Message: err.Error()}
+			return nil, fmt.Errorf("%w: expression %d: %w: %w", ErrUnsupportedExpression, i, &compiler.CompileError{Kind: compiler.ErrorSyntax, Expression: i, Position: position, Message: err.Error()}, err)
 		}
 		root = parser.Normalize(root)
-		if flags&FlagCombination != 0 {
+		if flags&CompileCombination != 0 {
 			if err = parser.Validate(root); err != nil {
-				return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}
+				return nil, fmt.Errorf("%w: expression %d: %w: %w", ErrInvalidCombination, i, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}, err)
 			}
 			if err = expression.Ext.Validate(); err != nil {
-				return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}
+				return nil, fmt.Errorf("%w: expression %d: %w: %w", ErrInvalidExtension, i, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}, err)
 			}
 			var extCopy *ExpressionExt
 			var extFlags ExpressionExtFlag
@@ -301,21 +338,21 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			comboBytes := uint64(len(expression.Pattern))
 			totalUsage.Add(compiler.Usage{ProgramBytes: comboBytes, MemoryBytes: comboBytes})
 			if err = limits.Check(totalUsage); err != nil {
-				return nil, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Message: err.Error()}
+				return nil, fmt.Errorf("%w: expression %d: %w: %w", ErrRegexTooComplex, i, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Message: err.Error()}, err)
 			}
 			info := compiler.DeriveExpressionInfo(expression.Id, uint32(flags), uint64(extFlags), root, nil)
 			applyExpressionAttributes(&info, flags, extCopy)
 			rules = append(rules, compiledRule{id: expression.Id, root: root, comb: combNode, flags: flags, ext: extCopy, info: info})
 			continue
 		}
-		if parser.Nullable(root) && flags&FlagAllowEmpty == 0 {
-			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: "empty match requires allow-empty flag"}
+		if parser.Nullable(root) && flags&CompileAllowEmpty == 0 {
+			return nil, fmt.Errorf("%w: expression %d: %w", ErrInvalidExpression, i, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: "empty match requires allow-empty flag"})
 		}
 		if err = parser.Validate(root); err != nil {
-			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Position: 0, Message: err.Error()}
+			return nil, fmt.Errorf("%w: expression %d: %w: %w", ErrInvalidExpression, i, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Position: 0, Message: err.Error()}, err)
 		}
 		if err = expression.Ext.Validate(); err != nil {
-			return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}
+			return nil, fmt.Errorf("%w: expression %d: %w: %w", ErrInvalidExtension, i, &compiler.CompileError{Kind: compiler.ErrorInvalidExpression, Expression: i, Message: err.Error()}, err)
 		}
 		ng, err := nfagraph.NewBuilder().Build(root)
 		if err != nil {
@@ -330,7 +367,7 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			usage := compiler.Usage{ProgramBytes: uint64(len(pattern)), MemoryBytes: uint64(len(pattern))}
 			totalUsage.Add(usage)
 			if err = limits.Check(totalUsage); err != nil {
-				return nil, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Position: 0, Message: err.Error()}
+				return nil, fmt.Errorf("%w: expression %d: %w: %w", ErrRegexTooComplex, i, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Position: 0, Message: err.Error()}, err)
 			}
 			info := compiler.DeriveExpressionInfo(expression.Id, uint32(flags), uint64(extFlags), root, nil)
 			applyExpressionAttributes(&info, flags, extCopy)
@@ -352,7 +389,7 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 		graphEdges := uint64(ng.EdgeCount())
 		graphUsage := compiler.Usage{GraphVertices: uint64(ng.NodeCount()), GraphEdges: graphEdges}
 		if err = limits.Check(totalUsage.Merge(graphUsage)); err != nil {
-			return nil, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Position: 0, Message: err.Error()}
+			return nil, fmt.Errorf("%w: expression %d: %w: %w", ErrRegexTooComplex, i, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Position: 0, Message: err.Error()}, err)
 		}
 		dfaLimit := 0
 		if limits.DFAStates > 0 && limits.DFAStates <= uint64(^uint(0)>>1) {
@@ -363,8 +400,8 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 		features := engine.SelectionFeatures{
 			Stateful:   parser.RequiresStatefulRuntime(root),
 			Assertions: parser.HasAssertion(root) || containsAny(root),
-			UTF8:       flags&FlagUTF8 != 0,
-			UCP:        flags&(FlagUCP|FlagCaseless|FlagMultiline|FlagDotAll) != 0,
+			UTF8:       flags&CompileUTF8 != 0,
+			UCP:        flags&(CompileUCP|CompileCaseless|CompileMultiline|CompileDotAll) != 0,
 		}
 		var autoProgram *engine.Program
 		if !features.Stateful && !features.Assertions && !features.UTF8 && !features.UCP {
@@ -374,7 +411,7 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 				if errors.Is(err, nfa.ErrStateLimit) || errors.Is(err, nfa.ErrEdgeLimit) || errors.Is(err, nfa.ErrMemoryLimit) || errors.Is(err, dfa.ErrStateLimit) || errors.Is(err, dfa.ErrMemoryLimit) {
 					kind = compiler.ErrorResourceLimit
 				}
-				return nil, &compiler.CompileError{Kind: kind, Expression: i, Position: 0, Message: err.Error()}
+				return nil, fmt.Errorf("%w: expression %d: %w", mapEngineKindToSentinel(kind), i, &compiler.CompileError{Kind: kind, Expression: i, Position: 0, Message: err.Error()})
 			}
 		}
 		edges := uint64(0)
@@ -406,7 +443,7 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 		}
 		totalUsage.Add(usage)
 		if err = limits.Check(totalUsage); err != nil {
-			return nil, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Position: 0, Message: err.Error()}
+			return nil, fmt.Errorf("%w: expression %d: %w: %w", ErrRegexTooComplex, i, &compiler.CompileError{Kind: compiler.ErrorResourceLimit, Expression: i, Position: 0, Message: err.Error()}, err)
 		}
 		extFlags := ExpressionExtFlag(0)
 		var extCopy *ExpressionExt
@@ -414,7 +451,7 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			extFlags = expression.Ext.Flags
 			copyValue := *expression.Ext
 			extCopy = &copyValue
-			if flags&FlagPrefilter != 0 {
+			if flags&CompilePrefilter != 0 {
 				extCopy.Flags &^= ExtFlagMinLength
 				extCopy.MinLength = 0
 				extFlags = extCopy.Flags
@@ -430,7 +467,7 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			}
 		}
 		// ASCII 大小写折叠无法覆盖多字节字符；此时不建立可能漏报的候选过滤。
-		if flags&FlagCaseless != 0 && !asciiBytes(candidate) {
+		if flags&CompileCaseless != 0 && !asciiBytes(candidate) {
 			candidate = nil
 		}
 		info := compiler.DeriveExpressionInfo(expression.Id, uint32(flags), uint64(extFlags), root, ng)
@@ -442,7 +479,7 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			info.SetBailout(optimizeBailout)
 		}
 		rule := compiledRule{id: expression.Id, root: root, flags: flags, ext: extCopy, info: info, prefilter: candidate, program: autoProgram}
-		if extCopy == nil && !parser.HasScopedFlags(root) && flags&(FlagCaseless|FlagUTF8|FlagUCP|FlagMultiline|FlagDotAll) == 0 {
+		if extCopy == nil && !parser.HasScopedFlags(root) && flags&(CompileCaseless|CompileUTF8|CompileUCP|CompileMultiline|CompileDotAll) == 0 {
 			if literal, ok := literalPattern(root); ok && len(literal) > 0 {
 				if small, smallErr := smallengine.CompileWithOptions(literal, smallengine.CompileOptions{SmallWriteSize: 8}); smallErr == nil {
 					switch small.Kind {
@@ -457,11 +494,11 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			if unit, minCount, maxCount, greedy, ok := repeatedLiteralPattern(root); ok {
 				rule.repeat, err = repeat.New(unit, minCount, maxCount, greedy)
 				if err != nil {
-					return nil, &compiler.CompileError{Kind: compiler.ErrorUnsupported, Expression: i, Position: 0, Message: err.Error()}
+					return nil, fmt.Errorf("%w: expression %d: %w: %w", ErrUnsupportedExpression, i, &compiler.CompileError{Kind: compiler.ErrorUnsupported, Expression: i, Position: 0, Message: err.Error()}, err)
 				}
 			}
 		}
-		if rule.ext == nil && flags&(FlagCaseless|FlagUTF8|FlagUCP|FlagMultiline|FlagDotAll) == 0 && !rule.info.Stateful && !rule.info.LBR {
+		if rule.ext == nil && flags&(CompileCaseless|CompileUTF8|CompileUCP|CompileMultiline|CompileDotAll) == 0 && !rule.info.Stateful && !rule.info.LBR {
 			if specialized, compileErr := nfa.CompileAuto(ng); compileErr == nil && specialized.SupportsGraph(ng) {
 				backendBytes := specialized.MemoryBytes()
 				if limits.MemoryBytes == 0 || totalUsage.MemoryBytes <= limits.MemoryBytes && backendBytes <= limits.MemoryBytes-totalUsage.MemoryBytes {
@@ -497,19 +534,19 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 		}
 		for _, id := range combination.IDs(rule.comb) {
 			if _, ok := knownIDs[id]; !ok {
-				return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidReference, Expression: i, Message: fmt.Sprintf("combination references unknown expression %d", id)}
+				return nil, fmt.Errorf("%w: expression %d: %w", ErrInvalidCombination, i, &compiler.CompileError{Kind: compiler.ErrorInvalidReference, Expression: i, Message: fmt.Sprintf("combination references unknown expression %d", id)})
 			}
 			target := ruleByID[id]
 			if target.comb != nil {
-				return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidReference, Expression: i, Message: fmt.Sprintf("combination references another combination %d", id)}
+				return nil, fmt.Errorf("%w: expression %d: %w", ErrInvalidCombination, i, &compiler.CompileError{Kind: compiler.ErrorInvalidReference, Expression: i, Message: fmt.Sprintf("combination references another combination %d", id)})
 			}
-			if target.flags&(FlagSOMLeftmost|FlagPrefilter) != 0 {
-				return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidReference, Expression: i, Message: fmt.Sprintf("combination operand %d uses unsupported flags", id)}
+			if target.flags&(CompileSOMLeftmost|CompilePrefilter) != 0 {
+				return nil, fmt.Errorf("%w: expression %d: %w", ErrInvalidCombination, i, &compiler.CompileError{Kind: compiler.ErrorInvalidReference, Expression: i, Message: fmt.Sprintf("combination operand %d uses unsupported flags", id)})
 			}
 		}
 	}
 	if err := combination.ValidateDependencies(dependencies); err != nil {
-		return nil, &compiler.CompileError{Kind: compiler.ErrorInvalidReference, Expression: -1, Message: err.Error()}
+		return nil, fmt.Errorf("%w: %w: %w", ErrInvalidCombination, &compiler.CompileError{Kind: compiler.ErrorInvalidReference, Expression: -1, Message: err.Error()}, err)
 	}
 	scanner := newScanner(rules)
 	scanner.usage = totalUsage
@@ -567,11 +604,11 @@ func consumeLeadingInlineFlags(pattern string, flags CompileFlag) (string, Compi
 				enable = false
 				continue
 			case 'i':
-				flag = FlagCaseless
+				flag = CompileCaseless
 			case 's':
-				flag = FlagDotAll
+				flag = CompileDotAll
 			case 'm':
-				flag = FlagMultiline
+				flag = CompileMultiline
 			default:
 				valid = false
 				continue
@@ -728,5 +765,18 @@ func repeatedLiteralPattern(n parser.Node) ([]byte, int, int, bool, bool) {
 		return unit, value.Min, value.Max, value.Greedy, ok && len(unit) > 0
 	default:
 		return nil, 0, 0, false, false
+	}
+}
+
+// mapEngineKindToSentinel 根据 engine.CompileAutoWithFeatures 报告的 [compiler.ErrorKind]
+// 映射到对应的公开哨兵错误，仅用于编译期错误出口，不参与业务逻辑判断。
+func mapEngineKindToSentinel(kind compiler.ErrorKind) error {
+	switch kind {
+	case compiler.ErrorResourceLimit:
+		return ErrRegexTooComplex
+	case compiler.ErrorUnsupported:
+		return ErrUnsupportedExpression
+	default:
+		return ErrInvalidExpression
 	}
 }

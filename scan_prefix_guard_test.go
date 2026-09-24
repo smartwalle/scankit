@@ -21,11 +21,11 @@ func TestPrefixGuardSets(t *testing.T) {
 		{name: "fixed prefix", pattern: `https?://[a-z]+`, length: 4, allow: "http://host", reject: "htxp://host"},
 		{name: "lookahead", pattern: `(?=abc)abc`, length: 3, allow: "abc", reject: "abd"},
 		{name: "unbounded class prefix", pattern: `[A-Za-z0-9._/-]+\.go`, length: 1, allow: "a_test.go", reject: " a_test.go"},
-		{name: "empty body", pattern: `a*`, flags: FlagAllowEmpty, length: 0},
+		{name: "empty body", pattern: `a*`, flags: CompileAllowEmpty, length: 0},
 		{name: "optional head", pattern: `a?b`, length: 0},
 		{name: "alternate heads", pattern: `(?:ab|cd)e`, length: 0},
-		{name: "caseless", pattern: `abc`, flags: FlagCaseless, length: 0},
-		{name: "utf8", pattern: `abc`, flags: FlagUTF8, length: 0},
+		{name: "caseless", pattern: `abc`, flags: CompileCaseless, length: 0},
+		{name: "utf8", pattern: `abc`, flags: CompileUTF8, length: 0},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {

@@ -11,7 +11,7 @@ func TestPrefilterPreservesResults(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	expr.Flags = FlagPrefilter
+	expr.Flags = CompilePrefilter
 	b, e := Compile([]Expression{expr})
 	if e != nil {
 		t.Fatal(e)
@@ -30,12 +30,12 @@ func TestPrefilterPreservesResults(t *testing.T) {
 }
 
 func TestPrefilterPreservesCaselessResults(t *testing.T) {
-	expr := Expression{Id: 1, Pattern: `foo[0-9]+bar`, Flags: FlagCaseless}
+	expr := Expression{Id: 1, Pattern: `foo[0-9]+bar`, Flags: CompileCaseless}
 	without, err := Compile([]Expression{expr})
 	if err != nil {
 		t.Fatal(err)
 	}
-	expr.Flags |= FlagPrefilter
+	expr.Flags |= CompilePrefilter
 	with, err := Compile([]Expression{expr})
 	if err != nil {
 		t.Fatal(err)
@@ -57,7 +57,7 @@ func TestPrefilterPreservesCaselessResults(t *testing.T) {
 }
 
 func TestPrefilterDoesNotRejectUnicodeCaselessLiteral(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 9, Pattern: "ÄBC", Flags: FlagUTF8 | FlagCaseless | FlagPrefilter}})
+	s, err := Compile([]Expression{{Id: 9, Pattern: "ÄBC", Flags: CompileUTF8 | CompileCaseless | CompilePrefilter}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestPrefilterDoesNotRejectUnicodeCaselessLiteral(t *testing.T) {
 }
 
 func TestPrefilterSquashesMinimumLength(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 1, Pattern: "a", Flags: FlagPrefilter, Ext: &ExpressionExt{Flags: ExtFlagMinLength, MinLength: 2}}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: "a", Flags: CompilePrefilter, Ext: &ExpressionExt{Flags: ExtFlagMinLength, MinLength: 2}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,8 +84,8 @@ func TestPrefilterSquashesMinimumLength(t *testing.T) {
 
 func TestSharedCandidatesSupportASCIIInsensitiveRules(t *testing.T) {
 	s, err := Compile([]Expression{
-		{Id: 1, Pattern: "header-[0-9]+", Flags: FlagCaseless},
-		{Id: 2, Pattern: "footer-[A-Z]+", Flags: FlagCaseless},
+		{Id: 1, Pattern: "header-[0-9]+", Flags: CompileCaseless},
+		{Id: 2, Pattern: "footer-[A-Z]+", Flags: CompileCaseless},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -97,7 +97,7 @@ func TestSharedCandidatesSupportASCIIInsensitiveRules(t *testing.T) {
 }
 
 func TestPrefilterBranchCandidateStillRunsFullConfirmation(t *testing.T) {
-	with, err := Compile([]Expression{{Id: 1, Pattern: `(?:foo|foobar)baz`, Flags: FlagPrefilter}})
+	with, err := Compile([]Expression{{Id: 1, Pattern: `(?:foo|foobar)baz`, Flags: CompilePrefilter}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestPrefilterBranchCandidateStillRunsFullConfirmation(t *testing.T) {
 }
 
 func TestSinglePrefilterUsesAllCandidateStarts(t *testing.T) {
-	scanner, err := Compile([]Expression{{Id: 91, Pattern: `foo[0-9]`, Flags: FlagPrefilter}})
+	scanner, err := Compile([]Expression{{Id: 91, Pattern: `foo[0-9]`, Flags: CompilePrefilter}})
 	if err != nil {
 		t.Fatal(err)
 	}

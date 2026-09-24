@@ -55,7 +55,7 @@ func startByteSet(rule compiledRule) []byte {
 	}
 	// 大小写折叠、UTF-8 语义、编辑距离与状态化结构都会让首字节偏离语法树
 	// 直接推导的结果，这里一律不做过滤。
-	if rule.flags&(FlagCaseless|FlagUTF8|FlagUCP) != 0 {
+	if rule.flags&(CompileCaseless|CompileUTF8|CompileUCP) != 0 {
 		return full()
 	}
 	if rule.ext != nil && rule.ext.Flags&(ExtFlagEditDistance|ExtFlagHammingDistance) != 0 {

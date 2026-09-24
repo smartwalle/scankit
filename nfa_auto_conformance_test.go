@@ -14,7 +14,7 @@ func TestAutoNFASelectionMatchesGenericScanner(t *testing.T) {
 		{name: "repeat", pat: `(?:xy){1,3}`, data: []byte("xyxy zxyxyxy")},
 		{name: "boundary", pat: `\bcat\b`, data: []byte("cat scatter cat")},
 		{name: "lookaround", pat: `(?=ab)ab`, data: []byte("zab ab")},
-		{name: "empty", pat: `a*`, data: []byte("ba"), flags: FlagAllowEmpty},
+		{name: "empty", pat: `a*`, data: []byte("ba"), flags: CompileAllowEmpty},
 		{name: "class-repeat", pat: `[a-c]{2,3}`, data: []byte("ab cde zz")},
 	}
 	for _, tc := range cases {

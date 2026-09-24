@@ -13,7 +13,7 @@ func TestSingleBlockConformanceMatrix(t *testing.T) {
 		data []byte
 		want int
 	}{
-		{"utf8", Expression{Id: 1, Pattern: "é", Flags: FlagUTF8}, []byte("xé"), 1},
+		{"utf8", Expression{Id: 1, Pattern: "é", Flags: CompileUTF8}, []byte("xé"), 1},
 		{"boundary", Expression{Id: 2, Pattern: `\bcat\b`}, []byte("cat scatter"), 1},
 		{"backref", Expression{Id: 3, Pattern: `(ab)\1`}, []byte("abab"), 1},
 		{"repeat", Expression{Id: 4, Pattern: `a{2,3}`}, []byte("aaa"), 1},
@@ -47,7 +47,7 @@ func TestBinaryModeAcceptsInvalidUTF8Bytes(t *testing.T) {
 func TestSingleScanEmptyAndNULConformance(t *testing.T) {
 	scanner, err := Compile([]Expression{
 		{Id: 1, Pattern: `\x00`},
-		{Id: 2, Pattern: `a*`, Flags: FlagAllowEmpty},
+		{Id: 2, Pattern: `a*`, Flags: CompileAllowEmpty},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -158,7 +158,7 @@ func TestEditFixedClassUsesDynamicConfirmation(t *testing.T) {
 
 func TestHammingClassHonorsCaselessFlag(t *testing.T) {
 	scanner, err := Compile([]Expression{{
-		Id: 11, Pattern: `[a-c]x`, Flags: FlagCaseless,
+		Id: 11, Pattern: `[a-c]x`, Flags: CompileCaseless,
 		Ext: &ExpressionExt{Flags: ExtFlagHammingDistance, HammingDistance: 0},
 	}})
 	if err != nil {
@@ -187,7 +187,7 @@ func TestFuzzyNegatedClassUsesComplementMask(t *testing.T) {
 
 func TestHammingUppercaseClassHonorsCaselessFlag(t *testing.T) {
 	scanner, err := Compile([]Expression{{
-		Id: 12, Pattern: `[A-C]x`, Flags: FlagCaseless,
+		Id: 12, Pattern: `[A-C]x`, Flags: CompileCaseless,
 		Ext: &ExpressionExt{Flags: ExtFlagHammingDistance, HammingDistance: 0},
 	}})
 	if err != nil {
@@ -262,7 +262,7 @@ func TestFuzzyWildcardAtomHonorsDotAll(t *testing.T) {
 	if err != nil || len(got) != 1 || got[0].From != 4 {
 		t.Fatalf("通配原子换行语义错误: %#v, %v", got, err)
 	}
-	with, err := Compile([]Expression{{Id: 32, Pattern: `a.b`, Flags: FlagDotAll, Ext: &ExpressionExt{Flags: ExtFlagHammingDistance, HammingDistance: 0}}})
+	with, err := Compile([]Expression{{Id: 32, Pattern: `a.b`, Flags: CompileDotAll, Ext: &ExpressionExt{Flags: ExtFlagHammingDistance, HammingDistance: 0}}})
 	if err != nil {
 		t.Fatal(err)
 	}

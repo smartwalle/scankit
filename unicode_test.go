@@ -3,7 +3,7 @@ package scankit
 import "testing"
 
 func TestUnicodeProperty(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 1, Pattern: `\p{L}+`, Flags: FlagUTF8 | FlagUCP}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: `\p{L}+`, Flags: CompileUTF8 | CompileUCP}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -15,10 +15,10 @@ func TestUnicodeProperty(t *testing.T) {
 
 func TestUnicodeBoundaryRejectsContinuationBytePosition(t *testing.T) {
 	data := []byte("中")
-	if wordBefore(data, 1, FlagUTF8) || wordAfter(data, 1, FlagUTF8) {
+	if wordBefore(data, 1, CompileUTF8) || wordAfter(data, 1, CompileUTF8) {
 		t.Fatal("续字节位置被错误识别为单词边界")
 	}
-	s, err := Compile([]Expression{{Id: 1, Pattern: `\b中`, Flags: FlagUTF8 | FlagUCP}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: `\b中`, Flags: CompileUTF8 | CompileUCP}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestUnicodeBoundaryRejectsContinuationBytePosition(t *testing.T) {
 }
 
 func TestUnicodePropertyAliases(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 1, Pattern: `\p{ASCII}+`, Flags: FlagUTF8}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: `\p{ASCII}+`, Flags: CompileUTF8}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestUnicodePropertyAliases(t *testing.T) {
 }
 
 func TestUnicodeScriptProperty(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 1, Pattern: `\p{Greek}`, Flags: FlagUTF8}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: `\p{Greek}`, Flags: CompileUTF8}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestUnicodeScriptProperty(t *testing.T) {
 
 func TestUnicodePropertyQualifiedAliases(t *testing.T) {
 	for _, pattern := range []string{`\p{Script=Greek}`, `\p{sc=Greek}`, `\p{gc=Lu}`} {
-		s, err := Compile([]Expression{{Id: 1, Pattern: pattern, Flags: FlagUTF8}})
+		s, err := Compile([]Expression{{Id: 1, Pattern: pattern, Flags: CompileUTF8}})
 		if err != nil {
 			t.Fatalf("属性 %s 编译失败: %v", pattern, err)
 		}
@@ -73,7 +73,7 @@ func TestUnicodeCharacterShorthandsWithUCP(t *testing.T) {
 		{`\D+`, "١a", 1},
 	}
 	for _, tc := range cases {
-		s, err := Compile([]Expression{{Id: 1, Pattern: tc.pattern, Flags: FlagUTF8 | FlagUCP}})
+		s, err := Compile([]Expression{{Id: 1, Pattern: tc.pattern, Flags: CompileUTF8 | CompileUCP}})
 		if err != nil {
 			t.Fatalf("compile %q: %v", tc.pattern, err)
 		}
@@ -85,7 +85,7 @@ func TestUnicodeCharacterShorthandsWithUCP(t *testing.T) {
 }
 
 func TestBracedHexUTF8Literal(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 1, Pattern: `\x{4e2d}\x{6587}`, Flags: FlagUTF8}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: `\x{4e2d}\x{6587}`, Flags: CompileUTF8}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestBracedHexUTF8Literal(t *testing.T) {
 }
 
 func TestUTF8NegatedClassConsumesWholeRune(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 1, Pattern: `\N+`, Flags: FlagUTF8}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: `\N+`, Flags: CompileUTF8}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestUTF8NegatedClassConsumesWholeRune(t *testing.T) {
 }
 
 func TestUCPWordBoundaryTreatsCombiningMarkAsWord(t *testing.T) {
-	s, err := Compile([]Expression{{Id: 1, Pattern: "a\\b\u0301", Flags: FlagUTF8 | FlagUCP}})
+	s, err := Compile([]Expression{{Id: 1, Pattern: "a\\b\u0301", Flags: CompileUTF8 | CompileUCP}})
 	if err != nil {
 		t.Fatal(err)
 	}
