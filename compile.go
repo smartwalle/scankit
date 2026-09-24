@@ -81,24 +81,34 @@ func validateCompileFlags(flags CompileFlag) error {
 const (
 	// FlagCaseless 忽略大小写：默认按 ASCII 折叠，配合 [FlagUTF8] 时按 Unicode 简单折叠。
 	FlagCaseless CompileFlag = 1
+
 	// FlagDotAll 让 `.` 匹配换行符。
 	FlagDotAll CompileFlag = 2
+
 	// FlagMultiline 让 `^` 与 `$` 额外匹配行首和行尾，`\A` 与 `\z` 仍是数据的绝对边界。
 	FlagMultiline CompileFlag = 4
+
 	// FlagSingleMatch 每条规则只报告首个匹配，之后不再报告该规则的结果。
 	FlagSingleMatch CompileFlag = 8
+
 	// FlagAllowEmpty 放行匹配空串的规则，未开启时 [Compile] 直接报错，同时关闭前缀守卫优化。
 	FlagAllowEmpty CompileFlag = 16
+
 	// FlagUTF8 按 UTF-8 码位解释模式与输入，匹配起点不会落在续字节上。
 	FlagUTF8 CompileFlag = 32
+
 	// FlagUCP 让 `\b`、`\w` 这类字符判定按 Unicode 码点而非字节进行，通常与 [FlagUTF8] 同时开启。
 	FlagUCP CompileFlag = 64
+
 	// FlagPrefilter 启用编译期推导的候选文字做起点过滤，未开启时不建立起点表。
 	FlagPrefilter CompileFlag = 128
+
 	// FlagSOMLeftmost 同一规则在每个结束偏移只保留起点最早的匹配。
 	FlagSOMLeftmost CompileFlag = 256
+
 	// FlagCombination 表示模式是布尔组合表达式而非正则，只允许搭配偏移类扩展。
 	FlagCombination CompileFlag = 512
+
 	// FlagQuiet 只参与内部判定，不向调用方报告该规则的匹配。
 	FlagQuiet CompileFlag = 1024
 )
@@ -126,12 +136,16 @@ type ExpressionExtFlag uint64
 const (
 	// ExtFlagMinOffset 启用 [ExpressionExt.MinOffset]：匹配结束偏移不得小于该值，值为 0 时不产生约束。
 	ExtFlagMinOffset ExpressionExtFlag = 1
+
 	// ExtFlagMaxOffset 启用 [ExpressionExt.MaxOffset]：匹配结束偏移不得大于该值，未启用时上界无界。
 	ExtFlagMaxOffset ExpressionExtFlag = 2
+
 	// ExtFlagMinLength 启用 [ExpressionExt.MinLength]：匹配长度不得小于该值。
 	ExtFlagMinLength ExpressionExtFlag = 4
+
 	// ExtFlagEditDistance 按编辑距离容错，上限取 [ExpressionExt.EditDistance]，与 [ExtFlagHammingDistance] 互斥。
 	ExtFlagEditDistance ExpressionExtFlag = 8
+
 	// ExtFlagHammingDistance 按汉明距离容错，上限取 [ExpressionExt.HammingDistance]，与 [ExtFlagEditDistance] 互斥。
 	ExtFlagHammingDistance ExpressionExtFlag = 16
 )
