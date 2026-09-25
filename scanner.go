@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"math"
 	"math/bits"
 	"slices"
 	"sort"
@@ -1106,229 +1105,6 @@ func longestLiteral(n parser.Node) []byte {
 		return true
 	})
 	return best
-}
-
-// scanRoseInto 使用独立角色调度器扫描可转换文字，并复用调用方提供的结果切片。
-func (scanner *Scanner) scanRoseInto(data []byte, dst []Match) []Match {
-	program := scanner.roseProgram()
-	if program == nil {
-		return dst[:0]
-	}
-	scheduler := rose.NewScheduler(program)
-	// 角色确认会为同一次扫描反复进入 AST 求值，这里共享一份求值工作区，
-	// 避免 UTF8 模式的字面量节点逐候选重复全量校验 subject。
-	var nodeEval nodeEval
-	events := scheduler.RunReports(data)
-	out := dst[:0]
-	seen := make(map[Match]struct{})
-	confirmEnds := make(map[uint32]map[uint64]uint64)
-	singleSeen := make(map[uint32]bool)
-	for _, event := range events {
-		role, ok := program.FindRole(event.ID)
-		// 多个角色可以共享同一报告编号；必须按候选偏移选择真正命中的角色，
-		// 否则第一个分支会吞掉后续分支的确认结果。
-		if !ok || !role.MatchAt(data, int(event.From)) {
-			ok = false
-			// 同一报告编号可能对应多个角色候选，按扫描代价从低到高选出真正命中的代表。
-			for _, candidate := range program.RolesForReport(event.ID) {
-				if candidate.MatchAt(data, int(event.From)) {
-					role, ok = candidate, true
-					break
-				}
-			}
-		}
-		if !ok {
-			// 角色候选可能因前缀、边界或指令条件失效；候选不是最终
-			// 结果，使用对应规则的完整确认器重新验证当前起点。
-			if index, exists := scanner.ruleIndex[event.ID]; exists && index >= 0 && index < len(scanner.rules) {
-				rule := scanner.rules[index]
-				if rule.flags&CompileQuiet == 0 {
-					for _, end := range matchRuleInto(rule, data, int(event.From), nil, &nodeEval) {
-						if rule.ext != nil && (!rule.ext.OffsetAllowed(uint64(end)) || !rule.ext.LengthAllowed(uint64(end)-event.From)) {
-							continue
-						}
-						match := Match{Id: rule.id, From: event.From, To: uint64(end)}
-						if _, exists := seen[match]; !exists {
-							seen[match] = struct{}{}
-							out = append(out, match)
-						}
-					}
-				}
-			}
-			continue
-		}
-		index, ok := scanner.ruleIndex[role.ReportID]
-		if !ok {
-			continue
-		}
-		rule := scanner.rules[index]
-		if rule.flags&CompileQuiet != 0 {
-			continue
-		}
-		if !role.Confirm {
-			if singleSeen[rule.id] {
-				continue
-			}
-			// 直接文字角色已经完成整段确认，仅需应用报告指令和扩展限制。
-			if rule.ext != nil && (!rule.ext.OffsetAllowed(event.To) || !rule.ext.LengthAllowed(event.To-event.From)) {
-				continue
-			}
-			instructions := program.InstructionsCopy()
-			emitted := false
-			hasInstruction := false
-			for _, instruction := range instructions {
-				if instruction.RoleID != role.ID {
-					continue
-				}
-				hasInstruction = true
-				if instruction.Kind != rose.InstructionReport || instruction.Flags&report.FlagQuiet != 0 {
-					continue
-				}
-				id := instruction.ReportID
-				if id == 0 {
-					id = role.ReportID
-				}
-				match := Match{Id: id, From: event.From, To: event.To}
-				if _, exists := seen[match]; exists {
-					continue
-				}
-				seen[match] = struct{}{}
-				out = append(out, match)
-				emitted = true
-				if instruction.Flags&report.FlagSingleMatch != 0 {
-					singleSeen[rule.id] = true
-				}
-			}
-			if !emitted && !hasInstruction {
-				match := Match{Id: role.ReportID, From: event.From, To: event.To}
-				if _, exists := seen[match]; !exists {
-					seen[match] = struct{}{}
-					out = append(out, match)
-				}
-				if rule.flags&CompileSingleMatch != 0 {
-					singleSeen[rule.id] = true
-				}
-			}
-			continue
-		}
-		if singleSeen[rule.id] {
-			continue
-		}
-		startFrom := 0
-		if rule.info.MaxLength != math.MaxUint64 && rule.info.MaxLength <= event.To {
-			startFrom = int(event.To - rule.info.MaxLength)
-		}
-		for start := startFrom; start <= int(event.From); start++ {
-			for _, end := range matchRuleInto(rule, data, start, nil, &nodeEval) {
-				if end < int(event.From)+len(role.Literal) || start > int(event.From) {
-					continue
-				}
-				if rule.ext != nil && (!rule.ext.OffsetAllowed(uint64(end)) || !rule.ext.LengthAllowed(uint64(end-start))) {
-					continue
-				}
-				match := Match{Id: role.ReportID, From: uint64(start), To: uint64(end)}
-				if confirmEnds[role.ReportID] == nil {
-					confirmEnds[role.ReportID] = make(map[uint64]uint64)
-				}
-				if previous, exists := confirmEnds[role.ReportID][uint64(end)]; exists && previous <= uint64(start) {
-					continue
-				}
-				confirmEnds[role.ReportID][uint64(end)] = uint64(start)
-				if _, exists := seen[match]; !exists {
-					seen[match] = struct{}{}
-					out = append(out, match)
-					if rule.flags&CompileSingleMatch != 0 {
-						singleSeen[rule.id] = true
-					}
-				}
-				if singleSeen[rule.id] {
-					break
-				}
-			}
-		}
-	}
-	return out
-}
-
-func (scanner *Scanner) literalCandidateBackend() string {
-	if scanner == nil {
-		return ""
-	}
-	return scanner.literalKind
-}
-func (scanner *Scanner) ruleIDs() []uint32 {
-	if scanner == nil {
-		return nil
-	}
-	out := make([]uint32, len(scanner.rules))
-	for i, rule := range scanner.rules {
-		out[i] = rule.id
-	}
-	return out
-}
-func (scanner *Scanner) expressionInfo(id uint32) (compiler.ExpressionInfo, bool) {
-	if scanner == nil {
-		return compiler.ExpressionInfo{}, false
-	}
-	index, ok := scanner.ruleIndex[id]
-	if !ok || index < 0 || index >= len(scanner.rules) {
-		return compiler.ExpressionInfo{}, false
-	}
-	return scanner.rules[index].info.Clone(), true
-}
-func (scanner *Scanner) backendName(id uint32) string {
-	if scanner == nil {
-		return ""
-	}
-	index, ok := scanner.ruleIndex[id]
-	if !ok || index < 0 || index >= len(scanner.rules) {
-		return ""
-	}
-	rule := scanner.rules[index]
-	if rule.comb != nil {
-		return "combination"
-	}
-	if rule.smallWrite != nil {
-		return "smallwrite"
-	}
-	if rule.smallBlock != nil {
-		return "smallblock"
-	}
-	if rule.repeat != nil {
-		return "repeat"
-	}
-	if rule.program != nil {
-		return rule.program.BackendName()
-	}
-	return "ast"
-}
-func (scanner *Scanner) ruleFlags(id uint32) (CompileFlag, bool) {
-	if scanner == nil {
-		return 0, false
-	}
-	index, ok := scanner.ruleIndex[id]
-	if !ok || index < 0 || index >= len(scanner.rules) {
-		return 0, false
-	}
-	return scanner.rules[index].flags, true
-}
-func (scanner *Scanner) ruleExtension(id uint32) (*ExpressionExt, bool) {
-	if scanner == nil {
-		return nil, false
-	}
-	index, ok := scanner.ruleIndex[id]
-	if !ok || index < 0 || index >= len(scanner.rules) {
-		return nil, false
-	}
-	return scanner.rules[index].ext.Clone(), true
-}
-func (scanner *Scanner) clone() *Scanner {
-	if scanner == nil {
-		return nil
-	}
-	out := newScanner(scanner.rules)
-	out.usage = scanner.usage
-	return out
 }
 
 // backendEligible 判断规则是否可以直接使用已编译后端完成单次扫描。
@@ -3159,12 +2935,6 @@ func firstRepeatPreference(n parser.Node) bool {
 	return ok && value
 }
 
-// matchRuleInto 在已确认快路径规则上复用调用方提供的结束偏移缓冲，
-// 避免每次起点重新分配结果切片。Fuzzy、Backreference、Conditional 仍返回新切片。
-func matchRuleInto(rule compiledRule, data []byte, start int, endsBuf []int, ev *nodeEval) []int {
-	return matchRuleIntoArena(&rule, data, start, endsBuf, nil, ev)
-}
-
 // matchRuleIntoArena 是 matchRuleInto 的工作区版本：arena 非空时优先用
 // 字节链快路径求值全部结束偏移，超出自持能力再退回通用后端与 AST 求值。
 func matchRuleIntoArena(rule *compiledRule, data []byte, start int, endsBuf []int, arena *byteChainArena, ev *nodeEval) []int {
@@ -3317,53 +3087,6 @@ func newFuzzyClass(c parser.Class) fuzzyAtom {
 		}
 	}
 	return a
-}
-
-func fuzzyAtoms(n parser.Node) ([]fuzzyAtom, bool) {
-	switch v := n.(type) {
-	case parser.Literal:
-		out := make([]fuzzyAtom, len(v.Value))
-		for i, b := range v.Value {
-			value := b
-			out[i].literal = &value
-		}
-		return out, len(out) > 0
-	case parser.Class:
-		c := v
-		return []fuzzyAtom{newFuzzyClass(c)}, true
-	case parser.Any:
-		return []fuzzyAtom{{any: true}}, true
-	case parser.Group:
-		if v.HasScopedFlags() || v.Atomic {
-			return nil, false
-		}
-		return fuzzyAtoms(v.Child)
-	case parser.Sequence:
-		out := make([]fuzzyAtom, 0)
-		for _, child := range v.Elements {
-			part, ok := fuzzyAtoms(child)
-			if !ok || len(out)+len(part) > 256 {
-				return nil, false
-			}
-			out = append(out, part...)
-		}
-		return out, len(out) > 0
-	case parser.Repeat:
-		if v.Max < 0 || v.Min != v.Max || v.Min == 0 || v.Min > 32 {
-			return nil, false
-		}
-		part, ok := fuzzyAtoms(v.Child)
-		if !ok || len(part)*v.Min > 256 {
-			return nil, false
-		}
-		out := make([]fuzzyAtom, 0, len(part)*v.Min)
-		for i := 0; i < v.Min; i++ {
-			out = append(out, part...)
-		}
-		return out, true
-	default:
-		return nil, false
-	}
 }
 
 // fuzzyAtomPaths 将可安全确认的表达式展开为有限原子路径。
@@ -3804,10 +3527,6 @@ func literalAlternativesNode(n parser.Node) [][]byte {
 	default:
 		return nil
 	}
-}
-
-func matchNode(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
-	return matchNodeGated(n, data, pos, flags, nil)
 }
 
 // matchNodeGated 是 matchNode 的可降级版本：ev 非空时复用扫描级工作区与
