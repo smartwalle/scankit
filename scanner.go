@@ -3,12 +3,12 @@ package scankit
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"math/bits"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -164,6 +164,10 @@ type scanContext struct {
 	confirmStack []confirmFrame
 	// directMatches 复用 simpleReports 模式下的直接结果切片。
 	directMatches []Match
+	// nodeEval 是本次扫描 AST 求值的可复用工作区：既缓存 subject 的 UTF-8
+	// 合法性判定（UTF8 模式字面量命中要求整个 subject 合法，逐起点重复全量
+	// 校验会退化成 O(n²)），也承载逐节点结束偏移滑窗的切分内存。
+	nodeEval nodeEval
 	// collapseWindows 按规则下标缓存「起点无关窗口」：窗口内的候选起点共享
 	// 同一次确认程序求值结果，避免为同一次文字命中的每个起点重复执行确认。
 	collapseWindows []collapseWindow
@@ -355,6 +359,9 @@ type compiledRule struct {
 	guard *prefixGuard
 	// confirm 是候选起点确认程序，nil 表示规则必须走通用确认路径。
 	confirm *confirmProgram
+	// confirmDFA 是断言敏感的确定性确认表，非空时优先于 confirm 使用。
+	// 编译期为「断言只落在匹配末尾」的图构建（见 confirm_dfa.go）。
+	confirmDFA *confirmDFA
 	// confirmEntry 是跳过入口文字后的程序入口，confirmSkip 是跳过的文字长度。
 	// confirmSkip 为 0 时从规则入口正常确认。
 	confirmEntry int32
@@ -1102,6 +1109,9 @@ func (scanner *Scanner) scanRoseInto(data []byte, dst []Match) []Match {
 		return dst[:0]
 	}
 	scheduler := rose.NewScheduler(program)
+	// 角色确认会为同一次扫描反复进入 AST 求值，这里共享一份求值工作区，
+	// 避免 UTF8 模式的字面量节点逐候选重复全量校验 subject。
+	var nodeEval nodeEval
 	events := scheduler.RunReports(data)
 	out := dst[:0]
 	seen := make(map[Match]struct{})
@@ -1127,7 +1137,7 @@ func (scanner *Scanner) scanRoseInto(data []byte, dst []Match) []Match {
 			if index, exists := scanner.ruleIndex[event.ID]; exists && index >= 0 && index < len(scanner.rules) {
 				rule := scanner.rules[index]
 				if rule.flags&CompileQuiet == 0 {
-					for _, end := range matchRule(rule, data, int(event.From)) {
+					for _, end := range matchRuleInto(rule, data, int(event.From), nil, &nodeEval) {
 						if rule.ext != nil && (!rule.ext.OffsetAllowed(uint64(end)) || !rule.ext.LengthAllowed(uint64(end)-event.From)) {
 							continue
 						}
@@ -1203,7 +1213,7 @@ func (scanner *Scanner) scanRoseInto(data []byte, dst []Match) []Match {
 			startFrom = int(event.To - rule.info.MaxLength)
 		}
 		for start := startFrom; start <= int(event.From); start++ {
-			for _, end := range matchRule(rule, data, start) {
+			for _, end := range matchRuleInto(rule, data, start, nil, &nodeEval) {
 				if end < int(event.From)+len(role.Literal) || start > int(event.From) {
 					continue
 				}
@@ -1495,7 +1505,9 @@ func (ctx *scanContext) retainedBytes() int {
 		cap(ctx.requiredStartCounts)*int(unsafe.Sizeof(uint32(0))) +
 		cap(ctx.directMatches)*int(unsafe.Sizeof(match)) +
 		cap(ctx.literalCandidates)*int(unsafe.Sizeof(candidate)) +
-		cap(ctx.ruleMatchBuf)*int(unsafe.Sizeof(0))
+		cap(ctx.ruleMatchBuf)*int(unsafe.Sizeof(0)) +
+		cap(ctx.nodeEval.ends.buf)*int(unsafe.Sizeof(0)) +
+		cap(ctx.nodeEval.states.buf)*int(unsafe.Sizeof(captureState{}))
 }
 
 func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) {
@@ -1620,6 +1632,7 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 			}
 			clear(byRule)
 		}
+		ctx.nodeEval.reset()
 		scanner.releaseScanContext(ctx)
 	}()
 	// 每个起点都必须独立求值，块模式允许同一规则产生重叠命中。
@@ -2189,7 +2202,7 @@ func (st *blockScanState) verify(ri int, start int) bool {
 		}
 	}
 	arena := st.confirmArena(rule)
-	ends := matchRuleIntoArena(rule, st.data, start, st.ctx.ruleMatchBuf[:0], arena)
+	ends := matchRuleIntoArena(rule, st.data, start, st.ctx.ruleMatchBuf[:0], arena, &st.ctx.nodeEval)
 	st.ctx.ruleMatchBuf = ends
 	return st.record(ri, start, ends)
 }
@@ -2197,10 +2210,16 @@ func (st *blockScanState) verify(ri int, start int) bool {
 // confirmEnd 运行规则的确认程序并返回偏好结束偏移。
 func (st *blockScanState) confirmEnd(ri int, start int) (int, bool) {
 	rule := &st.scanner.rules[ri]
-	// 候选由必须文字索引派生时，起点处的入口文字已由匹配器确认，
-	// 可以直接从入口文字之后的指令开始求值。
+	// 候选由必须文字索引派生时，起点处的入口文字已由匹配器确认，可以直接从
+	// 入口文字之后的指令开始求值。这条捷径比确定性表更省：解释器整段跳过前缀，
+	// 而表必须从候选起点逐字节重新走一遍，所以该捷径可用时优先保留解释器。
 	if rule.confirmSkip > 0 && st.requiredStartDriven && st.scanner.literalIndexCovered(ri) {
 		return rule.confirm.run(st.data, rule.confirmEntry, start+rule.confirmSkip, rule.flags, st.ctx.confirmFrames())
+	}
+	// 断言敏感确认表把单次确认压缩成每字节一次表查找，命中密集时远快于
+	// 解释执行确认程序；两者语义等价，结果同样只作为偏好结束偏移。
+	if rule.confirmDFA != nil {
+		return rule.confirmDFA.preferredEnd(st.data, start)
 	}
 	return rule.confirm.preferredEnd(st.data, start, rule.flags, st.ctx.confirmFrames())
 }
@@ -2889,6 +2908,11 @@ func (scanner *Scanner) scanRoseDirectInto(data []byte, dst []Match) []Match {
 	if singlePtr == nil {
 		singlePtr = new(map[uint32]struct{})
 	}
+	if *singlePtr == nil {
+		// 池的 New 返回的是「指向 nil map 的指针」，上次若因桶过大被丢弃也会
+		// 回填 nil；这里必须补建，否则下面登记 SingleMatch 去重项会 panic。
+		*singlePtr = make(map[uint32]struct{})
+	}
 	single := *singlePtr
 	defer func() {
 		// 池中 map 的桶大小不应随单次扫描无限增长，超出限制时丢弃避免泄漏。
@@ -3129,21 +3153,24 @@ func firstRepeatPreference(n parser.Node) bool {
 	return ok && value
 }
 
-func matchRule(rule compiledRule, data []byte, start int) []int {
-	return matchRuleInto(rule, data, start, nil)
-}
-
 // matchRuleInto 在已确认快路径规则上复用调用方提供的结束偏移缓冲，
 // 避免每次起点重新分配结果切片。Fuzzy、Backreference、Conditional 仍返回新切片。
-func matchRuleInto(rule compiledRule, data []byte, start int, endsBuf []int) []int {
-	return matchRuleIntoArena(&rule, data, start, endsBuf, nil)
+func matchRuleInto(rule compiledRule, data []byte, start int, endsBuf []int, ev *nodeEval) []int {
+	return matchRuleIntoArena(&rule, data, start, endsBuf, nil, ev)
 }
 
 // matchRuleIntoArena 是 matchRuleInto 的工作区版本：arena 非空时优先用
 // 字节链快路径求值全部结束偏移，超出自持能力再退回通用后端与 AST 求值。
-func matchRuleIntoArena(rule *compiledRule, data []byte, start int, endsBuf []int, arena *byteChainArena) []int {
+func matchRuleIntoArena(rule *compiledRule, data []byte, start int, endsBuf []int, arena *byteChainArena, ev *nodeEval) []int {
+	// 求值工作区按「一次规则求值」为生命周期整体复位；跨求值复用同一块内存，
+	// 因此任何结束偏移/捕获状态切片都不得在本次求值结束后继续持有。缓冲区本身
+	// 保留容量，候选密集时不会随起点数累积占用。
+	if ev != nil {
+		ev.resetEval()
+	}
 	if rule.hasBackref || rule.hasConditional {
-		states := matchCaptured(rule.root, data, start, rule.flags, make(map[int][]byte))
+		// 空闲起点无需捕获表：写入路径（Group）会自行创建，只读路径接受 nil。
+		states := matchCaptured(rule.root, data, start, rule.flags, nil, ev)
 		out := make([]int, 0, len(states))
 		for _, state := range states {
 			out = append(out, state.pos)
@@ -3253,7 +3280,7 @@ func matchRuleIntoArena(rule *compiledRule, data []byte, start int, endsBuf []in
 	if rule.program != nil && !rule.eodReports && !rule.info.RequiresStatefulRuntime() && rule.flags&(CompileCaseless|CompileUTF8|CompileUCP|CompileMultiline|CompileDotAll) == 0 && !containsAny(rule.root) {
 		return rule.program.MatchAt(data, start)
 	}
-	return matchNode(rule.root, data, start, rule.flags)
+	return matchNodeGated(rule.root, data, start, rule.flags, ev)
 }
 
 type fuzzyAtom struct {
@@ -3774,20 +3801,26 @@ func literalAlternativesNode(n parser.Node) [][]byte {
 }
 
 func matchNode(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
+	return matchNodeGated(n, data, pos, flags, nil)
+}
+
+// matchNodeGated 是 matchNode 的可降级版本：ev 非空时复用扫描级工作区与
+// UTF-8 校验结果，nil 时退回就地分配与逐次校验。
+func matchNodeGated(n parser.Node, data []byte, pos int, flags CompileFlag, ev *nodeEval) []int {
 	if containsCaptureSemantics(n) {
-		states := matchCaptured(n, data, pos, flags, map[int][]byte{})
+		states := matchCaptured(n, data, pos, flags, nil, ev)
 		out := make([]int, 0, len(states))
 		for _, state := range states {
 			out = append(out, state.pos)
 		}
 		return dedup(out)
 	}
-	return matchNodeBody(n, data, pos, flags)
+	return matchNodeBody(n, data, pos, flags, ev)
 }
 
 // matchNodeBody 执行不涉及捕获语义的递归求值。捕获检查只在整个子树的入口
 // 做一次，避免每个子节点重复遍历语法树。
-func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int {
+func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag, ev *nodeEval) []int {
 	switch v := n.(type) {
 	case parser.Literal:
 		if flags&CompileUTF8 != 0 {
@@ -3801,7 +3834,7 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 		if pos+len(v.Value) > len(data) {
 			return nil
 		}
-		if flags&CompileUTF8 != 0 && !validUTF8LiteralAt(data, pos, len(v.Value)) {
+		if flags&CompileUTF8 != 0 && !validUTF8LiteralAt(data, pos, len(v.Value), ev) {
 			return nil
 		}
 		for i, c := range v.Value {
@@ -3809,7 +3842,7 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 				return nil
 			}
 		}
-		return []int{pos + len(v.Value)}
+		return ev.singleEnd(pos + len(v.Value))
 	case parser.Any:
 		if pos >= len(data) || (data[pos] == '\n' && flags&CompileDotAll == 0) {
 			return nil
@@ -3822,9 +3855,9 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 			if size == 0 {
 				size = 1
 			}
-			return []int{pos + size}
+			return ev.singleEnd(pos + size)
 		}
-		return []int{pos + 1}
+		return ev.singleEnd(pos + 1)
 	case parser.Class:
 		if pos >= len(data) {
 			return nil
@@ -3836,7 +3869,7 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 			}
 			matched := unicodeShorthandClass(runeValue, v.Kind)
 			if matched != v.Negated {
-				return []int{pos + size}
+				return ev.singleEnd(pos + size)
 			}
 			return nil
 		}
@@ -3856,12 +3889,12 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 				}
 			}
 			if matched != v.Negated {
-				return []int{pos + size}
+				return ev.singleEnd(pos + size)
 			}
 			return nil
 		}
 		if classByteMatch(v, data[pos], flags) {
-			return []int{pos + 1}
+			return ev.singleEnd(pos + 1)
 		}
 		return nil
 	case parser.UnicodeClass:
@@ -3877,25 +3910,25 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 			ok = !ok
 		}
 		if ok {
-			return []int{pos + size}
+			return ev.singleEnd(pos + size)
 		}
 		return nil
 	case parser.Assertion:
 		if assertionHolds(v.Kind, data, pos, flags) {
-			return []int{pos}
+			return ev.singleEnd(pos)
 		}
 		return nil
 	case parser.Group:
 		flags = scopedGroupFlags(flags, v)
 		if v.Atomic {
-			states := matchCaptured(v.Child, data, pos, flags, map[int][]byte{})
+			states := matchCaptured(v.Child, data, pos, flags, nil, ev)
 			if len(states) == 0 {
 				return nil
 			}
 			state := selectAtomicState(states, v.Child)
-			return []int{state.pos}
+			return ev.singleEnd(state.pos)
 		}
-		return matchNodeBody(v.Child, data, pos, flags)
+		return matchNodeBody(v.Child, data, pos, flags, ev)
 	case parser.Lookaround:
 		positive := v.Kind == parser.Lookahead || v.Kind == parser.Lookbehind
 		if v.Kind == parser.Lookbehind || v.Kind == parser.NegativeLookbehind {
@@ -3915,35 +3948,35 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 				}
 			}
 			for _, start := range starts {
-				if slices.Contains(matchNodeBody(v.Child, data, start, flags), pos) {
+				if slices.Contains(matchNodeBody(v.Child, data, start, flags, ev), pos) {
 					found = true
 				}
 			}
 			if found == positive {
-				return []int{pos}
+				return ev.singleEnd(pos)
 			}
 			return nil
 		}
-		ends := matchNodeBody(v.Child, data, pos, flags)
+		ends := matchNodeBody(v.Child, data, pos, flags, ev)
 		if positive {
 			if len(ends) > 0 {
-				return []int{pos}
+				return ev.singleEnd(pos)
 			}
 			return nil
 		}
 		if len(ends) == 0 {
-			return []int{pos}
+			return ev.singleEnd(pos)
 		}
 		return nil
 	case parser.Sequence:
-		positions := []int{pos}
+		positions := ev.singleEnd(pos)
 		for _, child := range v.Elements {
 			if verb, ok := child.(parser.ControlVerb); ok && strings.EqualFold(verb.Name, "ACCEPT") {
 				return positions
 			}
-			next := make([]int, 0, len(positions))
+			next := ev.endsReserve(endsReserveFor(len(positions)))
 			for _, p := range positions {
-				next = append(next, matchNodeBody(child, data, p, flags)...)
+				next = append(next, matchNodeBody(child, data, p, flags, ev)...)
 			}
 			positions = dedup(next)
 			if len(positions) == 0 {
@@ -3952,29 +3985,31 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 		}
 		return positions
 	case parser.Alternation:
-		var out []int
+		out := ev.endsReserve(len(v.Options))
 		for _, child := range v.Options {
-			out = append(out, matchNodeBody(child, data, pos, flags)...)
+			out = append(out, matchNodeBody(child, data, pos, flags, ev)...)
 		}
 		return dedup(out)
 	case parser.Repeat:
 		if ends, ok := matchByteRepeat(v, data, pos, flags); ok {
 			return ends
 		}
-		positions := []int{pos}
-		var results []int
-		if v.Min == 0 {
-			results = append(results, pos)
-		}
+		positions := ev.singleEnd(pos)
 		maxCount := v.Max
 		budget := max(len(data)-pos+1, 1)
 		if maxCount < 0 || maxCount > budget {
 			maxCount = budget
 		}
+		// 结果长度取决于实际可重复次数而不是 maxCount 上界，因此只按一个
+		// 中等规模的批量预留；超出部分交给 append 自行扩容。
+		results := ev.endsReserve(min(maxCount+1, repeatResultReserve))
+		if v.Min == 0 {
+			results = append(results, pos)
+		}
 		for count := 1; count <= maxCount; count++ {
-			var next []int
+			next := ev.endsReserve(len(positions))
 			for _, p := range positions {
-				next = append(next, matchNodeBody(v.Child, data, p, flags)...)
+				next = append(next, matchNodeBody(v.Child, data, p, flags, ev)...)
 			}
 			next = dedup(next)
 			if len(next) == 0 {
@@ -3994,7 +4029,7 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag) []int
 		case "FAIL", "F":
 			return nil
 		case "ACCEPT":
-			return []int{pos}
+			return ev.singleEnd(pos)
 		case "SKIP", "PRUNE", "COMMIT":
 			return nil
 		default:
@@ -4091,11 +4126,199 @@ func matchByteRepeatInto(v parser.Repeat, data []byte, pos int, flags CompileFla
 	return ends, true
 }
 
-func validUTF8LiteralAt(data []byte, pos, width int) bool {
-	if !utf8.Valid(data) {
+// nodeEval 承载单次扫描内 AST 求值可复用的状态。
+//
+// 它绑定在某一份 subject 上：调用方必须在整次扫描中传入同一份数据切片。求值
+// 过程中产生的结束偏移切片、UTF-8 合法性判定都存放在这里，避免逐候选起点重复
+// 分配与重复扫描。nil 表示不提供工作区，此时退化为就地分配与逐次校验。
+type nodeEval struct {
+	ends   sliceArena[int]
+	states sliceArena[captureState]
+	utf8   utf8Gate
+}
+
+// reset 清空全部缓存，供扫描上下文跨扫描复用。
+func (ev *nodeEval) reset() {
+	ev.resetEval()
+	ev.utf8.reset()
+}
+
+// resetEval 复位单次规则求值的工作区，保留已分配容量。
+//
+// 结束偏移与捕获状态只在一次求值内有效，必须逐次复位；否则候选密集的扫描会
+// 按候选数持续累积工作区（容量本身会被保留复用）。
+func (ev *nodeEval) resetEval() {
+	ev.ends.reset()
+	ev.states.reset()
+}
+
+// subjectValid 返回 data 是否为合法 UTF-8，非 nil 时记忆结果。
+//
+// 逐起点校验整个 subject 是 O(候选起点数 × 数据长度)，在重复输入下会退化成
+// 平方级，因此这里必须复用同一次扫描的结果。
+func (ev *nodeEval) subjectValid(data []byte) bool {
+	if ev == nil {
+		return utf8.Valid(data)
+	}
+	return ev.utf8.subjectValid(data)
+}
+
+// endsAlloc 返回长度为 n 的结束偏移切片；非 nil 时从工作区切分。
+func (ev *nodeEval) endsAlloc(n int) []int {
+	if ev == nil {
+		return make([]int, n)
+	}
+	return ev.ends.alloc(n)
+}
+
+// endsReserve 返回长度 0、容量不小于 n 的结束偏移切片，供 append 复用；
+// 超出预留容量时 append 自行扩容，只损失复用而不影响正确性。
+func (ev *nodeEval) endsReserve(n int) []int {
+	if ev == nil {
+		return make([]int, 0, n)
+	}
+	return ev.ends.reserve(n)
+}
+
+// singleEnd 返回只包含一个结束偏移的结果切片，优先复用求值工作区。
+func (ev *nodeEval) singleEnd(end int) []int {
+	out := ev.endsAlloc(1)
+	out[0] = end
+	return out
+}
+
+// statesReserve 返回长度 0、容量不小于 n 的捕获状态切片。
+func (ev *nodeEval) statesReserve(n int) []captureState {
+	if ev == nil {
+		return make([]captureState, 0, n)
+	}
+	return ev.states.reserve(n)
+}
+
+// endsReserveFor 把「当前位置数」放大成一次预留量：子节点可能把单个位置展开
+// 成多个结束偏移，按位置数精确预留几乎必然触发一次扩容与拷贝。
+//
+// 只用于预留次数与输入长度无关的场合（如序列的每个子节点）；重复节点按轮次
+// 预留，放大会让工作区随输入长度成倍增长。
+func endsReserveFor(n int) int {
+	if n < sliceArenaMin {
+		return sliceArenaMin
+	}
+	return n
+}
+
+// singleState 返回只包含一个捕获状态的结果切片。
+func (ev *nodeEval) singleState(state captureState) []captureState {
+	if ev == nil {
+		return []captureState{state}
+	}
+	out := ev.states.alloc(1)
+	out[0] = state
+	return out
+}
+
+// utf8Gate 缓存单次扫描内 subject 的 UTF-8 合法性。
+type utf8Gate struct {
+	checked bool
+	valid   bool
+}
+
+// subjectValid 返回 data 是否为合法 UTF-8，并在非 nil 时记忆结果。
+func (g *utf8Gate) subjectValid(data []byte) bool {
+	if g == nil {
+		return utf8.Valid(data)
+	}
+	if !g.checked {
+		g.valid = utf8.Valid(data)
+		g.checked = true
+	}
+	return g.valid
+}
+
+// reset 清空缓存，供扫描上下文跨扫描复用。
+func (g *utf8Gate) reset() {
+	g.checked = false
+	g.valid = false
+}
+
+// sliceArena 是 AST 求值中间结果的单次工作区：只按游标向后切分，不做单独释放。
+// 每次进入规则求值前整体 reset，因此同一块内存在一次求值内被反复复用。
+//
+// 切分出的切片只能存活到本次求值结束：调用方读取结束后不得继续持有。
+type sliceArena[T any] struct {
+	buf []T
+	off int
+}
+
+// sliceArenaMin 是工作区的起始容量，避免单节点求值频繁扩容。
+const sliceArenaMin = 64
+
+// sliceArenaMax 是单块工作区的容量上限（元素数）。
+//
+// 工作区只按游标前进、不单独释放，因此单次求值的占用等于这次求值的**累计**
+// 切分量，而不是同时存活量：长重复、深回溯这类结构会让累计量远大于实际需求。
+// 超过上限后退回普通分配，把工作区占用限制在常数规模；上限之内的常见求值
+// 仍然完全不分配。
+const sliceArenaMax = 1 << 13
+
+// repeatResultReserve 是重复节点一次性预留的结果槽位上限。重复结果的长度由
+// 实际匹配长度决定，预留过多会在长输入上按起点浪费工作区，预留过少则会为每个
+// 候选起点付一次扩容拷贝。
+const repeatResultReserve = sliceArenaMin
+
+// reset 把游标归零，保留已分配容量。
+func (a *sliceArena[T]) reset() {
+	a.off = 0
+}
+
+// reserve 切出一段容量不小于 n 的空闲区域。超出上限时返回一次性切片，
+// 语义（长度 0、容量不小于 n）与工作区版本一致，只是不再复用内存。
+func (a *sliceArena[T]) reserve(n int) []T {
+	if n <= 0 {
+		return nil
+	}
+	if a.off+n > sliceArenaMax {
+		return make([]T, n)[:0]
+	}
+	if a.off+n > len(a.buf) {
+		size := len(a.buf) * 2
+		if size < n {
+			size = n
+		}
+		if size < sliceArenaMin {
+			size = sliceArenaMin
+		}
+		if size > sliceArenaMax {
+			size = sliceArenaMax
+		}
+		if a.off+n > size {
+			size = a.off + n
+		}
+		grown := make([]T, size)
+		copy(grown, a.buf[:a.off])
+		a.buf = grown
+	}
+	out := a.buf[a.off : a.off : a.off+n]
+	a.off += n
+	return out
+}
+
+// alloc 切出一段长度与容量都为 n 的区域。
+func (a *sliceArena[T]) alloc(n int) []T {
+	return a.reserve(n)[:n]
+}
+
+// validUTF8LiteralAt 判断 UTF8 模式下位置 pos 处长度为 width 的字面量命中是否有效。
+//
+// 语义要求三条同时成立：整个 subject 是合法 UTF-8、pos 落在字符起始边界上、
+// 命中区间自身是合法 UTF-8。字面量本身在调用方已经校验过，命中区间又必须与字面量
+// 逐字节相等，因此后两条在全量校验通过时必然成立；保留它们是为了在全量校验尚未
+// 发生时尽早排除明显非法的位置。全量校验走工作区，避免逐起点重复扫描整个 subject。
+func validUTF8LiteralAt(data []byte, pos, width int, ev *nodeEval) bool {
+	if pos < 0 || width <= 0 || pos+width > len(data) || pos > 0 && pos < len(data) && data[pos]&0xc0 == 0x80 {
 		return false
 	}
-	if pos < 0 || width <= 0 || pos+width > len(data) || pos > 0 && pos < len(data) && data[pos]&0xc0 == 0x80 {
+	if !ev.subjectValid(data) {
 		return false
 	}
 	return utf8.Valid(data[pos : pos+width])
@@ -4173,8 +4396,25 @@ func matchUTF8Literal(literal, data []byte, pos int) []int {
 	return []int{end}
 }
 
+// scannerUnicodePropertyNames 缓存 \p{...} 名称的规范化结果。
+//
+// 名称在编译期就已固定，规范化只依赖输入字符串，因此结果可以跨扫描安全共享。
+// 逐候选起点、逐字符地重复规范化会为每个字符分配一份临时字符串，是 \p{...}
+// 规则的主要分配来源。
+var scannerUnicodePropertyNames sync.Map
+
+// scannerUnicodePropertyName 返回规范化后的 Unicode 属性名。
+func scannerUnicodePropertyName(name string) string {
+	if cached, ok := scannerUnicodePropertyNames.Load(name); ok {
+		return cached.(string)
+	}
+	normalized := normalizeScannerUnicodeProperty(name)
+	scannerUnicodePropertyNames.Store(name, normalized)
+	return normalized
+}
+
 func unicodeProperty(r rune, name string) bool {
-	name = normalizeScannerUnicodeProperty(name)
+	name = scannerUnicodePropertyName(name)
 	for _, prefix := range []string{"script=", "sc=", "script:", "generalcategory=", "gc="} {
 		if after, ok := strings.CutPrefix(name, prefix); ok {
 			name = after
@@ -4281,30 +4521,31 @@ type captureState struct {
 	caps map[int][]byte
 }
 
-func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, caps map[int][]byte) []captureState {
+func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, caps map[int][]byte, ev *nodeEval) []captureState {
 	switch value := node.(type) {
 	case parser.Group:
 		flags = scopedGroupFlags(flags, value)
 		entryCaps := cloneCaps(caps)
 		clearCaptureScope(entryCaps, value)
-		out := matchCaptured(value.Child, data, pos, flags, entryCaps)
+		out := matchCaptured(value.Child, data, pos, flags, entryCaps, ev)
 		if value.Atomic && len(out) > 0 {
-			out = []captureState{selectAtomicState(out, value.Child)}
+			out = ev.singleState(selectAtomicState(out, value.Child))
 		}
 		if value.Capture <= 0 {
 			return out
 		}
 		for i := range out {
-			out[i].caps = cloneCaps(out[i].caps)
-			out[i].caps[value.Capture] = append([]byte(nil), data[pos:out[i].pos]...)
+			out[i].caps = withCapture(out[i].caps, value.Capture, data[pos:out[i].pos])
 		}
 		return out
 	case parser.Sequence:
-		states := []captureState{{pos: pos, caps: cloneCaps(caps)}}
+		// 捕获表只在即将被写入的路径上复制（见 Group 与 cloneCaps 注释），
+		// 这里与后续的只读分支都可以直接透传。
+		states := ev.singleState(captureState{pos: pos, caps: caps})
 		for _, child := range value.Elements {
-			next := make([]captureState, 0)
+			next := ev.statesReserve(len(states))
 			for _, state := range states {
-				next = append(next, matchCaptured(child, data, state.pos, flags, state.caps)...)
+				next = append(next, matchCaptured(child, data, state.pos, flags, state.caps, ev)...)
 			}
 			states = dedupCaptureStates(next)
 			if len(states) == 0 {
@@ -4313,14 +4554,14 @@ func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, ca
 		}
 		return states
 	case parser.Alternation:
-		out := make([]captureState, 0)
+		out := ev.statesReserve(len(value.Options))
 		for _, child := range value.Options {
-			out = append(out, matchCaptured(child, data, pos, flags, caps)...)
+			out = append(out, matchCaptured(child, data, pos, flags, caps, ev)...)
 		}
 		return dedupCaptureStates(out)
 	case parser.Repeat:
-		states := []captureState{{pos: pos, caps: cloneCaps(caps)}}
-		out := make([]captureState, 0)
+		states := ev.singleState(captureState{pos: pos, caps: caps})
+		out := ev.statesReserve(value.Min + 1)
 		if value.Min == 0 {
 			out = append(out, states...)
 		}
@@ -4330,9 +4571,9 @@ func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, ca
 			maxCount = budget
 		}
 		for count := 1; count <= maxCount; count++ {
-			next := make([]captureState, 0)
+			next := ev.statesReserve(len(states))
 			for _, state := range states {
-				next = append(next, matchCaptured(value.Child, data, state.pos, flags, state.caps)...)
+				next = append(next, matchCaptured(value.Child, data, state.pos, flags, state.caps, ev)...)
 			}
 			states = dedupCaptureStates(next)
 			if len(states) == 0 {
@@ -4356,18 +4597,18 @@ func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, ca
 				return nil
 			}
 		}
-		return []captureState{{pos: pos + len(captured), caps: cloneCaps(caps)}}
+		return ev.singleState(captureState{pos: pos + len(captured), caps: caps})
 	case parser.Conditional:
 		child := value.No
 		if _, ok := caps[value.Index]; ok {
 			child = value.Yes
 		}
-		return matchCaptured(child, data, pos, flags, caps)
+		return matchCaptured(child, data, pos, flags, caps, ev)
 	case parser.Lookaround:
 		positive := value.Kind == parser.Lookahead || value.Kind == parser.Lookbehind
 		if value.Kind == parser.Lookbehind || value.Kind == parser.NegativeLookbehind {
-			matched := make([]captureState, 0)
-			starts := make([]int, 0)
+			matched := ev.statesReserve(1)
+			starts := ev.endsReserve(1)
 			if width, _, ok := parser.FixedWidth(value.Child); ok && flags&CompileUTF8 == 0 {
 				if pos >= width {
 					starts = append(starts, pos-width)
@@ -4378,7 +4619,7 @@ func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, ca
 				}
 			}
 			for _, start := range starts {
-				for _, state := range matchCaptured(value.Child, data, start, flags, caps) {
+				for _, state := range matchCaptured(value.Child, data, start, flags, caps, ev) {
 					if state.pos == pos {
 						matched = append(matched, state)
 					}
@@ -4391,11 +4632,11 @@ func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, ca
 				return dedupCaptureStates(matched)
 			}
 			if !positive && len(matched) == 0 {
-				return []captureState{{pos: pos, caps: cloneCaps(caps)}}
+				return ev.singleState(captureState{pos: pos, caps: caps})
 			}
 			return nil
 		}
-		states := matchCaptured(value.Child, data, pos, flags, caps)
+		states := matchCaptured(value.Child, data, pos, flags, caps, ev)
 		if positive && len(states) > 0 {
 			for i := range states {
 				states[i].pos = pos
@@ -4403,14 +4644,14 @@ func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, ca
 			return dedupCaptureStates(states)
 		}
 		if !positive && len(states) == 0 {
-			return []captureState{{pos: pos, caps: cloneCaps(caps)}}
+			return ev.singleState(captureState{pos: pos, caps: caps})
 		}
 		return nil
 	default:
-		ends := matchNode(node, data, pos, flags)
-		out := make([]captureState, 0, len(ends))
+		ends := matchNodeGated(node, data, pos, flags, ev)
+		out := ev.statesReserve(len(ends))
 		for _, end := range ends {
-			out = append(out, captureState{pos: end, caps: cloneCaps(caps)})
+			out = append(out, captureState{pos: end, caps: caps})
 		}
 		return out
 	}
@@ -4434,41 +4675,119 @@ func selectAtomicState(states []captureState, child parser.Node) captureState {
 	return states[0]
 }
 
+// captureStateLinearDedup 是线性去重的状态数上限。状态集合在回溯里普遍很小，
+// 直接两两比较比重建 map 与编码键更省：既没有哈希开销，也不产生任何分配。
+const captureStateLinearDedup = 8
+
+// dedupCaptureStates 按「结束位置 + 捕获内容」去重，保留首次出现的顺序。
 func dedupCaptureStates(states []captureState) []captureState {
-	seen := map[string]struct{}{}
+	if len(states) < 2 {
+		return states
+	}
+	if len(states) <= captureStateLinearDedup {
+		out := states[:0]
+		for _, state := range states {
+			duplicate := false
+			for _, kept := range out {
+				if captureStatesEqual(kept, state) {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				out = append(out, state)
+			}
+		}
+		return out
+	}
+	seen := make(map[string]struct{}, len(states))
 	out := states[:0]
+	// key 跨状态复用，避免每个状态都重新构造一份字符串。
+	key := make([]byte, 0, 64)
 	for _, state := range states {
-		key := captureStateKey(state)
-		if _, ok := seen[key]; ok {
+		key = appendCaptureStateKey(key[:0], state)
+		if _, ok := seen[string(key)]; ok {
 			continue
 		}
-		seen[key] = struct{}{}
+		seen[string(key)] = struct{}{}
 		out = append(out, state)
 	}
 	return out
 }
 
-func captureStateKey(state captureState) string {
-	var key strings.Builder
-	key.WriteString(strconv.Itoa(state.pos))
-	key.WriteByte(':')
-	indexes := make([]int, 0, len(state.caps))
+// captureStatesEqual 判定两个捕获状态是否等价。
+func captureStatesEqual(left, right captureState) bool {
+	if left.pos != right.pos || len(left.caps) != len(right.caps) {
+		return false
+	}
+	for index, value := range left.caps {
+		other, ok := right.caps[index]
+		if !ok || !bytes.Equal(value, other) {
+			return false
+		}
+	}
+	return true
+}
+
+// captureStateKeyFields 编码单条捕获记录时使用的栈上小数组容量。绝大多数
+// 规则只用到个位数捕获组，超过时才退化为堆分配。
+const captureStateKeyFields = 8
+
+// appendCaptureStateKey 把捕获状态编码成前缀无关的字节序列：结束位置、捕获
+// 数量，随后是按下标排序的「下标 + 长度 + 原始字节」。
+//
+// 长度前缀保证不同状态的编码不会产生歧义，因此不需要转义，也不必像早先基于
+// 引号转义字符串的实现那样为每次去重构造多份临时字符串。
+func appendCaptureStateKey(dst []byte, state captureState) []byte {
+	dst = binary.AppendUvarint(dst, uint64(state.pos))
+	dst = binary.AppendUvarint(dst, uint64(len(state.caps)))
+	if len(state.caps) == 0 {
+		return dst
+	}
+	var stack [captureStateKeyFields]int
+	indexes := stack[:0]
+	if len(state.caps) > len(stack) {
+		indexes = make([]int, 0, len(state.caps))
+	}
 	for index := range state.caps {
 		indexes = append(indexes, index)
 	}
+	// map 迭代顺序随机，必须排序后才能得到与顺序无关的规范编码。
 	sort.Ints(indexes)
 	for _, index := range indexes {
-		key.WriteString(strconv.Itoa(index))
-		key.WriteByte('=')
-		key.WriteString(strconv.Quote(string(state.caps[index])))
-		key.WriteByte(';')
+		value := state.caps[index]
+		dst = binary.AppendUvarint(dst, uint64(index))
+		dst = binary.AppendUvarint(dst, uint64(len(value)))
+		dst = append(dst, value...)
 	}
-	return key.String()
+	return dst
 }
+
+// withCapture 返回「保留全部旧捕获、并把 id 指向 captured 内容」的新捕获表。
+//
+// captured 直接引用 subject 的子切片：输入在扫描期间保持不变，且捕获值只被读取
+// 和比较，因此不必为每次捕获复制一份字节。
+func withCapture(caps map[int][]byte, id int, captured []byte) map[int][]byte {
+	out := make(map[int][]byte, len(caps)+1)
+	for index, value := range caps {
+		out[index] = value
+	}
+	out[id] = captured
+	return out
+}
+
+// cloneCaps 复制捕获表结构，供即将就地修改（清除作用域或写入新捕获）的调用方使用。
+//
+// 捕获值本身在整个扫描期间不再被就地改写：新捕获总是整体替换成新切片，
+// 清除作用域只删除键。因此这里只做浅拷贝，避免为每个捕获组重复复制字节。
+// 空表返回 nil，让只读路径无需为「尚无捕获」付出一次 map 分配。
 func cloneCaps(in map[int][]byte) map[int][]byte {
+	if len(in) == 0 {
+		return nil
+	}
 	out := make(map[int][]byte, len(in))
 	for k, v := range in {
-		out[k] = append([]byte(nil), v...)
+		out[k] = v
 	}
 	return out
 }

@@ -479,6 +479,18 @@ func compileWithContext(ctx context.Context, expressions []Expression, limits co
 			info.SetBailout(optimizeBailout)
 		}
 		rule := compiledRule{id: expression.Id, root: root, flags: flags, ext: extCopy, info: info, prefilter: candidate, program: autoProgram}
+		// 词边界断言会挡掉字节后端，规则只能逐候选确认。这里尝试为确认阶段
+		// 额外构建断言敏感的确定性表（见 confirm_dfa.go），把命中密集时的
+		// 逐指令解释压缩成每字节一次表查找。不满足适用性边界或超出预算时保持
+		// 为 nil，规则继续走确认程序虚机，语义不变。
+		if autoProgram == nil && !info.GraphFallback && !info.Stateful && confirmDFAEligible(root, extCopy, flags) {
+			if table := buildConfirmDFA(ng, firstRepeatPreference(root)); table != nil {
+				if tableBytes := table.memoryBytes(); limits.MemoryBytes == 0 || tableBytes <= limits.MemoryBytes {
+					rule.confirmDFA = table
+					totalUsage.MemoryBytes = satAdd64(totalUsage.MemoryBytes, tableBytes)
+				}
+			}
+		}
 		if extCopy == nil && !parser.HasScopedFlags(root) && flags&(CompileCaseless|CompileUTF8|CompileUCP|CompileMultiline|CompileDotAll) == 0 {
 			if literal, ok := literalPattern(root); ok && len(literal) > 0 {
 				if small, smallErr := smallengine.CompileWithOptions(literal, smallengine.CompileOptions{SmallWriteSize: 8}); smallErr == nil {

@@ -298,10 +298,11 @@ func (p *Program) FindMatchesInto(data []byte, dst []State) []State {
 	if p == nil {
 		return dst[:0]
 	}
-	// matcher 为 nil 且已启用候选器时属于构建期有意为之的“跳过通用匹配器”，
-	// 不能在这里重新构建，否则候选路径会永远不可达并反复付出构建代价。
+	// matcher 为 nil 有两种构建期有意为之的形态：候选器就绪（miracleReady）、
+	// 以及单角色走轻量线性确认路径。两者都不能在这里重新构建，否则对应的
+	// 快路径永远不可达，而且每次扫描都要白建一个完整 FDR 自动机。
 	matcher := p.matcher
-	if matcher == nil && !p.miracleReady {
+	if matcher == nil && !p.miracleReady && len(p.Roles) > 1 {
 		matcher = buildRoleMatcher(p.Roles)
 	}
 	if matcher != nil {
@@ -371,8 +372,10 @@ func (p *Program) FindMatchesLimit(data []byte, limit int) []State {
 	if p == nil {
 		return nil
 	}
+	// 与 FindMatchesInto 同源：单角色与候选器就绪两种形态都刻意不持有通用
+	// 匹配器，只有真正需要共享自动机的程序才按需构建一次。
 	matcher := p.matcher
-	if matcher == nil {
+	if matcher == nil && !p.miracleReady && len(p.Roles) > 1 {
 		matcher = buildRoleMatcher(p.Roles)
 	}
 	if matcher == nil {
@@ -437,9 +440,10 @@ func (p *Program) FindMatchesRange(data []byte, from, to int) []State {
 	if p == nil || from < 0 || to < from || to > len(data) {
 		return nil
 	}
-	// 与 FindMatchesInto 一致：候选器就绪时保留构建期的 nil matcher 决定。
+	// 与 FindMatchesInto 一致：候选器就绪与单角色两种形态都保留构建期的
+	// nil matcher 决定，不走按需构建。
 	matcher := p.matcher
-	if matcher == nil && !p.miracleReady {
+	if matcher == nil && !p.miracleReady && len(p.Roles) > 1 {
 		matcher = buildRoleMatcher(p.Roles)
 	}
 	if matcher != nil {
