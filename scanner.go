@@ -595,7 +595,13 @@ func newRequiredFinder(literals []hwlm.Literal) func([]byte, []requiredHit) []re
 		finders = append(finders, newLiteralMatcherFinder(long))
 	}
 	if len(medium) > 0 {
-		finders = append(finders, newLiteralMatcherFinder(medium))
+		// 2~3 字节的定长文字走专用两级查表，避免通用自动机的逐候选转移与
+		// output 遍历；专用匹配器只在其覆盖范围内生效，异常时回退通用匹配器。
+		if finder := newRequiredShortFinder(medium); finder != nil {
+			finders = append(finders, finder)
+		} else {
+			finders = append(finders, newLiteralMatcherFinder(medium))
+		}
 	}
 	if len(single) > 0 {
 		finders = append(finders, newSingleByteFinder(single))
