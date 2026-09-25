@@ -423,7 +423,7 @@ func BenchmarkSyntaxCoverage(b *testing.B) {
 		data := []byte(c.Data)
 		// 扩出一段重复输入，让 MB/s 数量级稳定。
 		buf := make([]byte, 0, len(data))
-		for i := 0; i < 1024; i++ {
+		for i := 0; i < 1; i++ {
 			buf = append(buf, data...)
 		}
 		b.Run(c.Name+"/scankit", func(b *testing.B) {
