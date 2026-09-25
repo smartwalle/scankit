@@ -17,6 +17,10 @@ type Variant struct {
 	// Back 非空时表示偏移窗口内命中位置左侧的每个字节都必须属于该集合，
 	// 扫描时可用它把候选起点收缩到命中位置左侧的连续区间。
 	Back []byte
+	// Class 表示文字的字节至少有一部分由字符类展开而来。字符类在忽略大小写
+	// 时会匹配到集合内字母的大小写两侧，调用方不能把这类候选直接当作精确
+	// 字节序列使用。
+	Class bool
 }
 
 // Required 是一组变体：任意匹配至少包含其中一个变体。
@@ -53,7 +57,7 @@ func FromAST(root parser.Node) (Required, bool) {
 			// 偏移无上界时必须能靠左侧字节集合收缩起点，否则窗口无法约束。
 			return Required{}, false
 		}
-		out.Variants = append(out.Variants, Variant{Value: v.value, MinOffset: v.min, MaxOffset: v.max, Back: v.back})
+		out.Variants = append(out.Variants, Variant{Value: v.value, MinOffset: v.min, MaxOffset: v.max, Back: v.back, Class: v.class})
 	}
 	return out, true
 }

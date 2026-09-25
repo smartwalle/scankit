@@ -499,19 +499,42 @@ func newScanner(rules []compiledRule) *Scanner {
 }
 
 // requiredIndexEligible 判断规则能否安全进入必须文字候选索引。
-// 大小写折叠、UTF-8/UCP 会改变文字或字符类的匹配语义，作用域修饰符同理。
+// UTF-8/UCP 会改变文字或字符类的匹配语义；作用域修饰符只有在整条规则统一
+// 忽略大小写时才等价于 ASCII 折叠，其余情况一律保留完整确认路径。
 func requiredIndexEligible(rule compiledRule) bool {
 	if len(rule.required) == 0 {
 		return false
 	}
-	if rule.flags&(CompileCaseless|CompileUTF8|CompileUCP) != 0 {
+	if rule.flags&(CompileUTF8|CompileUCP) != 0 {
 		return false
 	}
 	// 模糊匹配允许匹配文字本身发生变化，精确文字候选会漏报。
 	if rule.ext != nil && rule.ext.Flags&(ExtFlagEditDistance|ExtFlagHammingDistance) != 0 {
 		return false
 	}
+	if ruleCaseless(rule) {
+		// ASCII 折叠无法覆盖 Unicode 折叠；字符类展开出的候选在忽略大小写时
+		// 需要重新展开；无上界窗口依赖的左侧字节集合同样需要折叠。三者都保留
+		// 原确认路径，宁可退化为逐起点确认也不能漏报。
+		for _, variant := range rule.required {
+			if variant.Class || variant.MaxOffset < variant.MinOffset || !asciiBytes(variant.Value) {
+				return false
+			}
+		}
+		return true
+	}
 	return !parser.HasScopedFlags(rule.root)
+}
+
+// ruleCaseless 判断规则是否整体处于忽略大小写语义。忽略大小写既可能来自
+// [CompileCaseless]，也可能来自模式开头的内联 (?i)，两者都需要识别。
+func ruleCaseless(rule compiledRule) bool {
+	if rule.flags&CompileCaseless != 0 {
+		// 表达式级忽略大小写仍可能被内联 (?-i:...) 局部撤消，此时不再具备
+		// 统一的 ASCII 折叠语义。
+		return !parser.HasCaselessClear(rule.root)
+	}
+	return parser.UniformCaseless(rule.root)
 }
 
 // buildRequiredIndex 为可安全提取必须文字的规则建立共享候选索引。
@@ -531,14 +554,23 @@ func buildRequiredIndex(rules []compiledRule, guardDriven []bool) ([]requiredLit
 		if ruleIndex < len(guardDriven) && guardDriven[ruleIndex] {
 			continue
 		}
+		caseless := ruleCaseless(rule)
 		for _, variant := range rule.required {
-			key := string(variant.Value)
+			// 忽略大小写与精确匹配的文字不能共用同一个候选：两者的候选匹配
+			// 语义不同，混用会让精确规则多确认（可接受）或让忽略大小写的规则
+			// 漏掉大小写变体（不可接受），因此按语义分开编号。
+			var key string
+			if caseless {
+				key = "\x01" + string(variant.Value)
+			} else {
+				key = "\x00" + string(variant.Value)
+			}
 			position, ok := byValue[key]
 			if !ok {
 				position = len(index)
 				byValue[key] = position
 				index = append(index, requiredLiteral{})
-				literals = append(literals, hwlm.Literal{ID: uint32(position + 1), Value: variant.Value})
+				literals = append(literals, hwlm.Literal{ID: uint32(position + 1), Value: variant.Value, CaseInsensitive: caseless})
 			}
 			entry := requiredEntry{ruleID: rule.id, ruleIndex: ruleIndex, min: variant.MinOffset, max: variant.MaxOffset, back: variant.Back, guard: rule.guard}
 			if guardImpliedByBack(entry.guard, variant.Back, variant.MinOffset) {
@@ -583,13 +615,13 @@ const maxRequiredWindow = 64
 // 命中密集时这一步是候选展开前的固定开销，改用直写的转换循环可让它随
 // 命中数线性摊薄。
 func newRequiredFinder(literals []hwlm.Literal) func([]byte, []requiredHit) []requiredHit {
-	single, medium, long := splitRequiredLiterals(literals)
-	if len(medium) == 0 && len(long) == 0 {
+	single, medium, long, caseless := splitRequiredLiterals(literals)
+	if len(medium) == 0 && len(long) == 0 && len(caseless) == 0 {
 		// 全部候选文字都是单字节：此时拆分拿不到任何 lane 收益，通用匹配器
 		// （FDR/Teddy）在稀疏命中语料上的跳过能力反而更好。
 		return newLiteralMatcherFinder(literals)
 	}
-	finders := make([]func([]byte, []requiredHit) []requiredHit, 0, 3)
+	finders := make([]func([]byte, []requiredHit) []requiredHit, 0, 4)
 	if len(long) > 0 {
 		finders = append(finders, newLiteralMatcherFinder(long))
 	}
@@ -604,6 +636,12 @@ func newRequiredFinder(literals []hwlm.Literal) func([]byte, []requiredHit) []re
 	}
 	if len(single) > 0 {
 		finders = append(finders, newSingleByteFinder(single))
+	}
+	if len(caseless) > 0 {
+		// 忽略大小写的候选必须交给按 ASCII 折叠建表的通用后端：专用匹配器是
+		// 按精确字节建表的，直接放进去会静默漏掉大小写变体。Teddy 与 FDR 都会
+		// 同时维护折叠前后的自动机，hwlm.Select 也不会为这类文字选择扁平索引。
+		finders = append(finders, newLiteralMatcherFinder(caseless))
 	}
 	switch len(finders) {
 	case 0:
@@ -620,18 +658,25 @@ func newRequiredFinder(literals []hwlm.Literal) func([]byte, []requiredHit) []re
 	}
 }
 
-// splitRequiredLiterals 把候选文字按长度分成"单字节"、"短"与"长"三组。候选文字
-// 中的单字节成员会把匹配器的最短文字压到 1，候选掩码随之退化成"首字节集合"，
-// 几乎覆盖全部输入字节；拆开之后多字节匹配器可以启用 2 个以上 lane，掩码只保留
-// 连续多字节共同命中的位置。
+// splitRequiredLiterals 把候选文字按匹配语义与长度分成四组：精确单字节、精确
+// 短文字（2~3 字节）、精确长文字（不小于 4 字节）与忽略大小写的文字。候选中的
+// 单字节成员会把匹配器的最短文字压到 1，候选掩码随之退化成"首字节集合"，几乎
+// 覆盖全部输入字节；拆开之后多字节匹配器可以启用 2 个以上 lane，掩码只保留连续
+// 多字节共同命中的位置。
 //
-// 短组（2~3 字节）与长组（不小于 4 字节）再拆一次，是因为二者的最佳后端不同：
-// 长组可以走 4 字节主键的扁平索引，把逐候选确认压成一次定长比较；短组的文字
-// 长度不足主键宽度，只能留在前缀树上。混在一起会把长组拖回前缀树，实测 10 MB
-// 语料上拆开后长组从 21.5 ms 降到 9.2 ms。短组自身的首字节集合很窄，留在
-// 前缀树上代价有限。
-func splitRequiredLiterals(literals []hwlm.Literal) (single, medium, long []hwlm.Literal) {
+// 短组与长组再拆一次，是因为二者的最佳后端不同：长组可以走 4 字节主键的扁平
+// 索引，把逐候选确认压成一次定长比较；短组的文字长度不足主键宽度，只能留在
+// 前缀树上。混在一起会把长组拖回前缀树，实测 10 MB 语料上拆开后长组从 21.5 ms
+// 降到 9.2 ms。短组自身的首字节集合很窄，留在前缀树上代价有限。
+//
+// 忽略大小写的文字单独成组：hwlm 的扁平索引与专用精确匹配器都按精确字节建表，
+// 只有 Teddy/FDR 这类维护折叠自动机的后端才能正确处理，不能与前三类混排。
+func splitRequiredLiterals(literals []hwlm.Literal) (single, medium, long, caseless []hwlm.Literal) {
 	for _, literal := range literals {
+		if literal.CaseInsensitive {
+			caseless = append(caseless, literal)
+			continue
+		}
 		switch length := len(literal.Value); {
 		case length <= 1:
 			single = append(single, literal)
@@ -641,7 +686,7 @@ func splitRequiredLiterals(literals []hwlm.Literal) (single, medium, long []hwlm
 			long = append(long, literal)
 		}
 	}
-	return single, medium, long
+	return single, medium, long, caseless
 }
 
 // newSingleByteFinder 为长度为 1 的候选文字构建专用匹配器：命中判定只取决于当前

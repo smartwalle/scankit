@@ -169,6 +169,10 @@ var SyntaxCases = []SyntaxCase{
 
 	// 交替
 	{"alternation", `a|z`, 0, "zy", []scankit.Match{{Id: 1, From: 0, To: 1}}},
+
+	// 忽略大小写：内联 (?i) 与表达式级标志必须产生相同的折叠语义。
+	{"caseless_inline_literal", `(?i)cat`, 0, "aCATb", []scankit.Match{{Id: 1, From: 1, To: 4}}},
+	{"caseless_flag_literal", `cat`, scankit.CompileCaseless, "aCATb", []scankit.Match{{Id: 1, From: 1, To: 4}}},
 }
 
 func TestSyntaxCoverage(t *testing.T) {
@@ -419,7 +423,7 @@ func BenchmarkSyntaxCoverage(b *testing.B) {
 		data := []byte(c.Data)
 		// 扩出一段重复输入，让 MB/s 数量级稳定。
 		buf := make([]byte, 0, len(data))
-		for i := 0; i < 1; i++ {
+		for i := 0; i < 1024; i++ {
 			buf = append(buf, data...)
 		}
 		b.Run(c.Name+"/scankit", func(b *testing.B) {
@@ -482,7 +486,13 @@ func tryCompileRegexp(c SyntaxCase) (*regexp.Regexp, bool) {
 			return nil, false
 		}
 	}
-	re, err := regexp.Compile(c.Pat)
+	// 表达式级忽略大小写在 scankit 中由 Flags 承载，regexp 需要用内联 (?i)
+	// 表达同一个语义，否则两侧的工作量不可比。
+	pattern := c.Pat
+	if c.Flags&scankit.CompileCaseless != 0 && !strings.HasPrefix(pattern, "(?i)") {
+		pattern = "(?i)" + pattern
+	}
+	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil, false
 	}

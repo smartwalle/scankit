@@ -18,8 +18,8 @@ func TestMiracleCandidateResultsMatchRoleScan(t *testing.T) {
 
 func TestMiracleSingleRoleUsesCandidatePath(t *testing.T) {
 	program := New([]Role{{ID: 7, Literal: []byte("foo")}})
-	if program.matcher != nil || len(program.miracles) != 1 {
-		t.Fatalf("single role did not select miracle path")
+	if len(program.miracles) != 1 || program.matcher == nil {
+		t.Fatalf("single role did not build candidate matcher")
 	}
 	got := program.FindMatches([]byte("foo xfoo"))
 	if len(got) != 2 || got[0].Offset != 0 || got[1].Offset != 5 {

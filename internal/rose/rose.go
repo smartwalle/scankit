@@ -298,9 +298,10 @@ func (p *Program) FindMatchesInto(data []byte, dst []State) []State {
 	if p == nil {
 		return dst[:0]
 	}
-	// matcher 为 nil 有两种构建期有意为之的形态：候选器就绪（miracleReady）、
-	// 以及单角色走轻量线性确认路径。两者都不能在这里重新构建，否则对应的
-	// 快路径永远不可达，而且每次扫描都要白建一个完整 FDR 自动机。
+	// matcher 为 nil 有两种形态：候选器就绪（miracleReady），以及
+	// buildRoleMatcher 无法为非 ASCII 的大小写不敏感角色建字节自动机。两者都不能
+	// 在这里重新构建，否则对应的快路径永远不可达，而且每次扫描都要白建一个完整
+	// FDR 自动机。可建自动机的单角色在构建期已经建好，这里直接复用。
 	matcher := p.matcher
 	if matcher == nil && !p.miracleReady && len(p.Roles) > 1 {
 		matcher = buildRoleMatcher(p.Roles)
@@ -328,8 +329,8 @@ func (p *Program) FindMatchesInto(data []byte, dst []State) []State {
 		return out
 	}
 	if len(p.Roles) == 1 && !p.miracleReady {
-		// 单角色不构建共享自动机时，直接线性确认即可；该路径保留
-		// 重叠命中并避免每个输入偏移建立去重映射。
+		// 单角色无法建立字节自动机时（例如非 ASCII 的大小写不敏感角色），
+		// 回落到逐偏移确认；该路径保留重叠命中并避免建立去重映射。
 		role := p.Roles[0]
 		out := dst[:0]
 		for off := 0; off+len(role.Literal) <= len(data); off++ {
@@ -663,11 +664,12 @@ func (p *Program) rebuildCandidateState() {
 		p.miracleBuckets[i] = nil
 	}
 	p.miracleFirstTable = simd.ByteSetTables{}
+	// 单角色同样保留共享自动机。没有自动机时单角色会退化为对每个输入偏移各做
+	// 一次 Role.Eligible（内部是 bytes.Equal / EqualFold）：23 KB 零命中语料上
+	// 约 70 µs，大小写不敏感约 122 µs；由自动机先定位候选再确认只要约 2.2 µs。
+	// 非 ASCII 的大小写不敏感角色无法建字节自动机，buildRoleMatcher 返回 nil，
+	// 此时仍回落到逐偏移确认。
 	p.matcher = buildRoleMatcher(p.Roles)
-	// 单角色使用轻量候选路径，多角色继续使用共享自动机。
-	if len(p.Roles) == 1 {
-		p.matcher = nil
-	}
 	if len(p.miracles) == len(p.Roles) && len(p.Roles) > 1 {
 		p.miracleReady = true
 		// 所有角色均可由候选器直接定位时跳过通用多模式匹配器。

@@ -53,13 +53,26 @@ func startByteSet(rule compiledRule) []byte {
 	if rule.root == nil {
 		return full()
 	}
-	// 大小写折叠、UTF-8 语义、编辑距离与状态化结构都会让首字节偏离语法树
-	// 直接推导的结果，这里一律不做过滤。
-	if rule.flags&(CompileCaseless|CompileUTF8|CompileUCP) != 0 {
+	// UTF-8 语义、编辑距离与运行时状态结构都会让首字节偏离语法树直接推导
+	// 的结果，这里一律不做过滤。
+	if rule.flags&(CompileUTF8|CompileUCP) != 0 {
 		return full()
 	}
 	if rule.ext != nil && rule.ext.Flags&(ExtFlagEditDistance|ExtFlagHammingDistance) != 0 {
 		return full()
+	}
+	if ruleCaseless(rule) {
+		// 忽略大小写只改变字节的等价类，不改变哪些结构会消费字节：首字节集合
+		// 仍可静态推导，按折叠后的闭包过滤即可。只有消费范围无法静态确定的
+		// 结构才回退全放行。
+		if unsupportedFirstBytes(rule.root) {
+			return full()
+		}
+		bytes := parser.FirstBytesCaseless(rule.root)
+		if len(bytes) == 0 || len(bytes) >= 256 {
+			return full()
+		}
+		return bytes
 	}
 	if parser.RequiresStatefulRuntime(rule.root) {
 		return full()
@@ -69,6 +82,22 @@ func startByteSet(rule compiledRule) []byte {
 		return full()
 	}
 	return bytes
+}
+
+// unsupportedFirstBytes 判断表达式是否包含首字节集合无法静态推导的结构：
+// 反向引用、条件分支、环视与控制动词的消费范围都不能由语法树直接确定。
+func unsupportedFirstBytes(root parser.Node) bool {
+	unsupported := false
+	parser.Walk(root, func(node parser.Node) bool {
+		switch node.(type) {
+		case parser.Backreference, parser.Conditional, parser.Lookaround, parser.ControlVerb:
+			unsupported = true
+			return false
+		default:
+			return true
+		}
+	})
+	return unsupported
 }
 
 // startByteEndRow 是数据末尾起点的分组编号：只有可能匹配空串的规则需要在该

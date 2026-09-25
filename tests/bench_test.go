@@ -151,6 +151,10 @@ func piiBenchmarkScenarios() []piiBenchmarkScenario {
 			expressions: []scankit.Expression{{Id: 1, Pattern: logCreditCardPattern}},
 		},
 		{
+			name:        "Password",
+			expressions: []scankit.Expression{{Id: 1, Pattern: logPasswordPattern}},
+		},
+		{
 			name:        "AllPIITypes",
 			expressions: logPIIMixedExpressions(),
 		},
@@ -311,6 +315,9 @@ func piiBenchmarkField(scenario string, index int, valid bool) string {
 			return "bank_card=6122021234567890"
 		case "CreditCard":
 			return "credit_card=2111111111111111"
+		case "Password":
+			// 缺 : / = 的同类字段名不得命中。
+			return "password_hint=disabled"
 		case "SensitiveToken":
 			return "sensitive_token=0"
 		default:
@@ -327,6 +334,12 @@ func piiBenchmarkField(scenario string, index int, valid bool) string {
 		return fmt.Sprintf("bank_card=62%014d", index)
 	case "CreditCard":
 		return fmt.Sprintf("credit_card=4%015d", index)
+	case "Password":
+		// 交替大小写：同时覆盖 `(?i)` 的大小写不敏感与生产日志里常见的全小写字段名。
+		if index%2 == 0 {
+			return fmt.Sprintf("password=P@ssw0rd-%04d", index)
+		}
+		return fmt.Sprintf("PASSWORD=P@ssw0rd-%04d", index)
 	case "SensitiveToken":
 		return "sensitive_token=zredaction"
 	default:

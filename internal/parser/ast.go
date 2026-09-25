@@ -301,39 +301,64 @@ func FirstLiterals(root Node) [][]byte {
 }
 
 // FirstBytes 返回可能在匹配起点消费的字节集合；无法静态确定时返回完整集合。
-func FirstBytes(root Node) []byte {
+func FirstBytes(root Node) []byte { return firstBytes(root, false) }
+
+// FirstBytesCaseless 返回 ASCII 大小写折叠语义下可能在匹配起点消费的字节集合。
+// 与 [FirstBytes] 相比，ASCII 字母会同时展开大小写字形。字面量含非 ASCII
+// 字节时返回完整集合：ASCII 折叠无法覆盖 Unicode 折叠的等价类，静态推导
+// 可能漏掉实际起点。
+func FirstBytesCaseless(root Node) []byte { return firstBytes(root, true) }
+
+// isASCIILiteral 判断字节序列是否全部落在 ASCII 范围。非 ASCII 字面量在
+// caseless 下的等价类可能跨越不同前导字节，静态首字节推导必须放弃。
+func isASCIILiteral(value []byte) bool {
+	for _, b := range value {
+		if b >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func firstBytes(root Node, caseless bool) []byte {
 	set := [256]bool{}
-	if Nullable(root) {
+	full := false
+	markAll := func() {
+		full = true
 		for i := range set {
 			set[i] = true
 		}
+	}
+	if Nullable(root) {
+		markAll()
 	}
 	var walk func(Node)
 	walk = func(n Node) {
 		switch v := n.(type) {
 		case Literal:
-			if len(v.Value) > 0 {
-				set[v.Value[0]] = true
+			if len(v.Value) == 0 {
+				return
 			}
+			if caseless && !isASCIILiteral(v.Value) {
+				markAll()
+				return
+			}
+			set[v.Value[0]] = true
 		case Class:
 			if v.Negated {
-				for i := range set {
-					set[i] = true
-				}
-			} else {
-				for _, r := range v.Ranges {
-					for c := r.Lo; ; c++ {
-						set[c] = true
-						if c == r.Hi {
-							break
-						}
+				markAll()
+				return
+			}
+			for _, r := range v.Ranges {
+				for c := r.Lo; ; c++ {
+					set[c] = true
+					if c == r.Hi {
+						break
 					}
 				}
 			}
 		case Any, UnicodeClass:
-			for i := range set {
-				set[i] = true
-			}
+			markAll()
 		case Group:
 			walk(v.Child)
 		case Sequence:
@@ -353,6 +378,20 @@ func FirstBytes(root Node) []byte {
 		}
 	}
 	walk(root)
+	if caseless && !full {
+		// ASCII 字母的大小写互为等价类，首字节候选集合必须取闭包，
+		// 否则大小写混合的输入会在起点过滤阶段被误丢弃。
+		for c := byte('a'); c <= 'z'; c++ {
+			if set[c] {
+				set[c-'a'+'A'] = true
+			}
+		}
+		for c := byte('A'); c <= 'Z'; c++ {
+			if set[c] {
+				set[c-'A'+'a'] = true
+			}
+		}
+	}
 	out := make([]byte, 0)
 	for i, ok := range set {
 		if ok {
@@ -406,6 +445,83 @@ func HasScopedFlags(root Node) bool {
 		return true
 	})
 	return found
+}
+
+// HasCaselessClear 判断表达式是否包含关闭忽略大小写的局部作用域。表达式级
+// caseless 会被这类结构局部撤消，调用方据此放弃"整条规则统一忽略大小写"的
+// 假设，不能用单一次 ASCII 折叠覆盖全表达式。
+func HasCaselessClear(root Node) bool {
+	found := false
+	Walk(root, func(node Node) bool {
+		if group, ok := node.(Group); ok && group.ClearFlags&GroupFlagCaseless != 0 {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// UniformCaseless 判断表达式是否整体处于 caseless 语义：所有可能消费字节的
+// 节点都在开启状态下求值。存在局部关闭、仅部分子树开启，或包含无法静态判定
+// caseless 作用域的结构时返回 false。
+//
+// 该判定用于确认「整条规则统一忽略大小写」，是候选索引与首字节索引放宽到
+// caseless 规则前的必要条件；判定为 false 时调用方必须保留完整确认路径。
+func UniformCaseless(root Node) bool {
+	if root == nil {
+		return false
+	}
+	found := false
+	uniform := true
+	var walk func(Node, bool)
+	walk = func(n Node, on bool) {
+		if !uniform {
+			return
+		}
+		switch v := n.(type) {
+		case Group:
+			next := on
+			if v.SetFlags&GroupFlagCaseless != 0 {
+				next = true
+			}
+			if v.ClearFlags&GroupFlagCaseless != 0 {
+				next = false
+			}
+			walk(v.Child, next)
+		case Literal:
+			if len(v.Value) == 0 {
+				return
+			}
+			found = true
+			if !on {
+				uniform = false
+			}
+		case Class, Any, UnicodeClass, Backreference:
+			found = true
+			if !on {
+				uniform = false
+			}
+		case Assertion:
+			// 零宽断言不消费字节，不参与 caseless 判定。
+		case Sequence:
+			for _, element := range v.Elements {
+				walk(element, on)
+			}
+		case Alternation:
+			for _, option := range v.Options {
+				walk(option, on)
+			}
+		case Repeat:
+			walk(v.Child, on)
+		default:
+			// 环视、条件分支、控制动词等结构无法用单层状态描述 caseless
+			// 作用域，保守放弃统一判定。
+			uniform = false
+		}
+	}
+	walk(root, false)
+	return found && uniform
 }
 
 // CaptureIDs 返回捕获组编号，按 AST 遍历顺序排列。

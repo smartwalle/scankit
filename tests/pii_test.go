@@ -26,6 +26,11 @@ const (
 	logBankCardPattern       = `62[0-9]{14,17}`
 	logCreditCardPattern     = `4[0-9]{15}|5[1-5][0-9]{14}|3[47][0-9]{13}`
 	logSensitiveTokenPattern = `[z][a-z]{9,}`
+
+	// logPasswordPattern 与前五类"只匹配原始值"的规则形态不同：它按字段名锚定，
+	// 不区分大小写地匹配 password 后跟 `:` 或 `=`（中间允许空白）以及一段非空白口令。
+	// 用于覆盖"字段名 + 分隔符 + 值"这类日志口令形态。
+	logPasswordPattern = `(?i)password\s*[:=]\s*\S+`
 )
 
 func TestLogPIIFixtures(t *testing.T) {
@@ -44,6 +49,7 @@ func TestLogPIIFixtures(t *testing.T) {
 		{"BankCard", []scankit.Expression{{Id: 1, Pattern: logBankCardPattern}}, logPIIRecord("bank_card", "6222021234567890"), 1},
 		{"CreditCard", []scankit.Expression{{Id: 1, Pattern: logCreditCardPattern}}, logPIIRecord("credit_card", "4111111111111111"), 1},
 		{"SensitiveToken", []scankit.Expression{{Id: 1, Pattern: logSensitiveTokenPattern}}, logPIIRecord("sensitive_token", "zredaction"), 1},
+		{"Password", []scankit.Expression{{Id: 1, Pattern: logPasswordPattern}}, logPIIRecord("password", "P@ssw0rd!2026"), 1},
 		{"Mixed", logPIIMixedExpressions(), logPIIMixedRecord(), 6},
 	} {
 		t.Run(test.name, func(t *testing.T) {
