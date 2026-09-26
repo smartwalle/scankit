@@ -89,6 +89,46 @@ func TestLogEmailPatternWithWordBoundariesMatchesEachAddress(t *testing.T) {
 	}
 }
 
+// 折叠窗口（入口集合重复 + 固定文字）只登记最左起点，窗口内更靠右的起点由确认
+// 阶段的推迟逻辑在 blockedUntil 位置补齐。这里用 Go regexp 作为参照，覆盖「前一个
+// 命中的结束位置落在下一个窗口内部」的形态：窗口最左起点被重叠抑制，真正命中的
+// 起点在窗口内部，漏掉这一步会少报一条匹配。
+func TestLogEmailPatternResumesInsideCollapsedWindow(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name    string
+		pattern string
+		record  string
+	}{
+		{"DomainTailBeforeLocalByte", logEmailPattern, "a@b.co-.@x.com"},
+		{"AdjacentAddresses", logEmailPattern, "u1@a.co.u2@b.co"},
+		{"SeparatedByLocalBytes", logEmailPattern, "u1@a.co-u2@b.co"},
+		{"BoundedLocalPart", `[a-z]{1,4}@[a-z]+`, "ab@cd@e"},
+		{"BoundedLocalPartDense", `[a-z]{1,4}@[a-z]+`, "a@b@cd"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := []byte(test.record)
+			scanner, err := scankit.Compile([]scankit.Expression{{Id: 1, Pattern: test.pattern}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			matches, err := scanner.Scan(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := regexp.MustCompile(test.pattern).FindAllIndex(data, -1)
+			if len(matches) != len(want) {
+				t.Fatalf("match count = %d, want %d; matches=%#v", len(matches), len(want), matches)
+			}
+			for index, span := range want {
+				if matches[index].From != uint64(span[0]) || matches[index].To != uint64(span[1]) {
+					t.Fatalf("match[%d] = (%d,%d), want (%d,%d)", index, matches[index].From, matches[index].To, span[0], span[1])
+				}
+			}
+		})
+	}
+}
+
 func TestLogChinesePhonePatternMatchesBoundedNumbers(t *testing.T) {
 	scanner, err := scankit.Compile([]scankit.Expression{{Id: 1, Pattern: logChinesePhonePattern2}})
 	if err != nil {

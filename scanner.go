@@ -295,6 +295,11 @@ type requiredEntry struct {
 	// 两者都在构造期固化，候选展开热路径直接读取，避免逐候选回查规则表。
 	guard *prefixGuard
 	skip  bool
+	// collapseWindow 表示该规则的候选窗口已被证明是一组确认结果相同的起点
+	// （见 collapseHead）：窗口内任意起点都会让入口集合重复消费到同一个文字
+	// 命中位置，之后的确认程序与起点无关。此时窗口只需登记最左起点，其余起点
+	// 由确认阶段的推迟逻辑补齐（见 retryCollapsedCandidate）。
+	collapseWindow bool
 }
 
 // requiredLiteral 是一个候选文字及共享它的全部规则。
@@ -574,6 +579,11 @@ func (scanner *Scanner) buildRequiredIndex(rules []compiledRule, guardDriven []b
 				literals = append(literals, hwlm.Literal{ID: uint32(position + 1), Value: variant.Value, CaseInsensitive: caseless})
 			}
 			entry := requiredEntry{ruleID: rule.id, ruleIndex: ruleIndex, min: variant.MinOffset, max: variant.MaxOffset, back: variant.Back, guard: rule.guard}
+			// 折叠窗口由 newCollapseHead 在确认程序入口证明：窗口内所有起点共享
+			// 同一个集合重复，确认结果与起点无关，因此只登记最左起点。判据与
+			// newCollapseHead 完全一致（单候选、guard 由回退集合蕴含），这里只
+			// 复用结论，不重复推导。
+			entry.collapseWindow = rule.collapseHead != nil
 			if guardImpliedByBack(entry.guard, variant.Back, variant.MinOffset) {
 				entry.guard = nil
 			}
@@ -1524,7 +1534,12 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 				byRule[candidate.ID] = candidate.To
 			}
 		}
-	} else if len(scanner.candidateIDs) == 1 && len(scanner.literalIDs) == 1 {
+	} else if !requiredDriven && len(scanner.candidateIDs) == 1 && len(scanner.literalIDs) == 1 {
+		// 只为「候选起点由候选文字索引枚举」的扫描建立单文字结束偏移表；
+		// 候选驱动扫描的起点已由必须文字索引给定，这张表不会参与候选枚举，
+		// 建立它只是每个文字命中分配一个 map。实测 2 条规则（`ab|cd` + 文字
+		// 规则）的 64 KiB 语料上，这一步凭空产生约 700 次分配，占该配置全部
+		// 分配的 97%，而扫描结果与耗时都只取决于必须文字路径。
 		if literalEnds == nil {
 			literalEnds = make(map[int]map[uint32]int)
 			ctx.literalEnds = literalEnds
@@ -2235,6 +2250,18 @@ func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte) ([]uin
 			if to == from {
 				// 窗口退化为单个起点，前缀约束在起点位置上必然成立，查表只是
 				// 额外常数开销。
+				if len(starts) >= limit {
+					return nil, false
+				}
+				starts = append(starts, uint64(uint32(from))<<32|ruleKey)
+				continue
+			}
+			if entry.collapseWindow {
+				// 窗口内所有起点的确认结果相同，只登记最左起点：更靠右的起点要么
+				// 被同一规则的重叠抑制挡住，要么由 retryCollapsedCandidate 推迟
+				// 到 blockedUntil 位置重新登记。登记整段窗口只会让同一份确认结果
+				// 反复经过排序与候选循环，实测让 Email 单规则的 HighMatch 场景
+				// 多付出一倍以上的确认前开销。
 				if len(starts) >= limit {
 					return nil, false
 				}

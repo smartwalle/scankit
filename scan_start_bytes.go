@@ -2,6 +2,7 @@ package scankit
 
 import (
 	"math/bits"
+	"sort"
 
 	"github.com/smartwalle/scankit/internal/parser"
 )
@@ -150,10 +151,14 @@ func (st *blockScanState) confirmCandidatesAndFallback(starts []uint64, index *s
 		// 候选已按 (起点, 规则) 升序。被重叠抑制或已终止的规则在这里直接
 		// 跳过，避免为必然返回的候选进入通用确认例程。
 		simple := st.scanner.simpleReports
-		for _, key := range starts {
+		for cursor := 0; cursor < len(starts); cursor++ {
+			key := starts[cursor]
 			start := int(key >> 32)
 			rule := int(uint32(key))
 			if start < st.blockedUntil[rule] || st.fired[rule] {
+				if next, ok := st.retryCollapsedCandidate(start, rule); ok {
+					starts = insertRequiredStart(starts, cursor+1, next)
+				}
 				continue
 			}
 			if !simple && st.ctx.Reports.Stopped() {
@@ -198,6 +203,13 @@ func (st *blockScanState) confirmCandidatesAndFallback(starts []uint64, index *s
 				break
 			}
 			if candidate >= 0 && (!hasRule || candidate < rule) {
+				if start < st.blockedUntil[candidate] || st.fired[candidate] {
+					if next, ok := st.retryCollapsedCandidate(start, candidate); ok {
+						starts = insertRequiredStart(starts, cursor+1, next)
+					}
+					cursor++
+					continue
+				}
 				if !st.verify(candidate, start) {
 					return
 				}
@@ -213,4 +225,42 @@ func (st *blockScanState) confirmCandidatesAndFallback(starts []uint64, index *s
 			return
 		}
 	}
+}
+
+// retryCollapsedCandidate 处理折叠窗口候选被重叠抑制的情况。
+//
+// 折叠窗口内的起点确认结果完全相同（见 collapseHead），逐起点确认在窗口内验证的
+// 是第一个未被抑制的起点，其余起点只会被 blockedUntil 挡住。窗口只登记了最左
+// 起点，因此这里把候选推迟到 blockedUntil 位置重新登记：该位置要么仍在窗口内、
+// 给出与逐起点确认一致的起点，要么已经越过窗口（此时窗口整体被抑制，重新确认会
+// 自然失败，或命中一个本就在该位置成立的合法匹配）。登记位置保持 (起点, 规则)
+// 升序，所以结果集合与稳定投递顺序都与逐起点确认一致。
+//
+// 返回 false 表示该候选不需要推迟：规则没有折叠窗口、规则已终止、推迟位置不晚于
+// 当前起点，或推迟位置已经在数据末尾之外。
+func (st *blockScanState) retryCollapsedCandidate(start int, rule int) (uint64, bool) {
+	if st.fired[rule] || st.scanner.rules[rule].collapseHead == nil {
+		return 0, false
+	}
+	next := st.blockedUntil[rule]
+	if next <= start || next > len(st.data) {
+		return 0, false
+	}
+	return requiredStartKey(next, rule), true
+}
+
+// insertRequiredStart 把推迟后的候选按 (起点, 规则) 升序插入候选序列。
+// at 之后的元素都已按升序排列，因此插入位置可以用二分查找定位；与既有候选完全
+// 相同的键不再重复登记，避免同一起点被确认两次。
+func insertRequiredStart(starts []uint64, at int, key uint64) []uint64 {
+	position := at + sort.Search(len(starts)-at, func(index int) bool {
+		return starts[at+index] >= key
+	})
+	if position < len(starts) && starts[position] == key {
+		return starts
+	}
+	starts = append(starts, 0)
+	copy(starts[position+1:], starts[position:])
+	starts[position] = key
+	return starts
 }
