@@ -1,176 +1,166 @@
-# Block 模式基准基线
+# 性能测试结果记录
 
-采集日期：2026-09-20
-环境：darwin/arm64，Apple M5 Pro；x86 行在 darwin/amd64 + Rosetta 2 下采集（Rosetta 暴露 SSE2/SSSE3/SSE4.2，
-CPUID 不暴露 AVX/AVX2 但可执行 AVX2 指令，不支持 AVX512；AVX2 行仅用于正确性验证，不作为性能证据）
+本文件是 scankit Block 模式**性能测试结果的唯一记录处**。原先（2026-09-20）的基线内容已作废，
+不再保留；作废说明见 §7。
 
-## 1. 固定语料与基准命令
+## 1. 维护规则
 
-固定语料由 `conformance_matrix_test.go` 的 `conformanceMatrixExpressions`（12 条 Block 规则）与
-`conformanceMatrixCorpus`（确定性字节串，含尾部截断、非对齐起点与跨窗口长前缀）定义；
-`perf_baseline_test.go` 的 `fixedBenchCorpus` 把同一语料确定性重复到约 64KiB 作为吞吐输入。
-基准与一致性矩阵共用同一份规则和语料，避免“基准输入”和“正确性输入”长期分叉。
+1. **只在产生新的最优值时更新本文件**：没有新最优值的实验（含被否决的方向）不写进本文件，
+   写进 `问题与排查计划.md` 对应章节。
+2. 一次更新固定包含三件事：
+   - 在 §4「演进记录」**追加**一行：日期 / 基准 / 前值 → 新值 / 变化 / 依据章节；
+   - 同步修改 §3「当前最优值」对应行的数值、采集日期与「依据」列；
+   - 不改动 §4 里已有的历史行，也不删除被替换掉的旧值。
+3. 数值必须来自**实际运行**；禁止用占比（pprof）或推演替代实测。
+4. 绝对值与相对值分栏记录：**绝对值只在与它同一次采集内可比**，跨会话的绝对差值不可比；
+   「本次提升多少」只能用**同一次采集内的两棵树交错 A/B** 差值表达（见 §2）。
 
-```text
-go test -run '^$' -bench 'Benchmark(Scan|EngineFamilies|ResourceUsage|ProgramFindMatches|FindAll|BackendEqualByteMask|ScanRuleScales|FixedCorpusScan|QueuePushAll|FindIntoByteMask|InRangeMask)' -benchmem ./...
-go test -run '^$' -bench 'Benchmark(ByteNFA|SelectEngineKind)' -benchmem ./internal/nfa/
-go test -run '^$' -bench BenchmarkBackendEqualByteMask -benchmem -benchtime=100ms ./internal/simd
-go test -run '^$' -bench 'BenchmarkNativeByteSetMask|BenchmarkByteSetMaskPrepared|BenchmarkNativeByteSetMask32|BenchmarkNativeByteSetMask64|BenchmarkWindowMask' -benchmem ./internal/simd/...
-go test -run '^$' -bench 'BenchmarkForEachNFAStartFirstByte|BenchmarkMiracleWindowCandidates' -benchmem ./internal/nfa/ ./internal/rose/
-```
+## 2. 测量规范
 
-AVX2 内核在 Rosetta 下需显式开启（仅用于正确性与指令级执行验证）：
+环境（历次记录均为此环境，换机器必须在 §4 注明）：
+
+- CPU：Apple M5 Pro；OS：darwin/arm64；Go 1.27。
+
+**结论性对比（判定「是否提升」）必须满足**：
+
+- `caffeinate -i` 包裹；
+- **一次只跑一个基准**（`-test.bench` 只匹配一个名字），不并发、不后台跑其他任务；
+- 两棵树交错执行（base → new → base → new …），轮间 `sleep 10`；
+- 多轮取最小值（至少 3 轮）。
+
+**本文件 §3 的采集方法**（建立/刷新「当前最优值」）：
+
+- 同一进程内 `-test.count 5`，每个基准取 5 次采样中的最小值；
+- 仍然是 `caffeinate -i`、一次只跑一个基准族；
+- 命令见 §5。该方法给出的是「可复现的参考值」，不是跨版本可比量。
+
+**噪声底**：在结构性 no-op 的基准上（见 §6）两棵树交错实测差值落在 **±1%** 以内，
+因此小于 1% 的差异一律不记为提升或回退。
+
+## 3. 当前最优值
+
+采集时间：**2026-09-26**；代码版本：`dev` 分支 `9c1dbfc perf: 入口文字之后续跑确认表`；
+采集方法：§2 的「当前最优值」方法（`-count 5` 取最小，`caffeinate -i`）。
+
+### 3.1 固定语料（64 KiB + 12 规则）
+
+基准：`BenchmarkFixedCorpusScan`（`conformanceMatrixExpressions` 的 12 条 Block 规则，
+`fixedBenchCorpus` 确定性重复到约 64 KiB，含尾部截断、非对齐起点与跨窗口长前缀）。
+
+| 后端 | ns/op | MB/s | B/op | allocs/op | 依据 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `/host` | 266,572 | 245.58 | 287,017 | 1 | §54、§56.6 均为结构性 no-op |
+| `/generic` | 400,681 | 163.38 | 287,294 | 1 | §54 P0-6 后复测 |
+
+### 3.2 PII 100 规则（`BenchmarkPIIRedactionRules100`）
+
+100 条规则 = 8 种 PII 形态 × 独立字段锚点 `field%02d=`；三个密度共用同一套规则：
+
+| 密度 | 语料字节 | 命中数 | 基准 | ns/op | MB/s | allocs/op | 依据 |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| NoMatch | 26,337 | 0 | `ScannerScanInto` | 2,745 | 9,595 | 0 | §56.6 |
+| NoMatch | 26,337 | 0 | `EngineMask` | 2,931 | 8,985 | 3 | §56.6 |
+| NoMatch | 26,337 | 0 | `GoRegexpReplace` | 1,473 | 17,881 | 2 | 外部参照 |
+| LowMatch | 30,805 | 200 | `ScannerScanInto` | 10,497 | 2,935 | 0 | §56.6 |
+| LowMatch | 30,805 | 200 | `EngineMask` | 13,142 | 2,344 | 3 | §56.6 |
+| LowMatch | 30,805 | 200 | `GoRegexpReplace` | 122,506 | 251 | 11 | 外部参照 |
+| HighMatch | 169,316 | 6,400 | `ScannerScanInto` | 247,360 | 684 | 0 | **§56.6 P0-8** |
+| HighMatch | 169,316 | 6,400 | `EngineMask` | 305,518 | 554 | 3 | §56.6 |
+| HighMatch | 169,316 | 6,400 | `GoRegexpReplace` | 3,702,395 | 46 | 22 | 外部参照 |
+
+`HighMatch` 是「高命中密度最坏情况」：169,316 字节里 6,400 个真实命中，即 26.5 字节/命中。
+
+> 同日交错 A/B 里 `HighMatch/ScannerScanInto` 采到过 244,958 ns（§4）。与上表的 247,360 ns
+> 不是矛盾：一个是「两棵树交错取最小」，一个是「同进程 5 次采样取最小」，差异来自采样方式
+> 与机器状态，量级都在噪声底附近。判断提升只认 §4 记录的**成对差值**。
+
+### 3.3 PII 单形态（`BenchmarkPIIRedaction`）
+
+每条规则单独跑；`EngineMask` 是端到端（扫描 + 原地脱敏），`GoRegexpReplace` 是外部参照基线。
+
+| 场景 | 密度 | EngineMask ns/op（MB/s） | GoRegexpReplace ns/op（MB/s） |
+| --- | --- | ---: | ---: |
+| Phone1 | NoMatch / LowMatch / HighMatch | 4,357（5,634） / 4,456（5,508） / 6,252（3,640） | 24,709（993） / 26,270（934） / 41,746（545） |
+| Phone2 | NoMatch / LowMatch / HighMatch | 3,289（7,464） / 3,402（7,215） / 5,709（3,986） | 460,548（53.3） / 465,861（52.7） / 450,331（50.5） |
+| Phone3 | NoMatch / LowMatch / HighMatch | 3,202（7,666） / 3,298（7,443） / 5,111（4,453） | 294,548（83.3） / 299,967（81.8） / 290,386（78.4） |
+| Email | NoMatch / LowMatch / HighMatch | 1,697（14,635） / 1,789（13,876） / 4,017（5,792） | 1,273,456（19.5） / 1,264,235（19.6） / 1,190,046（19.6） |
+| ChineseID | NoMatch / LowMatch / HighMatch | 5,006（4,980） / 5,078（4,909） / 6,959（3,380） | 311,162（80.1） / 311,443（80.0） / 322,435（73.0） |
+| BankCard | NoMatch / LowMatch / HighMatch | 2,494（9,945） / 2,576（9,629） / 4,141（5,619） | 4,096（6,055） / 6,478（3,829） / 32,335（720） |
+| CreditCard | NoMatch / LowMatch / HighMatch | 4,371（5,688） / 4,410（5,638） / 6,097（3,837） | 507,156（49.0） / 519,720（47.8） / 503,640（46.5） |
+| Password | NoMatch / LowMatch / HighMatch | 4,079（6,049） / 4,168（5,920） / 5,993（3,840） | 271,226（91.0） / 274,274（90.0） / 277,113（83.0） |
+| AllPIITypes | NoMatch / LowMatch / HighMatch | 15,079（1,910） / 15,425（1,868） / 31,211（1,018） | 3,448,172（8.35） / 3,453,929（8.34） / 3,978,980（7.99） |
+
+`EngineMask` 在全部 9 个场景上均为 96 B/op、3 allocs/op；`NoMatch` 行无分配。
+
+## 4. 演进记录
+
+按时间倒序；只记录**新最优值**。相对变化一律取自同一次采集内的两棵树交错 A/B。
+
+| 日期 | 基准 | 前值 → 新值 | 变化 | 依据 |
+| --- | --- | --- | --- | --- |
+| 2026-09-26 | `PIIRedactionRules100/HighMatch/ScannerScanInto` | 259,477 → 244,958 ns | **−5.6%** | §56.6（P0-8 确认表续跑） |
+| 2026-09-26 | 同上，探针 `confirmEnd` 分段 | 155.5 → 122.0 µs | **−21.5%** | §56.6 |
+| 2026-09-26 | 同上，Email 形态确认（13 条规则 / 830 余候选） | 52 → 21 µs | **−60%** | §56.6 |
+| 2026-09-26 | `FixedCorpusScan/host` | 265,780 → 263,456 ns | −0.9%（no-op，§6） | §56.6 |
+| 2026-09-26 | `PIIRedaction/{Email,AllPIITypes}/HighMatch/EngineMask` | 3,980 → 4,014 ns / 31,573 → 31,519 ns | ±1%（no-op，§6） | §56.6 |
+| 2026-09-2x | `FixedCorpusScan/host` | 271,840 → 252,553 ns | **−7.1%**（allocs 2→1） | §54（P0-6 统一两字节前缀匹配器） |
+| 2026-09-2x | `FixedCorpusScan/generic` | 557,288 → 392,964 ns | **−29.5%** | §54 |
+| 2026-09-2x | `PIIRedaction/Password/HighMatch` | 6,091 → 5,768 ns | **−5.3%** | §54 |
+| 2026-09-2x | `PIIRedaction/Password/NoMatch` | 4,342 → 3,946 ns | **−9.1%** | §54 |
+
+> P0-6 的绝对值与 §3 的绝对值来自不同会话，**不可直接相减**：例如
+> `FixedCorpusScan/host` 在 §3 记为 266,572 ns，而 P0-6 会话的最优值是 252,553 ns。
+> 两个数字都成立，差别来自采集会话的机器状态；判断「是否提升」只看同会话交错 A/B 的差值。
+
+## 5. 复现命令
+
+构建被测二进制（`tests` 包承载全部公开 API 基准）：
 
 ```bash
-SCANKIT_AVX2_TESTS=1 GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go test -count=1 -run 'AVX2' ./internal/simd/x86/
-SCANKIT_AVX2_TESTS=1 GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go test -count=1 -run '^$' -bench BenchmarkNativeByteSetMask32 -benchmem ./internal/simd/x86/
+go test -c -o /tmp/scankit_bench.test ./tests/
 ```
 
-x86 掩码基准需在 amd64 产物上运行：
+采集「当前最优值」（§3 用的方法）：
 
 ```bash
-GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go test -c ./internal/simd/x86 -o /tmp/x86simd.test
-arch -x86_64 /tmp/x86simd.test -test.run '^$' -test.bench BenchmarkNativeMasks -test.benchmem
+caffeinate -i /tmp/scankit_bench.test -test.run '^$' \
+  -test.bench 'BenchmarkFixedCorpusScan/' -test.benchmem -test.count 5
+
+caffeinate -i /tmp/scankit_bench.test -test.run '^$' \
+  -test.bench 'BenchmarkPIIRedactionRules100/' -test.benchmem -test.count 5
+
+caffeinate -i /tmp/scankit_bench.test -test.run '^$' \
+  -test.bench 'BenchmarkPIIRedaction/' -test.benchmem -test.count 5
 ```
 
-## 2. 代表性结果
+两棵树交错 A/B（判定提升/回退的标准做法；`<BENCH>` 一次只放一个基准名）：
 
-| 基准 | ns/op | B/op | allocs/op |
-| --- | ---: | ---: | ---: |
-| ScanRuleScales/rules_1 | 161,633 | 22,565 | 21 |
-| ScanRuleScales/rules_10 | 183,754 | 33,058 | 8 |
-| ScanRuleScales/rules_100 | 435,055 | 313,914 | 8 |
-| ScanRuleScales/rules_1000 | 3,099,492 | 3,198,690 | 9 |
-| FixedCorpusScan/generic | 96,093,969（0.68 MB/s） | 5,650,264 | 20,287 |
-| FixedCorpusScan/host | 92,600,458（0.71 MB/s） | 5,651,578 | 20,287 |
-| NFA ByteNFA | 3,891 | 8 | 1 |
-| NFA LimEx | 10,513 | 64 | 1 |
-| NFA Sheng | 16,341 | 64 | 1 |
-| NFA McSheng | 9,735 | 64 | 1 |
-| NFA Tamarama | 1,032 | 192 | 17 |
-| NFA Shufti | 14,932 | 64 | 1 |
-| NFA Truffle | 19,923 | 64 | 1 |
-| NFA Vermicelli | 9,745 | 64 | 1 |
-| NFA SelectEngineKind | 231,972 | 441,599 | 9,146 |
-| NFA ResourceUsage Castle | 58,243 | 57,179 | 648 |
-| NFA ResourceUsage LimEx | 325,580 | 2,033 | 7 |
-| Rose ProgramFindMatches | 213～279 | 600 | 8 |
-| Rose QueuePushAll/bulk | 440,460 | 299,080 | 18 |
-| Rose QueuePushAll/sequential | 9,225,258 | 298,984 | 15 |
-| HWLM FindAll | 86.8～98.0 | 24 | 2 |
-| HWLM Teddy FindInto（多 lane / 单 lane） | 2,022～2,876（1,424～2,026 MB/s） / 31,940～33,116（124～128 MB/s） | 24 | 1 |
-| HWLM Noodle FindInto（多 lane / 单 lane） | 2,181～2,769（1,479～1,878 MB/s） / 60,359～60,651（68 MB/s） | 24 | 1 |
-| HWLM Teddy WindowMask（宿主原生 / 通用标量） | 848（2,416 MB/s） / 4,931（415 MB/s） | 0 | 0 |
-| SIMD WindowMask 32B（NEON / 通用，lanes1） | 1,091（7,506 MB/s） / 4,979（1,645 MB/s） | 0 | 0 |
-| SIMD WindowMask 32B（NEON / 通用，lanes4） | 3,004（2,727 MB/s） / 19,670（416 MB/s） | 0 | 0 |
-| SIMD 32B 字节集合内核（NEON / SSE 半区拼接） | 1.78 / 3.55 | 0 | 0 |
-| SIMD 32B 字节集合内核（AVX2，Rosetta 模拟，仅供参考） | 12.10 | 0 | 0 |
-| SIMD WindowMask64 64B（NEON 拼接 / 通用标量，lanes1） | 1,816（9,024 MB/s） / 8,992（1,822 MB/s） | 0 | 0 |
-| SIMD WindowMask64 64B（NEON 拼接 / 通用标量，lanes4） | 5,150（3,181 MB/s） / 41,224（397 MB/s） | 0 | 0 |
-| SIMD 宽窗口内核同字节对照（NEON 64B 拼接 / 32B 内核，4KiB，宿主后端） | 573 / 819（lanes1）、901 / 1,243（lanes2） | 0 | 0 |
-| SIMD 宽窗口内核同字节对照（通用标量 64B / 32B，4KiB） | 1,486 / 1,199（lanes1）、785 / 711（lanes2）、410 / 423（lanes4，MB/s） | 0 | 0 |
-| SIMD EqualByteMask（通用） | 8.79 | 0 | 0 |
-| SIMD EqualByteMask（主机分派） | 2.50 | 0 | 0 |
-| SIMD EqualByteMask（NEON 原生 / 展开标量） | 1.32 / 9.55 | 0 | 0 |
-| SIMD EqualMask（NEON 原生 / 展开标量） | 0.99 / 4.77 | 0 | 0 |
-| SIMD InRangeMask（NEON 原生 / 展开标量） | 1.91 / 7.22 | 0 | 0 |
-| SIMD ByteSetMask（NEON 原生 / 展开标量） | 1.68 / 7.30 | 0 | 0 |
-| SIMD ByteSetMask（SSE PSHUFB / 展开标量，Rosetta amd64） | 2.52 / 14.50 | 0 | 0 |
-| SIMD InRangeMask（SSE2 原生 / 展开标量，Rosetta amd64） | 2.00 / 6.00 | 0 | 0 |
+```bash
+for round in 1 2 3; do
+  for tree in base new; do
+    caffeinate -i /tmp/<tree>.test -test.run '^$' -test.bench '<BENCH>' -test.benchmem -test.count 1
+    sleep 10
+  done
+done
+```
 
-`FixedCorpusScan` 的吞吐偏低来自规则集合同时包含文字、范围、锚定、重复与 NFA/DFA 确认路径，
-且语料高度重复、命中密集，属于确认路径的最坏情况；该数字用于同机回归比较，不代表目标环境吞吐。
+## 6. 结构性 no-op 与噪声底
 
-## 3. 回归治理
+以下基准对特定改动是**结构性 no-op**，它们的实测差值构成噪声底（**±1%**），
+不作为提升或回退证据：
 
-确定性指标由 `TestFixedCorpusDeterministicMetrics` 强制校验，不依赖机器性能：
+| 基准 | 为什么是 no-op |
+| --- | --- |
+| `FixedCorpusScan/*` | 12 条规则中没有任何一条同时具备确认表与入口文字（`\bword\b` 的 `confirmSkip = 0`，其余规则无断言），因此 §56 的确认表续跑不生效 |
+| `PIIRedaction/Email/*`、`PIIRedaction/AllPIITypes/*` | 模式没有入口文字（`confirmSkip = 0`），确认表续跑不生效 |
+| `PIIRedactionRules100/{NoMatch,LowMatch}` | 候选数很少（0 / 200），收益被固定开销摊薄到噪声内 |
 
-- 命中集合：`1=1,2=2,3=15,4=1,5=1,6=1,7=1,8=2,9=1,10=1,11=1,12=11`。
-- 执行后端与布局：
-  `1=nfa/11/1/60,2=literal,3=nfa/11/2/68,4=nfa/3/10/22831,5=dfa/12/14096,6=literal,7=literal,8=nfa/10/3/33,9=nfa/11/1/100,10=nfa/11/1/66,11=literal,12=dfa/6/9096`
-  （格式：`<路径>/<引擎类型>/<状态数>/<布局内存字节>`）。
-- 分配上限：单次完整扫描 `<= 100` 次分配（当前 97），只允许下降不允许上升。
+## 7. 变更说明
 
-时间指标（`ns/op`、吞吐、`B/op`）只用于记录和同机对比，不写入断言，避免把某一台机器的性能当成绝对阈值。
-
-## 4. 说明
-
-本次单次采样命令输出作为当前可重复基线；多规则纯文字扫描继续消费候选切片，避免逐起点遍历和候选区间映射。
-NFA 各引擎在固定 corpus 上报告的状态、边、布局内存与执行步数由 `TestFixedCorpusDeterministicMetrics` 一起固化。
-跨后端一致性由 `TestScanConformanceAcrossBackendMatrix`、`TestScanConformanceAcrossBackendMatrixWindows`、
-`TestScanFixturesAcrossBackendMatrix` 和 `TestBackendInRangeMaskCoversAllValues` 重复验证，保证原生路径与回退路径结果一致。
-正式阈值需由部署环境另行定义。
-
-## 5. 64 字节宽窗口接入的对照与边界
-
-第 5 轮把 `Backend.WindowMask64`（64 字节宽窗口）接入 Teddy、Noodle、Rose 与 NFA 的候选枚举热路径，
-并把手写尾零位循环换成 `math/bits.TrailingZeros32/64`。对照数据全部来自同一台 darwin/arm64（M5 Pro），
-`-benchtime 4000x -count 3`：
-
-| 基准 | 32 字节基线（改前） | 64 字节宽窗口（改后） | 变化 |
-| --- | --- | --- | --- |
-| Teddy `FindIntoByteMask/second_mask` | 3,485～4,207 ns | 1,759～2,020 ns | 约 2.0 倍 |
-| Teddy `FindIntoByteMask/first_only` | 44,641～46,976 ns | 31,114～32,102 ns | 约 1.45 倍 |
-| Noodle `FindIntoByteMask/second_mask` | 4,390～5,536 ns | 2,495～3,467 ns | 约 1.75 倍 |
-| Noodle `FindIntoByteMask/first_only` | 76,588～77,996 ns | 57,050～57,782 ns | 约 1.34 倍 |
-| NFA `BenchmarkForEachNFAStartFirstByte/window32` | 54,425～60,796 ns | 42,434～46,134 ns | 约 1.3 倍 |
-| Rose `BenchmarkMiracleWindowCandidates` | 190,833～199,689 ns | 155,249～157,740 ns | 约 1.24 倍 |
-| Rose `New`+`Normalize`+`FindMatches`（64KiB，候选器路径可达后） | 765,059 ns | 309,149 ns | 约 2.5 倍 |
-
-重要的排查结论：宽窗口刚接入时 Teddy/Noodle 的稠密命中基准反而变慢（`first_only` 由约 45μs 升到约 66μs）。
-CPU profile 显示瓶颈不在 `WindowMask64` 内核（同字节数下 64 字节内核比 32 字节内核快约 1.4 倍），
-而是手写尾零位循环 `for v&1 == 0 { v >>= 1 }` 在稠密掩码场景下占 `FindInto` 约 23% CPU。
-替换为 `math/bits.TrailingZeros32/64`（单个 `RBIT`/`TZCNT` 指令）后，四个热点全部快于改前的 32 字节基线。
-该结论已写入任务清单 K-20 第四轮证据，避免后续再把手写位循环引入热路径。
-
-512 位（AVX512BW/VBMI）内核在本机无法执行（Rosetta 的 AVX512 探针直接触发非法指令），
-因此它们只有交叉编译与一次性运行时自检证据，不纳入性能基线。
-
-## 6. PII 规模化基准（100 条规则）与每命中预算
-
-`BenchmarkPIIRedactionRules100` 由 `pii_rules100_bench_test.go` 独立承载：规则构造、逐行负载、
-密度登记与该场景的全部测试（字段锚点、裸值不命中、近失配不命中、语料命中与 Go regexp 一致）
-都只在该文件里，`pii_log_bench_test.go` 不再登记该场景，两者互不引用私有钩子。
-100 条规则 = 8 种 PII 形态
-（手机号 ×3、邮箱、身份证、银行卡、信用卡、令牌）× 独立字段锚点 `field%02d=`；
-锚点用 `(?:…)` 包住整条形态，否则 `a|b|c` 只会锚定第一个分支，信用卡形态会退化成
-长度 2～3 字节的必需文字并让 HWLM 扁平索引失效。
-三个密度场景的语料与命中数（同一台 darwin/arm64，`-benchtime=2000x -count=3` 取最小值）：
-
-| 场景 | 语料字节 | 命中数 | ns/op | MB/s | allocs/op |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| PIIRules100/NoMatch | 26,337 | 0 | 3,606 | 7,303 | 0 |
-| PIIRules100/LowMatch | 30,805 | 200 | 11,744 | 2,623 | 0 |
-| PIIRules100/HighMatch | 169,316 | 6,400 | 249,441 | 678 | 0 |
-
-`HighMatch` 的起点是 357,526 ns（481 MB/s），本轮结束时为 249,441 ns（678 MB/s）。
-贡献按交替 A/B 折算：HWLM 扁平索引单 lane 绑定约 16%、`FindIntoUnsorted` 扁平专用扫描与主键探测内联约 5%、
-确认程序按字节数上界的回溯点剪枝约 1.3～3%。
-
-该场景是"高命中密度"最坏情况：169,316 字节里分布 6,400 个真实命中，即 26.5 字节/命中。
-按此密度，1,000 MB/s 要求单命中总预算降到 26.5 ns 以内，当前实测约 39 ns/命中。
-`cpuprofile`（`-benchtime=20000x`，扣除建表开销后扫描约占 5.0 s）拆分为：
-
-- 候选定位约 50 µs（7.8 ns/命中）：64 字节宽窗口的字节集合掩码约 2,640 次/扫描，加约 6,400 次
-  8 字节主键哈希探测（`flatTable.findInto` 累计 34 µs）。
-- 确认程序约 144 µs（22.5 ns/命中）：平均 12.9 条虚机指令、约 1.6 ns/指令；按形态拆分为
-  手机1 5 步、手机2 14 步、手机3 9 步、邮箱 44 步（70 ns，含 `{1,64}` 与 `{0,61}` 的有界重复压栈）、
-  身份证 18 步、银行卡 4 步、信用卡 5 步、令牌 4 步。
-
-同一场景下 `EngineMask`（扫描 + 原地脱敏）与 Go `regexp.ReplaceAllFunc` 基线（`-benchtime=300x -count=3` 取最小值）：
-
-| 场景 | ScannerScanInto | EngineMask | GoRegexpReplace |
-| --- | ---: | ---: | ---: |
-| PIIRules100/NoMatch | 7,303 MB/s | 6,807 MB/s | 20,665 MB/s |
-| PIIRules100/LowMatch | 2,623 MB/s | 2,087 MB/s | 254 MB/s |
-| PIIRules100/HighMatch | 678 MB/s | 529 MB/s | 44.8 MB/s |
-
-即命中存在时 scankit 比 Go regexp 快 10～15 倍，1,000 MB/s 目标在 NoMatch/LowMatch 两档分别以
-7.3 倍与 2.6 倍余量达成；只有“每两行就有一行含 100 个 PII 值”的 HighMatch 极端密度低于目标。
-无命中时 Go regexp 反而更快（20.7 GB/s 对 6.8 GB/s）：RE2 的单遍 DFA 没有逐命中确认常数，
-而 scankit 即使零命中也要付出 100 条规则的候选文字索引与固定派发开销。
-
-结论：该密度下的瓶颈是确认程序的逐指令开销与窗口掩码的每窗口成本，两者都已接近当前架构的常数下限；
-`{0,61}`/`{1,64}` 一类有界重复与 `(?:…)+` 回边使邮箱形态既无法按字节数剪枝（消费长度无上界），
-也无法通过减少压栈改善。进一步提升需要并行分块扫描或按规则形态生成专用验证器，
-两者都会改变 Block 扫描语义/结构，本轮未纳入主路径。
+- **2026-09-26**：本文件整体重写为「性能测试结果记录」。删除原先（2026-09-20）的基线表，
+  包括 `ScanRuleScales`、NFA 引擎、Rose、HWLM、SIMD 掩码等条目——那些数字属于一次性采样，
+  既没有可复现的采集口径，也不属于当前回归基准集（见 §1），继续保留只会误导对比。
+- **保留**：文件名与路径不变（`docs/technical-solutions/scankit-block-mode/performance-baseline.md`），
+  因为 `release-runbook.md`、`release-audit.md`、`vectorscan-replication-task-list.md` 引用该路径。
+- **不纳入本文件**：`BenchmarkEngineScan`（已删除）、`internal/*` 包内基准（只作实现内部证据，
+  不作为回归基线）、以及被否决方向的数据（写在 `问题与排查计划.md`）。
