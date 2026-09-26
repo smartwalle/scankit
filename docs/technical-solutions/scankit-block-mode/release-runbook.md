@@ -38,7 +38,7 @@ SCANKIT_FORCE_BACKEND=generic
 go test -run 'TestScanConformanceAcrossBackendMatrix|TestScanFixturesAcrossBackendMatrix' .
 go test -run 'TestBackendInRangeMaskCoversAllValues|TestBackendPreparedByteSet|TestBackendEqualMasksCoverAllValues|TestBackendWindowMaskMatchesScalar|TestBackendWindowMaskCoversAllBytes|TestBackendWindowMask64MatchesScalar|TestBackendWindowMask64CoversAllBytes' ./internal/simd
 go test -run 'TestForEachNFAStartWindow|TestEngineFamiliesWindowBoundaryConformance' ./internal/nfa
-go test -run 'TestMiracle|TestNormalizePreservesMiracleCandidatePath' ./internal/rose
+go test -run 'TestMultiRole|TestNormalizePreservesSharedMatcher' ./internal/rose
 go test -run 'TestFindMatchesWideWindowBoundary' ./internal/hwlm/...
 go test -run TestFixedCorpusDeterministicMetrics .
 ```
@@ -68,10 +68,13 @@ Rosetta 不支持 AVX512（ZMM/K 寄存器指令直接触发非法指令），�
 
 ## 性能基线
 
-发布前重新采集固定语料与既有基准，并把 `ns/op`、`B/op`、`allocs/op` 写入 `performance-baseline.md`：
+发布前重新采集固定语料与既有基准。**只把回归基准集（`BenchmarkFixedCorpusScan`、
+`BenchmarkPIIRedactionRules100`、`BenchmarkPIIRedaction`）的 `ns/op`、`B/op`、`allocs/op` 写入
+`performance-baseline.md`**（该文件是性能结果记录，口径见其 §1/§2）；下条命令里其余包内基准
+属于发布证据，结果记在发布审计里，不进 `performance-baseline.md`：
 
 ```bash
-go test -run '^$' -bench 'Benchmark(Scan|EngineFamilies|ResourceUsage|ProgramFindMatches|FindAll|BackendEqualByteMask|ScanRuleScales|FixedCorpusScan|QueuePushAll|FindIntoByteMask|InRangeMask|WindowMask|NativeByteSetMask|ForEachNFAStartFirstByte|MiracleWindowCandidates)' -benchmem ./...
+go test -run '^$' -bench 'Benchmark(Scan|EngineFamilies|ResourceUsage|ProgramFindMatches|FindAll|BackendEqualByteMask|ScanRuleScales|FixedCorpusScan|QueuePushAll|FindIntoByteMask|InRangeMask|WindowMask|NativeByteSetMask|ForEachNFAStartFirstByte|MultiRoleCandidates)' -benchmem ./...
 ```
 
 确定性指标（命中集合、执行后端、状态数、布局内存、分配上限）由 `TestFixedCorpusDeterministicMetrics` 强制校验，时间指标只记录不设阈值。

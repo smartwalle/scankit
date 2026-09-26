@@ -7,6 +7,7 @@ import (
 
 	"github.com/smartwalle/scankit/internal/parser"
 	"github.com/smartwalle/scankit/internal/prefilter"
+	"github.com/smartwalle/scankit/internal/rose"
 )
 
 // 本文件实现 Block 扫描候选起点的确认程序。候选文字索引只能定位“可能命中”
@@ -49,6 +50,10 @@ const (
 	confirmOpAssert
 	confirmOpSplit
 	confirmOpMatch
+	// confirmOpUnicodeLiteral 处理含非 ASCII 字节的忽略大小写文字：字节级
+	// ASCII 折叠覆盖不了 Unicode 折叠等价类，改为按 rune 比较（见 rose.CaselessEqual）。
+	// index 指向文字表。
+	confirmOpUnicodeLiteral
 )
 
 // confirmPackedLiteralLimit 是可直接内联进指令的文字长度上限。
@@ -468,7 +473,7 @@ func confirmRemainAt(p *confirmProgram, pc int32, remain []int) int {
 	switch instr.op {
 	case confirmOpLiteral:
 		return after(instr.next, int(uint32(instr.index)>>24))
-	case confirmOpLongLiteral:
+	case confirmOpLongLiteral, confirmOpUnicodeLiteral:
 		return after(instr.next, len(p.literals[instr.index]))
 	case confirmOpSet, confirmOpAny:
 		return after(instr.next, 1)
@@ -502,6 +507,11 @@ func (c *confirmCompiler) compile(node parser.Node, next int32) int32 {
 	case parser.Literal:
 		if len(v.Value) == 0 {
 			return next
+		}
+		// 忽略大小写且含非 ASCII 的文字必须按 rune 折叠比较：打包字面量与
+		// equalByte 都只做 ASCII 折叠，会让「école」匹配不到「ÉCOLE」。
+		if c.flags&CompileCaseless != 0 && !asciiBytes(v.Value) {
+			return c.emit(confirmInstr{op: confirmOpUnicodeLiteral, next: next, index: c.addLiteral(v.Value)})
 		}
 		if len(v.Value) <= confirmPackedLiteralLimit {
 			return c.emit(confirmInstr{op: confirmOpLiteral, next: next, index: packConfirmLiteral(v.Value)})
@@ -745,6 +755,14 @@ scan:
 						goto backtrack
 					}
 				}
+			}
+			pos += length
+			pc = instr.next
+		case confirmOpUnicodeLiteral:
+			literal := p.literals[instr.index]
+			length := len(literal)
+			if pos+length > dataLen || !rose.CaselessEqual(literal, data[pos:pos+length]) {
+				goto backtrack
 			}
 			pos += length
 			pc = instr.next

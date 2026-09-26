@@ -4,6 +4,8 @@ package parser
 import (
 	"reflect"
 	"slices"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Node 是 AST 节点的公共接口，只由本包的节点类型实现。
@@ -303,14 +305,55 @@ func FirstLiterals(root Node) [][]byte {
 // FirstBytes 返回可能在匹配起点消费的字节集合；无法静态确定时返回完整集合。
 func FirstBytes(root Node) []byte { return firstBytes(root, false) }
 
-// FirstBytesCaseless 返回 ASCII 大小写折叠语义下可能在匹配起点消费的字节集合。
-// 与 [FirstBytes] 相比，ASCII 字母会同时展开大小写字形。字面量含非 ASCII
-// 字节时返回完整集合：ASCII 折叠无法覆盖 Unicode 折叠的等价类，静态推导
-// 可能漏掉实际起点。
+// FirstBytesCaseless 返回忽略大小写语义下可能在匹配起点消费的字节集合。
+// 与 [FirstBytes] 相比，ASCII 字母会同时展开大小写字形。解析器把多字节文字拆成
+// 逐字节 Literal，单个字节无法解出 rune，因此含非 ASCII 字节的字面量一律返回
+// 完整集合；按 rune 收窄首字节由 internal/rose 的角色过滤负责（见
+// [CaselessLeadingBytes]）。
 func FirstBytesCaseless(root Node) []byte { return firstBytes(root, true) }
 
+// CaselessLeadingBytes 返回忽略大小写字面量可能消费的首字节集合，升序去重。
+//
+// 忽略大小写的命中判定比较的是 rune 的小写结果，因此首 rune 的等价类由
+// ToLower(首 rune) 的折叠轨道决定。全 Unicode 穷举校验确认该轨道与等价类仅差
+// U+0130 'İ'（ToLower 为 'i' 却不与 'i' 同轨），这里显式并入，保证返回值是
+// 等价类的超集：只可能多出候选起点，不会漏判。
+//
+// 返回 nil 表示无法静态推导（空字面量或非法 UTF-8），调用方必须回退完整集合。
+// 本函数是首字节推导与 internal/rose 角色过滤共用的唯一实现。
+func CaselessLeadingBytes(value []byte) []byte {
+	if len(value) == 0 || !utf8.Valid(value) {
+		return nil
+	}
+	first, _ := utf8.DecodeRune(value)
+	// utf8.Valid 已保证解码成功：U+FFFD 本身是合法 rune，不能按解码失败处理。
+	lower := unicode.ToLower(first)
+	var set [256]bool
+	mark := func(r rune) {
+		buf := utf8.AppendRune(nil, r)
+		if len(buf) > 0 {
+			set[buf[0]] = true
+		}
+	}
+	mark(lower)
+	for f := unicode.SimpleFold(lower); f != lower; f = unicode.SimpleFold(f) {
+		mark(f)
+	}
+	if lower == 'i' {
+		mark(0x0130)
+	}
+	out := make([]byte, 0, 4)
+	for i, ok := range set {
+		if ok {
+			out = append(out, byte(i))
+		}
+	}
+	return out
+}
+
 // isASCIILiteral 判断字节序列是否全部落在 ASCII 范围。非 ASCII 字面量在
-// caseless 下的等价类可能跨越不同前导字节，静态首字节推导必须放弃。
+// caseless 下的等价类可能跨越不同前导字节，而逐字节 Literal 又不足以还原首个
+// rune，静态首字节推导因此放弃。
 func isASCIILiteral(value []byte) bool {
 	for _, b := range value {
 		if b >= 0x80 {
@@ -318,6 +361,27 @@ func isASCIILiteral(value []byte) bool {
 		}
 	}
 	return true
+}
+
+// caselessLeadingBytes 把 Sequence 首段连续 Literal 拼回首个 rune，返回忽略
+// 大小写折叠后的首字节超集。解析器把多字节文字拆成逐字节 Literal，单个字节
+// 解不出 rune，因此这里必须重新拼接。拼接不足以解出完整 rune（首字节非 ASCII
+// 且后续字节缺失）时返回 nil，调用方回退完整集合，保证只可能多放行、不漏判。
+func caselessLeadingBytes(elements []Node) []byte {
+	var lead []byte
+	for _, child := range elements {
+		lit, ok := child.(Literal)
+		if !ok || len(lit.Value) == 0 {
+			break
+		}
+		lead = append(lead, lit.Value...)
+		// 首字节非 ASCII 且只拼到一个字节时，rune 尚未完整，继续拼后续字节。
+		if len(lead) == 1 && !isASCIILiteral(lead) {
+			continue
+		}
+		return CaselessLeadingBytes(lead)
+	}
+	return nil
 }
 
 func firstBytes(root Node, caseless bool) []byte {
@@ -340,6 +404,15 @@ func firstBytes(root Node, caseless bool) []byte {
 				return
 			}
 			if caseless && !isASCIILiteral(v.Value) {
+				// 非 ASCII 忽略大小写文字按 rune 折叠：首字节集合需要按折叠轨道
+				// 推导（可能跨越不同前导字节），不能只取 v.Value[0]。非法 UTF-8
+				// 无法推导时整体放弃，返回完整集合。
+				if leading := CaselessLeadingBytes(v.Value); leading != nil {
+					for _, c := range leading {
+						set[c] = true
+					}
+					return
+				}
 				markAll()
 				return
 			}
@@ -362,6 +435,16 @@ func firstBytes(root Node, caseless bool) []byte {
 		case Group:
 			walk(v.Child)
 		case Sequence:
+			// 解析器把多字节文字拆成逐字节 Literal，需要先把首段连续 Literal
+			// 拼回首个 rune，才能按 rune 推导忽略大小写的折叠首字节闭包。
+			if caseless {
+				if leading := caselessLeadingBytes(v.Elements); leading != nil {
+					for _, c := range leading {
+						set[c] = true
+					}
+					return
+				}
+			}
 			for _, child := range v.Elements {
 				walk(child)
 				if !Nullable(child) {

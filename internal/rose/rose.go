@@ -5,19 +5,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"math/bits"
 	"slices"
 	"sort"
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/smartwalle/scankit/internal/dispatch"
 	"github.com/smartwalle/scankit/internal/fdr"
 	"github.com/smartwalle/scankit/internal/hwlm"
 	"github.com/smartwalle/scankit/internal/nfagraph"
 	"github.com/smartwalle/scankit/internal/parser"
 	"github.com/smartwalle/scankit/internal/report"
-	"github.com/smartwalle/scankit/internal/simd"
 )
 
 // Role 描述一条 Rose 角色：以固定文字为触发条件，并携带偏移与确认约束。
@@ -138,30 +135,7 @@ func (r Role) MatchAt(data []byte, off int) bool {
 		return false
 	}
 	if r.CaseInsensitive && !isASCII(r.Literal) {
-		if off >= len(data) || !utf8.RuneStart(data[off]) || !utf8.Valid(r.Literal) || !utf8.Valid(data[off:off+len(r.Literal)]) {
-			return false
-		}
-		literal := string(r.Literal)
-		input := string(data[off : off+len(r.Literal)])
-		lr, ls := utf8.DecodeRuneInString(literal)
-		ir, is := utf8.DecodeRuneInString(input)
-		for len(literal) > 0 && len(input) > 0 {
-			if lr != ir && unicode.ToLower(lr) != unicode.ToLower(ir) {
-				return false
-			}
-			if ls <= 0 || is <= 0 || ls != is {
-				return false
-			}
-			literal = literal[ls:]
-			input = input[is:]
-			if len(literal) > 0 {
-				lr, ls = utf8.DecodeRuneInString(literal)
-			}
-			if len(input) > 0 {
-				ir, is = utf8.DecodeRuneInString(input)
-			}
-		}
-		return len(literal) == 0 && len(input) == 0
+		return CaselessEqual(r.Literal, data[off:off+len(r.Literal)])
 	}
 	if !r.CaseInsensitive {
 		// 大小写不敏感且全 ASCII 走 bytes.Equal。
@@ -169,6 +143,37 @@ func (r Role) MatchAt(data []byte, off int) bool {
 	}
 	// 大小写不敏感且全 ASCII 走 bytes.EqualFold。
 	return bytes.EqualFold(r.Literal, data[off:off+len(r.Literal)])
+}
+
+// CaselessEqual 判断 literal 与 input 在 Unicode 简单折叠语义下是否相等。
+//
+// 约束与 Role.MatchAt 的忽略大小写分支一致：两侧都必须是合法 UTF-8，输入起点
+// 必须是 rune 起始字节；逐 rune 比较时要求两侧 rune 的 UTF-8 编码长度相同，
+// 因此命中区间长度恒等于 len(literal)。
+//
+// 该函数是 Rose 角色匹配与扫描器确认程序共用的唯一实现，避免两处各写一份折叠
+// 语义后出现「同一条规则走不同路径得到不同结果」的分叉。
+func CaselessEqual(literal, input []byte) bool {
+	if len(literal) == 0 || len(input) < len(literal) {
+		return false
+	}
+	input = input[:len(literal)]
+	if !utf8.RuneStart(input[0]) || !utf8.Valid(literal) || !utf8.Valid(input) {
+		return false
+	}
+	for len(literal) > 0 {
+		lr, ls := utf8.DecodeRune(literal)
+		ir, is := utf8.DecodeRune(input)
+		if ls != is {
+			return false
+		}
+		if lr != ir && unicode.ToLower(lr) != unicode.ToLower(ir) {
+			return false
+		}
+		literal = literal[ls:]
+		input = input[is:]
+	}
+	return true
 }
 
 func isASCII(data []byte) bool {
@@ -216,17 +221,14 @@ type Program struct {
 	Instructions []Instruction
 	matcher      *fdr.Matcher
 	// matchBuf 复用 matcher 返回的命中缓冲，避免每次 FindMatchesInto 都重新分配。
-	matchBuf        []fdr.Match
-	miracles        []*Miracle
-	miracleBuckets  [256][]int
-	miracleFirstSet [4]uint64
-	// miracleFirstTable 是 miracleFirstSet 的预编译窗口查找表，供候选取点热路径
-	// 一次判定 32 字节；只在 miracleReady 为真时构建，与首字节集合同步维护。
-	miracleFirstTable simd.ByteSetTables
-	miracleReady      bool
-	index             map[uint32]int
-	byReport          map[uint32][]int
-	instructions      map[uint32][]Instruction
+	matchBuf []fdr.Match
+	// roleFirstBytes 与 Roles 一一对应，保存每个角色「可能命中的首字节集合」，
+	// 供逐偏移确认前的廉价否定使用（见 nextRoleOffset）。只有无法建立字节自动机、
+	// 必须逐偏移确认的角色才会填充，其余项为 nil。
+	roleFirstBytes [][]byte
+	index          map[uint32]int
+	byReport       map[uint32][]int
+	instructions   map[uint32][]Instruction
 }
 
 // InstructionKind 表示角色状态执行时的动作类型。
@@ -298,12 +300,11 @@ func (p *Program) FindMatchesInto(data []byte, dst []State) []State {
 	if p == nil {
 		return dst[:0]
 	}
-	// matcher 为 nil 有两种形态：候选器就绪（miracleReady），以及
-	// buildRoleMatcher 无法为非 ASCII 的大小写不敏感角色建字节自动机。两者都不能
-	// 在这里重新构建，否则对应的快路径永远不可达，而且每次扫描都要白建一个完整
-	// FDR 自动机。可建自动机的单角色在构建期已经建好，这里直接复用。
+	// matcher 为 nil 只发生在 buildRoleMatcher 无法为非 ASCII 的大小写不敏感
+	// 角色建字节自动机时。不能在这里重新构建，否则每次扫描都要白建一个完整
+	// FDR 自动机。可建自动机的角色集合（含单角色）在构建期已经建好，这里直接复用。
 	matcher := p.matcher
-	if matcher == nil && !p.miracleReady && len(p.Roles) > 1 {
+	if matcher == nil && len(p.Roles) > 1 {
 		matcher = buildRoleMatcher(p.Roles)
 	}
 	if matcher != nil {
@@ -335,26 +336,28 @@ func (p *Program) FindMatchesInto(data []byte, dst []State) []State {
 		}
 		return out
 	}
-	if len(p.Roles) == 1 && !p.miracleReady {
+	if len(p.Roles) == 1 {
 		// 单角色无法建立字节自动机时（例如非 ASCII 的大小写不敏感角色），
 		// 回落到逐偏移确认；该路径保留重叠命中并避免建立去重映射。
+		// roleFirstBytes 先用首字节集合做廉价否定，把逐偏移的 MatchAt 调用
+		// 收敛到真正可能的起点上。
 		role := p.Roles[0]
 		out := dst[:0]
-		for off := 0; off+len(role.Literal) <= len(data); off++ {
+		last := len(data) - len(role.Literal)
+		for off := p.nextRoleOffset(0, data, 0, last); off <= last; off = p.nextRoleOffset(0, data, off+1, last) {
 			if role.Eligible(data, off) {
 				out = append(out, State{RoleID: role.ID, Offset: uint64(off)})
 			}
 		}
 		return out
 	}
-	if p.miracleReady {
-		return p.findMiracleMultiInto(data, 0, len(data), 0, dst)
-	}
 	// 此分支在每个角色至多被处理一次的条件下，不存在 (role.ID, off) 重复。
 	// 直接写入结果缓冲，避免每次扫描都分配去重 map。
 	out := dst[:0]
-	for _, role := range p.Roles {
-		for off := 0; off+len(role.Literal) <= len(data); off++ {
+	for i := range p.Roles {
+		role := &p.Roles[i]
+		last := len(data) - len(role.Literal)
+		for off := p.nextRoleOffset(i, data, 0, last); off <= last; off = p.nextRoleOffset(i, data, off+1, last) {
 			if role.Eligible(data, off) {
 				out = append(out, State{RoleID: role.ID, Offset: uint64(off)})
 			}
@@ -380,26 +383,18 @@ func (p *Program) FindMatchesLimit(data []byte, limit int) []State {
 	if p == nil {
 		return nil
 	}
-	// 与 FindMatchesInto 同源：单角色与候选器就绪两种形态都刻意不持有通用
-	// 匹配器，只有真正需要共享自动机的程序才按需构建一次。
+	// 与 FindMatchesInto 同源：只有真正需要共享自动机的程序才按需构建一次。
 	matcher := p.matcher
-	if matcher == nil && !p.miracleReady && len(p.Roles) > 1 {
+	if matcher == nil && len(p.Roles) > 1 {
 		matcher = buildRoleMatcher(p.Roles)
 	}
 	if matcher == nil {
-		if p.miracleReady {
-			// 每个角色单独限量会在合并排序前丢失更早的候选，
-			// 这里先收集完整候选，再统一去重、排序和截断。
-			out := p.findMiracleMulti(data, 0, len(data), 0)
-			if len(out) > limit {
-				out = out[:limit]
-			}
-			return out
-		}
 		out := make([]State, 0, limit)
 		seen := make(map[[2]uint64]struct{}, limit)
-		for _, role := range p.Roles {
-			for off := 0; off+len(role.Literal) <= len(data); off++ {
+		for i := range p.Roles {
+			role := &p.Roles[i]
+			last := len(data) - len(role.Literal)
+			for off := p.nextRoleOffset(i, data, 0, last); off <= last; off = p.nextRoleOffset(i, data, off+1, last) {
 				if !role.Eligible(data, off) {
 					continue
 				}
@@ -448,10 +443,9 @@ func (p *Program) FindMatchesRange(data []byte, from, to int) []State {
 	if p == nil || from < 0 || to < from || to > len(data) {
 		return nil
 	}
-	// 与 FindMatchesInto 一致：候选器就绪与单角色两种形态都保留构建期的
-	// nil matcher 决定，不走按需构建。
+	// 与 FindMatchesInto 一致：保留构建期的 nil matcher 决定，不走按需构建。
 	matcher := p.matcher
-	if matcher == nil && !p.miracleReady && len(p.Roles) > 1 {
+	if matcher == nil && len(p.Roles) > 1 {
 		matcher = buildRoleMatcher(p.Roles)
 	}
 	if matcher != nil {
@@ -471,9 +465,6 @@ func (p *Program) FindMatchesRange(data []byte, from, to int) []State {
 			out = append(out, State{RoleID: match.ID, Offset: uint64(match.From)})
 		}
 		return SortStates(out)
-	}
-	if p.miracleReady {
-		return p.findMiracleMulti(data, from, to, 0)
 	}
 	out := make([]State, 0)
 	for _, state := range p.FindMatches(data) {
@@ -515,13 +506,12 @@ func (p *Program) FindMatchesRangeLimit(data []byte, from, to, limit int) []Stat
 		}
 		return out
 	}
-	if p.miracleReady {
-		return p.findMiracleMulti(data, from, to, limit)
-	}
 	out := make([]State, 0)
 	seen := make(map[[2]uint64]struct{})
-	for _, role := range p.Roles {
-		for off := from; off+len(role.Literal) <= to; off++ {
+	for i := range p.Roles {
+		role := &p.Roles[i]
+		last := to - len(role.Literal)
+		for off := p.nextRoleOffset(i, data, from, last); off <= last; off = p.nextRoleOffset(i, data, off+1, last) {
 			if role.Eligible(data, off) {
 				key := [2]uint64{uint64(role.ID), uint64(off)}
 				if _, exists := seen[key]; exists {
@@ -567,20 +557,14 @@ func (p *Program) FindMatchesEndRange(data []byte, from, to int) []State {
 		}
 		return SortStates(out)
 	}
-	if len(p.miracles) == len(p.Roles) && len(p.miracles) > 0 {
-		out := make([]State, 0)
-		for _, miracle := range p.miracles {
-			out = append(out, miracle.FindEndRange(data, from, to, 0)...)
-		}
-		return SortStates(dedupStates(out))
-	}
 	out := make([]State, 0)
 	seen := make(map[[2]uint64]struct{})
-	for _, role := range p.Roles {
+	for i := range p.Roles {
+		role := &p.Roles[i]
 		length := len(role.Literal)
 		start := max(from-length, 0)
 		last := min(to-length-1, len(data)-length)
-		for off := start; off <= last; off++ {
+		for off := p.nextRoleOffset(i, data, start, last); off <= last; off = p.nextRoleOffset(i, data, off+1, last) {
 			if !role.Eligible(data, off) {
 				continue
 			}
@@ -654,124 +638,32 @@ func New(roles []Role) *Program {
 	return p
 }
 
-// rebuildCandidateState 由当前 Roles 重新推导 matcher、候选器与首字节集合。
+// rebuildCandidateState 由当前 Roles 重新推导共享自动机。
 //
 // 这是 New 与 Normalize 共用的唯一派生入口：两处分别推导会让“跳过通用匹配器”
-// 的决定在 Normalize 之后被还原，候选路径随之永久失效。
+// 的决定在 Normalize 之后被还原，自动机路径随之永久失效。
+//
+// 单角色与多角色都保留共享自动机。没有自动机时单角色会退化为对每个输入偏移各做
+// 一次 Role.Eligible（内部是 bytes.Equal / EqualFold）：23 KB 零命中语料上
+// 约 70 µs，大小写不敏感约 122 µs；由自动机先定位候选再确认只要约 2.2 µs。
+// 非 ASCII 的大小写不敏感角色无法建字节自动机，buildRoleMatcher 返回 nil，
+// 此时仍回落到逐偏移确认；该回退路径先由 roleFirstBytes 做首字节廉价否定，因此
+// 只在真正可能的起点上调用 Role.Eligible，不再对每个字节位置各做一次完整比较。
+//
+// 多角色同样保留自动机：§57 的 64 KiB 尺寸扫描实测显示，原先基于首字节桶的
+// 候选器在“多条规则共享公共前缀”与“语料字母密集”两类形态下会退化为每个命中
+// 字节遍历整桶并逐个 Role.Eligible，比自动机慢 5~82×；只有“语料完全不命中任何
+// 首字节”的稀疏形态快 25%（绝对差约 1.2 µs）。故生产路径统一由自动机定位候选，
+// 确认仍由 Role.Eligible 完成。
 func (p *Program) rebuildCandidateState() {
-	p.miracles = p.miracles[:0]
-	for _, role := range p.Roles {
-		if miracle := newMiracle(role); miracle != nil {
-			p.miracles = append(p.miracles, miracle)
-		}
-	}
-	p.miracleReady = false
-	p.miracleFirstSet = [4]uint64{}
-	for i := range p.miracleBuckets {
-		p.miracleBuckets[i] = nil
-	}
-	p.miracleFirstTable = simd.ByteSetTables{}
-	// 单角色同样保留共享自动机。没有自动机时单角色会退化为对每个输入偏移各做
-	// 一次 Role.Eligible（内部是 bytes.Equal / EqualFold）：23 KB 零命中语料上
-	// 约 70 µs，大小写不敏感约 122 µs；由自动机先定位候选再确认只要约 2.2 µs。
-	// 非 ASCII 的大小写不敏感角色无法建字节自动机，buildRoleMatcher 返回 nil，
-	// 此时仍回落到逐偏移确认。
 	p.matcher = buildRoleMatcher(p.Roles)
-	if len(p.miracles) == len(p.Roles) && len(p.Roles) > 1 {
-		p.miracleReady = true
-		// 所有角色均可由候选器直接定位时跳过通用多模式匹配器。
-		// 完整 Role.Eligible 仍在候选确认阶段执行。
-		p.matcher = nil
-		for i, role := range p.Roles {
-			if len(role.Literal) > 0 {
-				first := role.Literal[0]
-				outFirst := first
-				p.miracleFirstSet[outFirst/64] |= 1 << uint(outFirst%64)
-				p.miracleBuckets[first] = append(p.miracleBuckets[first], i)
-				if role.CaseInsensitive {
-					folded := foldASCII(first)
-					p.miracleFirstSet[folded/64] |= 1 << uint(folded%64)
-					if folded != first {
-						p.miracleBuckets[folded] = append(p.miracleBuckets[folded], i)
-					}
-					if folded >= 'a' && folded <= 'z' {
-						upper := folded - 'a' + 'A'
-						p.miracleFirstSet[upper/64] |= 1 << uint(upper%64)
-						if upper != first {
-							p.miracleBuckets[upper] = append(p.miracleBuckets[upper], i)
-						}
-					}
-				}
-			}
-		}
-		p.miracleFirstTable = simd.FirstByteTables(p.miracleFirstSet)
+	// 首字节集合只服务于「没有共享自动机、必须逐偏移确认」的回退路径；
+	// 能建自动机时保持 nil，避免为常规程序凭空增加一层按角色的切片。
+	if p.matcher != nil {
+		p.roleFirstBytes = nil
+		return
 	}
-}
-
-func (p *Program) findMiracleMulti(data []byte, from, to, limit int) []State {
-	return p.findMiracleMultiInto(data, from, to, limit, nil)
-}
-
-func (p *Program) findMiracleMultiInto(data []byte, from, to, limit int, dst []State) []State {
-	if p == nil || !p.miracleReady || from < 0 || to < from || to > len(data) || limit < 0 {
-		return dst[:0]
-	}
-	out := dst[:0]
-	visit := func(off int) bool {
-		for _, idx := range p.miracleBuckets[data[off]] {
-			role := p.Roles[idx]
-			if off+len(role.Literal) > to || !role.Eligible(data, off) {
-				continue
-			}
-			out = append(out, State{RoleID: role.ID, Offset: uint64(off)})
-			if limit > 0 && len(out) >= limit {
-				return false
-			}
-		}
-		return true
-	}
-	backend := dispatch.DefaultBackend()
-	// 候选枚举优先按宽窗口批量判定，剩余不足一个宽窗口时先用超向量窗口补齐，
-	// 最后再逐字节回退判定；三段区间按起始位置无缝衔接，不会重复访问同一偏移。
-	off := from
-	for ; off+simd.WideWidth <= to; off += simd.WideWidth {
-		mask, ok := backend.WindowMask64(data, off, &p.miracleFirstTable, 1)
-		if !ok {
-			break
-		}
-		for mask != 0 {
-			bit := bits.TrailingZeros64(mask)
-			if !visit(off + bit) {
-				return SortStates(out)
-			}
-			mask &^= 1 << uint(bit)
-		}
-	}
-	if off+simd.SuperWidth <= to {
-		if mask, ok := backend.WindowMask(data, off, &p.miracleFirstTable, 1); ok {
-			for mask != 0 {
-				bit := bits.TrailingZeros32(mask)
-				if !visit(off + bit) {
-					return SortStates(out)
-				}
-				mask &^= 1 << uint(bit)
-			}
-			off += simd.SuperWidth
-		}
-	}
-	for ; off < to; off++ {
-		if p.miracleFirstSet[data[off]/64]&(1<<uint(data[off]%64)) == 0 {
-			continue
-		}
-		if !visit(off) {
-			break
-		}
-	}
-	out = SortStates(out)
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
-	}
-	return out
+	p.roleFirstBytes = buildRoleFirstBytes(p.Roles)
 }
 
 func (p *Program) rebuildInstructionIndex() {
@@ -836,6 +728,87 @@ func buildRoleMatcher(roles []Role) *fdr.Matcher {
 		return nil
 	}
 	return fdr.New(literals)
+}
+
+// buildRoleFirstBytes 为每个角色预编译「可命中起点的首字节集合」。
+// 只有需要逐偏移确认的角色才会填充对应项，其余保持 nil，表示无需预过滤。
+func buildRoleFirstBytes(roles []Role) [][]byte {
+	var out [][]byte
+	for i := range roles {
+		set := roleFirstByteSet(roles[i])
+		if len(set) == 0 {
+			continue
+		}
+		if out == nil {
+			out = make([][]byte, len(roles))
+		}
+		out[i] = set
+	}
+	return out
+}
+
+// roleFirstByteSet 返回角色可命中起点的首字节集合，升序去重；无法给出集合时返回 nil。
+//
+// 语义依据 Role.MatchAt：区分大小写时起点首字节必须等于字面量首字节；忽略大小写
+// 时起点首 rune 需满足 ToLower(输入) == ToLower(字面量首 rune)，由
+// parser.CaselessLeadingBytes 给出该等价类的首字节超集。
+func roleFirstByteSet(role Role) []byte {
+	if len(role.Literal) == 0 || !utf8.Valid(role.Literal) {
+		return nil
+	}
+	if !role.CaseInsensitive {
+		return []byte{role.Literal[0]}
+	}
+	// 忽略大小写的首字节闭包与 parser 的首字节推导共用同一实现，避免两处各写
+	// 一份 Unicode 折叠语义后出现分叉。返回值仍是等价类的超集。
+	return parser.CaselessLeadingBytes(role.Literal)
+}
+
+// indexByteInSet 返回 data 中第一个属于 set 的字节下标，没有时返回 -1。
+func indexByteInSet(data, set []byte) int {
+	if len(set) == 1 {
+		return bytes.IndexByte(data, set[0])
+	}
+	best := -1
+	for _, b := range set {
+		i := bytes.IndexByte(data, b)
+		if i < 0 {
+			continue
+		}
+		if best < 0 || i < best {
+			best = i
+			if best == 0 {
+				break
+			}
+		}
+	}
+	return best
+}
+
+// nextRoleOffset 返回 roleIndex 对应的角色在 [from, last] 内下一个可能命中的起点。
+// 没有可命中的首字节时返回 last+1，调用方的循环条件据此退出。角色没有预编译集合
+// 时退化为返回 from，保持原有的逐偏移语义。
+func (p *Program) nextRoleOffset(roleIndex int, data []byte, from, last int) int {
+	if from < 0 {
+		from = 0
+	}
+	if last >= len(data) {
+		last = len(data) - 1
+	}
+	if from > last {
+		return last + 1
+	}
+	if roleIndex < 0 || roleIndex >= len(p.roleFirstBytes) {
+		return from
+	}
+	set := p.roleFirstBytes[roleIndex]
+	if len(set) == 0 {
+		return from
+	}
+	if idx := indexByteInSet(data[from:last+1], set); idx >= 0 {
+		return from + idx
+	}
+	return last + 1
 }
 
 // Normalize 按角色编号排序并删除重复编号，保证程序顺序稳定。

@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// bruteForceStates 用逐偏移逐角色比较给出候选结果参考，作为窗口批量枚举的独立对照。
+// bruteForceStates 用逐偏移逐角色比较给出候选结果参考，作为自动机候选路径的独立对照。
 func bruteForceStates(roles []Role, data []byte) []State {
 	var out []State
 	for off := range data {
@@ -43,9 +43,9 @@ func literalMatches(role Role, window []byte) bool {
 	return role.CaseInsensitive && bytes.EqualFold(window, role.Literal)
 }
 
-// TestMiracleWindowCandidatesMatchBruteForce 校验多角色候选路径在 64 字节宽窗口边界
+// TestMultiRoleWindowCandidatesMatchBruteForce 校验多角色候选路径在 64 字节宽窗口边界
 // 附近（含尾部截断）不丢命中：数据长度从 0 覆盖到 96，随机内容含大小写变体。
-func TestMiracleWindowCandidatesMatchBruteForce(t *testing.T) {
+func TestMultiRoleWindowCandidatesMatchBruteForce(t *testing.T) {
 	// WideWidthGuard 取宽窗口宽度，确保语料覆盖到第二个宽窗口之后。
 	const WideWidthGuard = 64
 	roles := []Role{
@@ -54,8 +54,8 @@ func TestMiracleWindowCandidatesMatchBruteForce(t *testing.T) {
 		{ID: 3, Literal: []byte("efg")},
 	}
 	program := New(roles)
-	if !program.miracleReady || program.matcher != nil {
-		t.Fatalf("多角色纯文字程序未走候选路径: ready=%v matcher=%v", program.miracleReady, program.matcher != nil)
+	if program.matcher == nil {
+		t.Fatal("多角色纯文字程序未构建共享自动机")
 	}
 	rng := rand.New(rand.NewSource(90210))
 	alphabet := []byte("abABcCdDeEfFgGz")
@@ -83,8 +83,8 @@ func TestMiracleWindowCandidatesMatchBruteForce(t *testing.T) {
 	}
 }
 
-// TestMiracleWindowCandidatesRespectEndRange 校验候选结果与右开区间结束偏移语义一致。
-func TestMiracleWindowCandidatesRespectEndRange(t *testing.T) {
+// TestMultiRoleCandidatesRespectEndRange 校验候选结果与右开区间结束偏移语义一致。
+func TestMultiRoleCandidatesRespectEndRange(t *testing.T) {
 	roles := []Role{
 		{ID: 1, Literal: []byte("ab")},
 		{ID: 2, Literal: []byte("cd"), CaseInsensitive: true},
@@ -105,8 +105,8 @@ func TestMiracleWindowCandidatesRespectEndRange(t *testing.T) {
 	}
 }
 
-// BenchmarkMiracleWindowCandidates 记录候选路径在 64KiB 输入上的吞吐与分配。
-func BenchmarkMiracleWindowCandidates(b *testing.B) {
+// BenchmarkMultiRoleCandidates 记录候选路径在 64KiB 输入上的吞吐与分配。
+func BenchmarkMultiRoleCandidates(b *testing.B) {
 	program := New([]Role{
 		{ID: 1, Literal: []byte("alpha")},
 		{ID: 2, Literal: []byte("BETA"), CaseInsensitive: true},
@@ -127,18 +127,18 @@ func BenchmarkMiracleWindowCandidates(b *testing.B) {
 	}
 }
 
-// TestMiracleWindowWideBoundaryCandidatesMatched 用确定性语料覆盖 64 字节宽窗口边界：
-// 命中分别落在宽窗口起点（偏移 0/64/128/192）、窗口末端与尾部回退区间，任何一段的
-// 候选枚举出现漏报或重复都会与暴力参考不一致。
-func TestMiracleWindowWideBoundaryCandidatesMatched(t *testing.T) {
+// TestMultiRoleWideBoundaryCandidatesMatched 用确定性语料覆盖后端窗口边界：
+// 命中分别落在窗口起点、窗口末端与尾部回退区间，任何一段的候选枚举出现漏报或
+// 重复都会与暴力参考不一致。
+func TestMultiRoleWideBoundaryCandidatesMatched(t *testing.T) {
 	roles := []Role{
 		{ID: 1, Literal: []byte("abc")},
 		{ID: 2, Literal: []byte("cd"), CaseInsensitive: true},
 		{ID: 3, Literal: []byte("efg")},
 	}
 	program := New(roles)
-	if !program.miracleReady {
-		t.Fatal("多角色纯文字程序未走候选路径")
+	if program.matcher == nil {
+		t.Fatal("多角色纯文字程序未构建共享自动机")
 	}
 	// 两组落点互不重叠，且刻意跨越 64 字节宽窗口边界。
 	wideStarts := []int{0, 8, 30, 38, 60, 68, 126, 134, 190}

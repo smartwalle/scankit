@@ -55,15 +55,18 @@ type Scanner struct {
 	roseSinglePool  *sync.Pool
 	// canUseRoseInScan 缓存 canUseRoseInScan 的结果，避免每次 Scan 重复遍历。
 	canUseRoseInScan bool
-	rules            []compiledRule
-	ruleIndex        map[uint32]int
-	ruleOrder        map[uint32]int
-	hasCombo         bool
-	literalFind      func([]byte) []literalCandidate
-	literalFindInto  func([]byte, []literalCandidate) []literalCandidate
-	literalKind      string
-	candidateIDs     map[uint32]struct{}
-	literalIDs       map[uint32]struct{}
+	// roseDirectLiteralIndex 表示 Rose 直通路径可以直接消费 Scanner 自己的候选
+	// 索引，而不必调用 rose.Program 内部另建的 matcher。推导见 newScanner。
+	roseDirectLiteralIndex bool
+	rules                  []compiledRule
+	ruleIndex              map[uint32]int
+	ruleOrder              map[uint32]int
+	hasCombo               bool
+	literalFind            func([]byte) []literalCandidate
+	literalFindInto        func([]byte, []literalCandidate) []literalCandidate
+	literalKind            string
+	candidateIDs           map[uint32]struct{}
+	literalIDs             map[uint32]struct{}
 	// indexedRules/exactRules 是 candidateIDs 与 literalIDs 的下标视图，
 	// 供确认热路径避免每个候选起点都做一次 map 查询。
 	indexedRules []bool
@@ -541,6 +544,13 @@ func newScanner(rules []compiledRule) *Scanner {
 	scanner.rosePlan = scanner.buildRoseProgram()
 	scanner.buildRoseDirectIndex()
 	scanner.canUseRoseInScan = scanner.computeCanUseRoseInScan()
+	// Rose 直通场景要求全部规则都是单条纯文字，而 buildRoseProgram 只在「同一规则
+	// 有第二个及之后的文字分支」时才另分配角色编号，因此该场景下角色编号恒等于
+	// 规则编号。若再满足每条规则的候选文字就是完整文字（而非更短前缀），Scanner
+	// 的候选索引与 Rose 角色 matcher 给出完全相同的候选集合，可以直接复用，
+	// 省掉 rose 包内另建一份 fdr.Matcher 的构建与查询开销。
+	scanner.roseDirectLiteralIndex = scanner.canUseRoseInScan &&
+		len(candidateIDs) == len(scanner.rules) && len(literalIDs) == len(scanner.rules)
 	// 编译结果不可变，计划校验只需在构造时执行一次；扫描热路径复用该结论。
 	scanner.validationErr = scanner.validate()
 	return scanner
@@ -3200,6 +3210,11 @@ func (scanner *Scanner) roseDirectEntryFor(program *rose.Program, roleID uint32)
 // scanRoseDirectInto 将无确认文字角色的候选直接转换为 Block 结果。
 // 角色索引已经在计划构造阶段完成，运行时只保留 SingleMatch 的最小状态。
 func (scanner *Scanner) scanRoseDirectInto(data []byte, dst []Match) []Match {
+	// 候选索引能完整替代 Rose 角色 matcher 时优先走它：同样的候选集合，但省掉
+	// rose.Program 内部的完整输入扫描与 State 组装。
+	if scanner.roseDirectLiteralIndex && scanner.literalFindInto != nil {
+		return scanner.scanRoseDirectByLiteralIndex(data, dst)
+	}
 	program := scanner.roseProgram()
 	if program == nil {
 		return dst[:0]
@@ -3279,6 +3294,61 @@ func (scanner *Scanner) scanRoseDirectInto(data []byte, dst []Match) []Match {
 			single[entry.reportID] = struct{}{}
 		}
 		out = append(out, Match{Id: entry.reportID, From: state.Offset, To: state.Offset + uint64(entry.length)})
+	}
+	return out
+}
+
+// scanRoseDirectByLiteralIndex 用 Scanner 自己的候选索引驱动 Rose 直通路径。
+// 进入条件（roseDirectLiteralIndex）保证候选索引覆盖全部规则、候选文字就是完整
+// 文字，且角色编号恒等于规则编号，因此候选集合与 Rose 角色的 matcher 完全一致。
+func (scanner *Scanner) scanRoseDirectByLiteralIndex(data []byte, dst []Match) []Match {
+	var candBuf [256]literalCandidate
+	candidates := scanner.literalFindInto(data, candBuf[:0])
+	if len(candidates) == 0 {
+		return dst[:0]
+	}
+	if cap(dst) < len(candidates) {
+		dst = make([]Match, 0, len(candidates)+cap(dst))
+	}
+	out := dst[:0]
+	// 只有存在 SingleMatch 规则时才需要去重表，全为普通规则时整块跳过池取用、
+	// 建表与逐次清空，与 rose.Program 路径保持同一策略。
+	single := (map[uint32]struct{})(nil)
+	if scanner.roseDirectSingle {
+		singlePtr, _ := scanner.roseSinglePool.Get().(*map[uint32]struct{})
+		if singlePtr == nil {
+			singlePtr = new(map[uint32]struct{})
+		}
+		if *singlePtr == nil {
+			// 池的 New 返回的是「指向 nil map 的指针」，上次若因桶过大被丢弃也会
+			// 回填 nil；这里必须补建，否则登记 SingleMatch 去重项会 panic。
+			*singlePtr = make(map[uint32]struct{})
+		}
+		single = *singlePtr
+		defer func() {
+			if len(single) > 1<<16 {
+				*singlePtr = nil
+			} else {
+				clear(single)
+			}
+			scanner.roseSinglePool.Put(singlePtr)
+		}()
+	}
+	for _, candidate := range candidates {
+		entry, ok := scanner.roseDirect[candidate.ID]
+		if !ok {
+			continue
+		}
+		if entry.quiet {
+			continue
+		}
+		if entry.single {
+			if _, exists := single[entry.reportID]; exists {
+				continue
+			}
+			single[entry.reportID] = struct{}{}
+		}
+		out = append(out, Match{Id: entry.reportID, From: uint64(candidate.From), To: uint64(candidate.From) + uint64(entry.length)})
 	}
 	return out
 }
@@ -4216,16 +4286,20 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag, ev *n
 		positive := v.Kind == parser.Lookahead || v.Kind == parser.Lookbehind
 		if v.Kind == parser.Lookbehind || v.Kind == parser.NegativeLookbehind {
 			found := false
-			var starts []int
 			width, _, ok := parser.FixedWidth(v.Child)
 			if flags&CompileUTF8 != 0 {
 				width, _, ok = parser.FixedWidthUTF8(v.Child)
 			}
+			// 候选起点缓冲走求值工作区：固定宽度只需一个起点，变宽时起点数随
+			// pos 增长、按实际数量预留，避免每个候选起点都从 nil 切片 append。
+			var starts []int
 			if ok {
+				starts = ev.endsReserve(1)
 				if pos >= width {
 					starts = append(starts, pos-width)
 				}
 			} else {
+				starts = ev.endsReserve(pos + 1)
 				for start := 0; start <= pos; start++ {
 					starts = append(starts, start)
 				}
