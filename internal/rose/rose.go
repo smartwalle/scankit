@@ -318,14 +318,21 @@ func (p *Program) FindMatchesInto(data []byte, dst []State) []State {
 		if cap(out) < len(matches) {
 			out = make([]State, 0, len(matches))
 		}
+		// matcher 的候选集合已按 (起点, 角色编号, 终点) 排好序，过滤只是原地
+		// 删减，顺序保持；State 的 Priority 在此路径上恒为 0，因此调度顺序与
+		// 候选顺序一致，不需要再做一次稳定排序。重复排序在命中密集时是每个
+		// 命中一次 O(log n) 比较，还会为 SliceStable 分配交换缓冲。
 		for _, match := range matches {
-			role, ok := p.findRole(match.ID)
-			if !ok || !role.Eligible(data, match.From) {
+			index, ok := p.findRoleIndex(match.ID)
+			if !ok {
+				continue
+			}
+			role := &p.Roles[index]
+			if !role.Eligible(data, match.From) {
 				continue
 			}
 			out = append(out, State{RoleID: match.ID, Offset: uint64(match.From)})
 		}
-		sortStatesInPlace(out)
 		return out
 	}
 	if len(p.Roles) == 1 && !p.miracleReady {
@@ -915,16 +922,27 @@ func (p *Program) FindRole(id uint32) (Role, bool) {
 
 // findRole 返回共享底层字面量切片的角色，避免在只读路径上重复分配。
 func (p *Program) findRole(id uint32) (Role, bool) {
-	if p == nil {
+	i, ok := p.findRoleIndex(id)
+	if !ok {
 		return Role{}, false
+	}
+	return p.Roles[i], true
+}
+
+// findRoleIndex 返回角色在角色表中的下标。命中密集的只读路径只需要角色的
+// 字段，按下标取地址可以避免每个命中复制一次整个 Role 结构体。
+func (p *Program) findRoleIndex(id uint32) (int, bool) {
+	if p == nil {
+		return 0, false
 	}
 	if p.index == nil {
 		p.index = buildRoleIndex(p.Roles)
 	}
-	if i, ok := p.index[id]; ok && i >= 0 && i < len(p.Roles) {
-		return p.Roles[i], true
+	i, ok := p.index[id]
+	if !ok || i < 0 || i >= len(p.Roles) {
+		return 0, false
 	}
-	return Role{}, false
+	return i, true
 }
 
 // RoleByID 返回共享底层字面量切片的角色。仅在只读场景使用，避免对字面量做防御性复制。

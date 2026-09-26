@@ -8,9 +8,7 @@ import (
 	"maps"
 	"slices"
 	"sort"
-	"strings"
 	"sync"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/smartwalle/scankit/internal/graph"
@@ -63,32 +61,6 @@ type genericWork struct {
 }
 
 var genericWorkPool sync.Pool
-
-// unicodeTables 将标准库公开的 Unicode 分类、属性和脚本统一建立规范化索引。
-// 这样未知于快捷别名的 \p{...} 表达式仍可按完整表语义匹配。
-var unicodeTables = buildUnicodeTables()
-
-func buildUnicodeTables() map[string]*unicode.RangeTable {
-	tables := make(map[string]*unicode.RangeTable, len(unicode.Categories)+len(unicode.Properties)+len(unicode.Scripts))
-	for name, table := range unicode.Categories {
-		tables[normalizeUnicodeProperty(name)] = table
-	}
-	for name, table := range unicode.Properties {
-		tables[normalizeUnicodeProperty(name)] = table
-	}
-	for name, table := range unicode.Scripts {
-		tables[normalizeUnicodeProperty(name)] = table
-	}
-	return tables
-}
-
-func normalizeUnicodeProperty(name string) string {
-	name = strings.ToLower(name)
-	name = strings.ReplaceAll(name, "_", "")
-	name = strings.ReplaceAll(name, "-", "")
-	name = strings.ReplaceAll(name, " ", "")
-	return name
-}
 
 func acquireGenericWork() *genericWork {
 	w, _ := genericWorkPool.Get().(*genericWork)
@@ -859,7 +831,12 @@ func (p *Program) matchAtLimitBudget(data []byte, start int, limit int, multilin
 				if r == utf8.RuneError && size == 1 && data[s.pos] >= 0x80 {
 					continue
 				}
-				ok := unicodeProperty(r, n.Unicode.Name)
+				// 属性名在解析阶段已解析成判定函数，运行时不再重复规范化名称。
+				property := n.Unicode.Resolved
+				if property == nil {
+					property = parser.ResolveUnicodeProperty(n.Unicode.Name)
+				}
+				ok := property.Match(r)
 				if n.Unicode.Negated {
 					ok = !ok
 				}
@@ -1331,60 +1308,4 @@ func assertion(kind parser.AssertionKind, data []byte, pos int, multiline bool) 
 }
 func word(c byte) bool {
 	return c == '_' || c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
-}
-
-func unicodeProperty(r rune, name string) bool {
-	name = normalizeUnicodeProperty(name)
-	for _, prefix := range []string{"script=", "sc=", "script:", "generalcategory=", "gc="} {
-		if after, ok := strings.CutPrefix(name, prefix); ok {
-			name = after
-			break
-		}
-	}
-	switch name {
-	case "l", "letter", "alpha":
-		return unicode.IsLetter(r)
-	case "n", "number":
-		return unicode.IsNumber(r)
-	case "nd":
-		return unicode.IsDigit(r)
-	case "z", "space", "whitespace":
-		return unicode.IsSpace(r)
-	case "lu", "uppercaseletter":
-		return unicode.IsUpper(r)
-	case "ll", "lowercaseletter":
-		return unicode.IsLower(r)
-	case "lt":
-		return unicode.Is(unicode.Lt, r)
-	case "lm":
-		return unicode.Is(unicode.Lm, r)
-	case "lo":
-		return unicode.Is(unicode.Lo, r)
-	case "m", "mark":
-		return unicode.Is(unicode.M, r)
-	case "p", "punct":
-		return unicode.Is(unicode.P, r)
-	case "s", "symbol":
-		return unicode.Is(unicode.S, r)
-	case "cc", "control":
-		return unicode.Is(unicode.Cc, r)
-	case "ascii":
-		return r < 128
-	case "any":
-		return true
-	case "assigned":
-		return !unicode.Is(unicode.Cn, r)
-	case "unassigned":
-		return unicode.Is(unicode.Cn, r)
-	default:
-		if table, ok := unicodeTables[name]; ok {
-			return unicode.Is(table, r)
-		}
-		if len(name) > 2 && (strings.HasPrefix(name, "is") || strings.HasPrefix(name, "in")) {
-			if table, ok := unicodeTables[name[2:]]; ok {
-				return unicode.Is(table, r)
-			}
-		}
-		return false
-	}
 }

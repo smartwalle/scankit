@@ -540,7 +540,7 @@ func (p *state) parseEscape() (Node, error) {
 		}
 		name := string(p.input[start:p.pos])
 		p.pos++
-		return UnicodeClass{Name: name, Negated: ch == 'P'}, nil
+		return UnicodeClass{Name: name, Negated: ch == 'P', Resolved: ResolveUnicodeProperty(name)}, nil
 	}
 	if ch >= '1' && ch <= '9' {
 		start := p.pos - 1

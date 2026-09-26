@@ -43,30 +43,6 @@ type Match struct {
 	To   uint64
 }
 
-var scannerUnicodeTables = buildScannerUnicodeTables()
-
-func buildScannerUnicodeTables() map[string]*unicode.RangeTable {
-	tables := make(map[string]*unicode.RangeTable, len(unicode.Categories)+len(unicode.Properties)+len(unicode.Scripts))
-	for name, table := range unicode.Categories {
-		tables[normalizeScannerUnicodeProperty(name)] = table
-	}
-	for name, table := range unicode.Properties {
-		tables[normalizeScannerUnicodeProperty(name)] = table
-	}
-	for name, table := range unicode.Scripts {
-		tables[normalizeScannerUnicodeProperty(name)] = table
-	}
-	return tables
-}
-
-func normalizeScannerUnicodeProperty(name string) string {
-	name = strings.ToLower(strings.TrimSpace(name))
-	name = strings.ReplaceAll(name, "_", "")
-	name = strings.ReplaceAll(name, "-", "")
-	name = strings.ReplaceAll(name, " ", "")
-	return name
-}
-
 // Scanner 是内存中的不可变编译规则执行计划，可安全地并发扫描，并管理所需的可复用扫描上下文。
 type Scanner struct {
 	contextPool *sync.Pool
@@ -106,6 +82,18 @@ type Scanner struct {
 	// requiredCovered 标记规则是否由候选文字索引覆盖；覆盖的规则只需在
 	// 候选起点确认，不再参与整块后端扫描。
 	requiredCovered []bool
+	// anchorEntries 是锚定在输入首尾的规则候选来源：这些规则只有一个可行起点，
+	// 直接按锚点推导，无需候选文字命中。anchorCovered 标记这些规则，使它们同样
+	// 免于整块后端扫描；与 requiredCovered 分开是因为该来源没有校验规则入口
+	// 文字，确认程序不能跳过入口指令。
+	anchorEntries []anchorEntry
+	anchorCovered []bool
+	// roseDirect 把 Rose 直通路径需要的报告信息按角色编号固化下来：角色编号到
+	// 报告编号、命中长度与报告语义的映射在构造期解析一次，避免每个候选都做
+	// 两次 map 查找并复制 compiledRule。roseDirectSingle 表示是否需要单次命中
+	// 去重表，全为普通规则时可以整块跳过该表的取用与清空。
+	roseDirect       map[uint32]roseDirectEntry
+	roseDirectSingle bool
 	// fastLiteral/backendOnly 只依赖编译结果，构造阶段固化以避免每次扫描重复推导。
 	fastLiteral bool
 	backendOnly bool
@@ -470,7 +458,7 @@ func newScanner(rules []compiledRule) *Scanner {
 		scanner.hasCollapse = scanner.hasCollapse || copyRules[i].collapseHead != nil
 	}
 	scanner.guardRunCovered = guardRunCandidates(copyRules)
-	scanner.requiredLiterals, scanner.requiredFindInto, scanner.requiredCovered = buildRequiredIndex(copyRules, scanner.guardRunCovered)
+	scanner.buildRequiredIndex(copyRules, scanner.guardRunCovered)
 	scanner.fastLiteral = !scanner.hasCombo && len(copyRules) > 1 &&
 		len(candidateIDs) == len(copyRules) && len(literalIDs) == len(copyRules)
 	if scanner.fastLiteral {
@@ -492,6 +480,7 @@ func newScanner(rules []compiledRule) *Scanner {
 	// Rose 角色图与文字候选索引随规则计划不可变，构造阶段完成一次，
 	// 扫描时直接复用，避免每个 Block 重建角色、指令和自动机。
 	scanner.rosePlan = scanner.buildRoseProgram()
+	scanner.buildRoseDirectIndex()
 	scanner.canUseRoseInScan = scanner.computeCanUseRoseInScan()
 	// 编译结果不可变，计划校验只需在构造时执行一次；扫描热路径复用该结论。
 	scanner.validationErr = scanner.validate()
@@ -538,20 +527,32 @@ func ruleCaseless(rule compiledRule) bool {
 }
 
 // buildRequiredIndex 为可安全提取必须文字的规则建立共享候选索引。
-// 返回的 covered 标记哪些规则真正进入索引：无法提取必须文字、或偏移窗口无法
-// 约束的规则保留原确认路径，不会让整个索引失效。窗口上界为负代表偏移无上界，
-// 此时必须携带 Back 字节集合才能把候选收缩到有限起点。
-func buildRequiredIndex(rules []compiledRule, guardDriven []bool) ([]requiredLiteral, func([]byte, []requiredHit) []requiredHit, []bool) {
+//
+// covered 标记哪些规则的候选起点由必须文字索引枚举：无法提取必须文字、或偏移
+// 窗口无法约束的规则保留原确认路径，不会让整个索引失效。窗口上界为负代表偏移
+// 无上界，此时必须携带 Back 字节集合才能把候选收缩到有限起点。
+//
+// 锚定在输入首尾的规则只有一个可行起点，单独记在 anchorEntries 里：它们既不
+// 需要候选文字的全部命中，也不需要为窗口内每个起点展开确认，只要在唯一的那个
+// 起点上跑一次完整确认即可。
+func (scanner *Scanner) buildRequiredIndex(rules []compiledRule, guardDriven []bool) {
 	byValue := make(map[string]int)
 	literals := make([]hwlm.Literal, 0, 64)
 	index := make([]requiredLiteral, 0, 64)
 	covered := make([]bool, len(rules))
+	anchorCovered := make([]bool, len(rules))
+	var anchors []anchorEntry
 	for ruleIndex := range rules {
 		rule := rules[ruleIndex]
 		if !requiredIndexEligible(rule) || !requiredWindowUsable(rule.required) {
 			continue
 		}
 		if ruleIndex < len(guardDriven) && guardDriven[ruleIndex] {
+			continue
+		}
+		if anchor, ok := ruleStartAnchor(rule); ok {
+			anchorCovered[ruleIndex] = true
+			anchors = append(anchors, anchorEntry{ruleIndex: ruleIndex, anchor: anchor})
 			continue
 		}
 		caseless := ruleCaseless(rule)
@@ -580,10 +581,15 @@ func buildRequiredIndex(rules []compiledRule, guardDriven []bool) ([]requiredLit
 		}
 		covered[ruleIndex] = true
 	}
-	if len(index) == 0 {
-		return nil, nil, nil
+	scanner.requiredLiterals = index
+	scanner.requiredCovered = covered
+	scanner.anchorEntries = anchors
+	scanner.anchorCovered = anchorCovered
+	if len(literals) == 0 {
+		scanner.requiredFindInto = nil
+		return
 	}
-	return index, newRequiredFinder(literals), covered
+	scanner.requiredFindInto = newRequiredFinder(literals)
 }
 
 // requiredWindowUsable 判断偏移窗口能否在扫描期展开为有限起点集合。
@@ -1813,7 +1819,7 @@ func groupGuardRuns(runs []guardRun) []guardRunGroup {
 // 约束）。任一来源生效时都必须走候选驱动路径，否则这两类规则会退化成整块
 // 逐起点确认。判定只依赖构造期固化的字段，因此在确认规则集合构建之前即可用。
 func (scanner *Scanner) requiredIndexDriven() bool {
-	return scanner.requiredFindInto != nil || scanner.guardRunCovered != nil
+	return scanner.requiredFindInto != nil || scanner.guardRunCovered != nil || len(scanner.anchorEntries) > 0
 }
 
 // guardImpliedByBack 判断前缀约束是否只校验首字节、且该字节集合与左侧回退集合
@@ -1905,7 +1911,10 @@ func (head *collapseHead) runEnd(data []byte, start int) int {
 // requiredIndexCovered 判断规则的候选起点是否已由候选索引（必须文字或前缀
 // 字节约束）枚举，覆盖的规则不再参与整块后端扫描。
 func (scanner *Scanner) requiredIndexCovered(ri int) bool {
-	if scanner.requiredCovered != nil && scanner.requiredCovered[ri] {
+	if scanner.requiredCovered != nil && ri < len(scanner.requiredCovered) && scanner.requiredCovered[ri] {
+		return true
+	}
+	if scanner.anchorCovered != nil && ri < len(scanner.anchorCovered) && scanner.anchorCovered[ri] {
 		return true
 	}
 	return scanner.guardRunCovers(ri)
@@ -2173,6 +2182,18 @@ func (st *blockScanState) finish(matches []Match) ([]Match, error) {
 func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte) ([]uint64, bool) {
 	starts := ctx.requiredStarts[:0]
 	limit := 16*len(data) + 4096
+	// 锚定在输入首尾的规则只有一个可行起点（\A 为 0，\z 为 len(data) 减去
+	// 锚点之前的固定消费字节数），直接登记该起点，不依赖候选文字命中。
+	for _, entry := range scanner.anchorEntries {
+		start, ok := entry.pinnedStart(len(data))
+		if !ok {
+			continue
+		}
+		if len(starts) >= limit {
+			return nil, false
+		}
+		starts = append(starts, uint64(uint32(start))<<32|uint64(uint32(entry.ruleIndex)))
+	}
 	hits := []requiredHit(nil)
 	if scanner.requiredFindInto != nil {
 		hits = scanner.requiredFindInto(data, ctx.requiredHits[:0])
@@ -2681,7 +2702,15 @@ func (scanner *Scanner) computeCanUseRoseInScan() bool {
 		if !ok || len(alternatives) != 1 {
 			return false
 		}
-		if _, _, _, direct := roseLiteralPattern(alternatives[0]); !direct {
+		_, anchored, endOfData, direct := roseLiteralPattern(alternatives[0])
+		if !direct {
+			return false
+		}
+		// 锚定（\A）与末尾约束（\z）的角色最多只有一个可行偏移，但通用自动机
+		// 仍会在整段输入上枚举其字面量的全部命中，再由 Role.Eligible 逐条丢弃，
+		// 在长输入上退化成 O(输入长度)。这类规则交给恰好收敛到单个起点的锚点
+		// 索引（见 scan_anchor_window.go）更省，因此不进入 Rose 直通路径。
+		if anchored || endOfData {
 			return false
 		}
 		if _, ok := covered[rule.id]; !ok {
@@ -2689,6 +2718,55 @@ func (scanner *Scanner) computeCanUseRoseInScan() bool {
 		}
 	}
 	return true
+}
+
+// roseDirectEntry 是 Rose 直通路径每个候选都需要的报告信息。
+type roseDirectEntry struct {
+	reportID uint32
+	length   int
+	quiet    bool
+	single   bool
+}
+
+// buildRoseDirectIndex 把「角色编号 -> 报告信息」的映射在构造期固化到 Scanner。
+// 直通路径对每个候选都要这份信息，运行时逐候选回查角色表与规则表会变成每个
+// 命中两次 map 查找加一次 compiledRule 结构体复制。
+func (scanner *Scanner) buildRoseDirectIndex() {
+	program := scanner.rosePlan
+	if program == nil {
+		return
+	}
+	index := make(map[uint32]roseDirectEntry, len(program.Roles))
+	single := false
+	for _, role := range program.Roles {
+		entry, ok := scanner.roseDirectEntryFor(program, role.ID)
+		if !ok {
+			continue
+		}
+		index[role.ID] = entry
+		single = single || entry.single
+	}
+	scanner.roseDirect = index
+	scanner.roseDirectSingle = single
+}
+
+// roseDirectEntryFor 解析单个角色编号的报告信息；直通索引未建立时作为回落路径。
+func (scanner *Scanner) roseDirectEntryFor(program *rose.Program, roleID uint32) (roseDirectEntry, bool) {
+	role, ok := program.RoleByID(roleID)
+	if !ok {
+		return roseDirectEntry{}, false
+	}
+	index, ok := scanner.ruleIndex[role.ReportID]
+	if !ok || index < 0 || index >= len(scanner.rules) {
+		return roseDirectEntry{}, false
+	}
+	flags := scanner.rules[index].flags
+	return roseDirectEntry{
+		reportID: role.ReportID,
+		length:   len(role.Literal),
+		quiet:    flags&CompileQuiet != 0,
+		single:   flags&CompileSingleMatch != 0,
+	}, true
 }
 
 // scanRoseDirectInto 将无确认文字角色的候选直接转换为 Block 结果。
@@ -2730,48 +2808,49 @@ func (scanner *Scanner) scanRoseDirectInto(data []byte, dst []Match) []Match {
 		dst = make([]Match, 0, need+cap(dst))
 	}
 	out := dst[:0]
-	// 复用 SingleMatch 规则的去重表，避免每次扫描都分配 map。
-	singlePtr, _ := scanner.roseSinglePool.Get().(*map[uint32]struct{})
-	if singlePtr == nil {
-		singlePtr = new(map[uint32]struct{})
-	}
-	if *singlePtr == nil {
-		// 池的 New 返回的是「指向 nil map 的指针」，上次若因桶过大被丢弃也会
-		// 回填 nil；这里必须补建，否则下面登记 SingleMatch 去重项会 panic。
-		*singlePtr = make(map[uint32]struct{})
-	}
-	single := *singlePtr
-	defer func() {
-		// 池中 map 的桶大小不应随单次扫描无限增长，超出限制时丢弃避免泄漏。
-		if len(single) > 1<<16 {
-			*singlePtr = nil
-		} else {
-			clear(single)
+	// 只有存在 SingleMatch 规则时才需要去重表；全为普通规则时整块跳过池取用、
+	// 建表与逐次清空，命中密集的扫描因此少一次 map 分配与维护。
+	single := (map[uint32]struct{})(nil)
+	if scanner.roseDirectSingle {
+		singlePtr, _ := scanner.roseSinglePool.Get().(*map[uint32]struct{})
+		if singlePtr == nil {
+			singlePtr = new(map[uint32]struct{})
 		}
-		scanner.roseSinglePool.Put(singlePtr)
-	}()
+		if *singlePtr == nil {
+			// 池的 New 返回的是「指向 nil map 的指针」，上次若因桶过大被丢弃也会
+			// 回填 nil；这里必须补建，否则下面登记 SingleMatch 去重项会 panic。
+			*singlePtr = make(map[uint32]struct{})
+		}
+		single = *singlePtr
+		defer func() {
+			// 池中 map 的桶大小不应随单次扫描无限增长，超出限制时丢弃避免泄漏。
+			if len(single) > 1<<16 {
+				*singlePtr = nil
+			} else {
+				clear(single)
+			}
+			scanner.roseSinglePool.Put(singlePtr)
+		}()
+	}
 	for _, state := range states {
-		// 只读场景使用 RoleByID 避免对 Literal 做防御性复制。
-		role, ok := program.RoleByID(state.RoleID)
+		entry, ok := scanner.roseDirect[state.RoleID]
 		if !ok {
-			continue
-		}
-		index, ok := scanner.ruleIndex[role.ReportID]
-		if !ok || index < 0 || index >= len(scanner.rules) {
-			continue
-		}
-		rule := scanner.rules[index]
-		if rule.flags&CompileQuiet != 0 {
-			continue
-		}
-		if rule.flags&CompileSingleMatch != 0 {
-			if _, exists := single[rule.id]; exists {
+			// 直通索引未建立时回落到逐候选回查，保证不漏报。
+			entry, ok = scanner.roseDirectEntryFor(program, state.RoleID)
+			if !ok {
 				continue
 			}
-			single[rule.id] = struct{}{}
 		}
-		end := state.Offset + uint64(len(role.Literal))
-		out = append(out, Match{Id: role.ReportID, From: state.Offset, To: end})
+		if entry.quiet {
+			continue
+		}
+		if entry.single {
+			if _, exists := single[entry.reportID]; exists {
+				continue
+			}
+			single[entry.reportID] = struct{}{}
+		}
+		out = append(out, Match{Id: entry.reportID, From: state.Offset, To: state.Offset + uint64(entry.length)})
 	}
 	return out
 }
@@ -2992,7 +3071,7 @@ func matchRuleIntoArena(rule *compiledRule, data []byte, start int, endsBuf []in
 	if rule.hasBackref || rule.hasConditional {
 		// 空闲起点无需捕获表：写入路径（Group）会自行创建，只读路径接受 nil。
 		states := matchCaptured(rule.root, data, start, rule.flags, nil, ev)
-		out := make([]int, 0, len(states))
+		out := endsBuf[:0]
 		for _, state := range states {
 			out = append(out, state.pos)
 		}
@@ -3675,7 +3754,13 @@ func matchNodeBody(n parser.Node, data []byte, pos int, flags CompileFlag, ev *n
 		if size == 0 || (r == utf8.RuneError && size == 1 && data[pos] >= 0x80) {
 			return nil
 		}
-		ok := unicodeProperty(r, v.Name)
+		// 属性名在解析阶段已解析成判定函数；节点缺少解析结果时按名称现场解析，
+		// 保证手工构造的 AST 仍然得到与解析器一致的语义。
+		property := v.Resolved
+		if property == nil {
+			property = parser.ResolveUnicodeProperty(v.Name)
+		}
+		ok := property.Match(r)
 		if v.Negated {
 			ok = !ok
 		}
@@ -3904,7 +3989,10 @@ func matchByteRepeatInto(v parser.Repeat, data []byte, pos int, flags CompileFla
 type nodeEval struct {
 	ends   sliceArena[int]
 	states sliceArena[captureState]
-	utf8   utf8Gate
+	// caps 承载捕获表副本。捕获表按「一次写入一份新表」的不可变方式生成，
+	// 每条记录只有 32 字节；工作区化之后带捕获语义的规则在求值期不再分配。
+	caps sliceArena[captureValue]
+	utf8 utf8Gate
 }
 
 // reset 清空全部缓存，供扫描上下文跨扫描复用。
@@ -3920,6 +4008,7 @@ func (ev *nodeEval) reset() {
 func (ev *nodeEval) resetEval() {
 	ev.ends.reset()
 	ev.states.reset()
+	ev.caps.reset()
 }
 
 // subjectValid 返回 data 是否为合法 UTF-8，非 nil 时记忆结果。
@@ -3955,6 +4044,14 @@ func (ev *nodeEval) singleEnd(end int) []int {
 	out := ev.endsAlloc(1)
 	out[0] = end
 	return out
+}
+
+// captureAlloc 返回长度为 n 的捕获表缓冲；非 nil 时从工作区切分。
+func (ev *nodeEval) captureAlloc(n int) captureTable {
+	if ev == nil {
+		return make(captureTable, n)
+	}
+	return captureTable(ev.caps.alloc(n))
 }
 
 // statesReserve 返回长度 0、容量不小于 n 的捕获状态切片。
@@ -4166,77 +4263,6 @@ func matchUTF8Literal(literal, data []byte, pos int) []int {
 	return []int{end}
 }
 
-// scannerUnicodePropertyNames 缓存 \p{...} 名称的规范化结果。
-//
-// 名称在编译期就已固定，规范化只依赖输入字符串，因此结果可以跨扫描安全共享。
-// 逐候选起点、逐字符地重复规范化会为每个字符分配一份临时字符串，是 \p{...}
-// 规则的主要分配来源。
-var scannerUnicodePropertyNames sync.Map
-
-// scannerUnicodePropertyName 返回规范化后的 Unicode 属性名。
-func scannerUnicodePropertyName(name string) string {
-	if cached, ok := scannerUnicodePropertyNames.Load(name); ok {
-		return cached.(string)
-	}
-	normalized := normalizeScannerUnicodeProperty(name)
-	scannerUnicodePropertyNames.Store(name, normalized)
-	return normalized
-}
-
-func unicodeProperty(r rune, name string) bool {
-	name = scannerUnicodePropertyName(name)
-	for _, prefix := range []string{"script=", "sc=", "script:", "generalcategory=", "gc="} {
-		if after, ok := strings.CutPrefix(name, prefix); ok {
-			name = after
-			break
-		}
-	}
-	if len(name) > 2 && (strings.HasPrefix(name, "is") || strings.HasPrefix(name, "in")) {
-		name = name[2:]
-	}
-	switch name {
-	case "l", "letter", "alpha":
-		return unicode.IsLetter(r)
-	case "n", "number":
-		return unicode.IsNumber(r)
-	case "nd":
-		return unicode.IsDigit(r)
-	case "z", "space", "whitespace":
-		return unicode.IsSpace(r)
-	case "lu", "uppercaseletter":
-		return unicode.IsUpper(r)
-	case "ll", "lowercaseletter":
-		return unicode.IsLower(r)
-	case "lt":
-		return unicode.Is(unicode.Lt, r)
-	case "lm":
-		return unicode.Is(unicode.Lm, r)
-	case "lo":
-		return unicode.Is(unicode.Lo, r)
-	case "m", "mark":
-		return unicode.Is(unicode.M, r)
-	case "p", "punct":
-		return unicode.Is(unicode.P, r)
-	case "s", "symbol":
-		return unicode.Is(unicode.S, r)
-	case "cc", "control":
-		return unicode.Is(unicode.Cc, r)
-	case "ascii":
-		return r < 128
-	case "any":
-		return true
-	case "assigned":
-		return !unicode.Is(unicode.Cn, r)
-	case "unassigned":
-		return unicode.Is(unicode.Cn, r)
-	default:
-		if table, ok := scannerUnicodeTables[name]; ok {
-			return unicode.Is(table, r)
-		}
-		return false
-	}
-}
-
 func containsCaptureSemantics(n parser.Node) bool {
 	switch v := n.(type) {
 	case parser.Backreference, parser.Conditional:
@@ -4286,17 +4312,46 @@ func containsBackreference(n parser.Node) bool {
 	return false
 }
 
-type captureState struct {
-	pos  int
-	caps map[int][]byte
+// captureValue 是一条捕获记录：捕获组编号与它在 subject 上占据的子切片。
+type captureValue struct {
+	index int
+	value []byte
 }
 
-func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, caps map[int][]byte, ev *nodeEval) []captureState {
+// captureTable 是捕获内容的不可变快照，条目按捕获组编号升序排列。
+//
+// 捕获组编号在编译期已经确定，实际用到的编号通常只有个位数；用有序小切片代替
+// map，可以在写入路径上省掉每写一次捕获组就分配一个 map 头与桶的开销。表本身
+// 不可变——写入总是生成新表——因此可以在不同求值状态之间安全共享。
+//
+// 查找与比较都依赖「按编号升序且编号唯一」，这两条不变式由 withCapture 与
+// scopedCaptureTable 保证。
+type captureTable []captureValue
+
+// lookup 返回捕获组编号对应的子切片。条目升序排列，因此在越过目标编号后即可
+// 提前结束，小表上比二分更省。
+func (t captureTable) lookup(index int) ([]byte, bool) {
+	for _, entry := range t {
+		if entry.index == index {
+			return entry.value, true
+		}
+		if entry.index > index {
+			break
+		}
+	}
+	return nil, false
+}
+
+type captureState struct {
+	pos  int
+	caps captureTable
+}
+
+func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, caps captureTable, ev *nodeEval) []captureState {
 	switch value := node.(type) {
 	case parser.Group:
 		flags = scopedGroupFlags(flags, value)
-		entryCaps := cloneCaps(caps)
-		clearCaptureScope(entryCaps, value)
+		entryCaps := scopedCaptureTable(ev, caps, value)
 		out := matchCaptured(value.Child, data, pos, flags, entryCaps, ev)
 		if value.Atomic && len(out) > 0 {
 			out = ev.singleState(selectAtomicState(out, value.Child))
@@ -4305,11 +4360,11 @@ func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, ca
 			return out
 		}
 		for i := range out {
-			out[i].caps = withCapture(out[i].caps, value.Capture, data[pos:out[i].pos])
+			out[i].caps = withCapture(ev, out[i].caps, value.Capture, data[pos:out[i].pos])
 		}
 		return out
 	case parser.Sequence:
-		// 捕获表只在即将被写入的路径上复制（见 Group 与 cloneCaps 注释），
+		// 捕获表只在即将被写入的路径上复制（见 Group 与 scopedCaptureTable 注释），
 		// 这里与后续的只读分支都可以直接透传。
 		states := ev.singleState(captureState{pos: pos, caps: caps})
 		for _, child := range value.Elements {
@@ -4331,7 +4386,10 @@ func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, ca
 		return dedupCaptureStates(out)
 	case parser.Repeat:
 		states := ev.singleState(captureState{pos: pos, caps: caps})
-		out := ev.statesReserve(value.Min + 1)
+		// 结果长度由实际可重复次数决定。只按 Min+1 预留会让第一次重复命中就
+		// 触发 append 扩容、并绕开求值工作区；按一个最小批量预留后，常见的短
+		// 重复可以在预留区里完成，代价只是同一块工作区多切几个槽位。
+		out := ev.statesReserve(statesRepeatReserve(value.Min))
 		if value.Min == 0 {
 			out = append(out, states...)
 		}
@@ -4358,7 +4416,7 @@ func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, ca
 		}
 		return dedupCaptureStates(out)
 	case parser.Backreference:
-		captured, ok := caps[value.Index]
+		captured, ok := caps.lookup(value.Index)
 		if !ok || pos+len(captured) > len(data) {
 			return nil
 		}
@@ -4370,7 +4428,7 @@ func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, ca
 		return ev.singleState(captureState{pos: pos + len(captured), caps: caps})
 	case parser.Conditional:
 		child := value.No
-		if _, ok := caps[value.Index]; ok {
+		if _, ok := caps.lookup(value.Index); ok {
 			child = value.Yes
 		}
 		return matchCaptured(child, data, pos, flags, caps, ev)
@@ -4427,14 +4485,52 @@ func matchCaptured(node parser.Node, data []byte, pos int, flags CompileFlag, ca
 	}
 }
 
-// clearCaptureScope 在重复进入分组时清除该分组及其子树的旧捕获值。
-func clearCaptureScope(caps map[int][]byte, group parser.Group) {
-	if group.Capture > 0 {
-		delete(caps, group.Capture)
+// scopedCaptureTable 返回清除了分组自身及其子树旧捕获后的捕获表：分组重入时
+// 上一轮的捕获值必须失效，否则反向引用会读到上一次迭代的内容。
+//
+// 尚无捕获时直接复用空表；已有捕获但不落在该作用域内时（绝大多数重入场景）
+// 复用原表。两种情况都不再为「可能被清除」构造一遍捕获编号列表。
+func scopedCaptureTable(ev *nodeEval, caps captureTable, group parser.Group) captureTable {
+	if len(caps) == 0 {
+		return caps
 	}
-	for _, id := range parser.CaptureIDs(group.Child) {
-		delete(caps, id)
+	ids := parser.CaptureIDs(group.Child)
+	removed := 0
+	for _, entry := range caps {
+		if captureInScope(group.Capture, ids, entry.index) {
+			removed++
+		}
 	}
+	if removed == 0 {
+		return caps
+	}
+	out := ev.captureAlloc(len(caps) - removed)
+	write := 0
+	for _, entry := range caps {
+		if captureInScope(group.Capture, ids, entry.index) {
+			continue
+		}
+		out[write] = entry
+		write++
+	}
+	return out[:write]
+}
+
+// captureInScope 判断捕获编号是否属于该分组：分组自身的编号，或子树里任意
+// 分组的编号。
+func captureInScope(own int, ids []int, index int) bool {
+	if index <= 0 {
+		return false
+	}
+	if own > 0 && index == own {
+		return true
+	}
+	for _, id := range ids {
+		if id == index {
+			return true
+		}
+	}
+	return false
 }
 
 // selectAtomicState 保留原子分组首次确定的路径，避免后续回溯改写选择。
@@ -4443,6 +4539,20 @@ func selectAtomicState(states []captureState, child parser.Node) captureState {
 		return states[len(states)-1]
 	}
 	return states[0]
+}
+
+// statesRepeatReserveMin 是重复节点结果的预留下限（元素数）。
+//
+// 重复节点在一轮里可能产出多个状态，只按 Min+1 预留必然紧接着扩容；预留一个
+// 小批量可以覆盖绝大多数短重复，又不至于在长输入上按起点浪费工作区。
+const statesRepeatReserveMin = 8
+
+// statesRepeatReserve 把重复节点的最小重复次数换算成结果预留量。
+func statesRepeatReserve(minCount int) int {
+	if minCount+1 >= statesRepeatReserveMin {
+		return minCount + 1
+	}
+	return statesRepeatReserveMin
 }
 
 // captureStateLinearDedup 是线性去重的状态数上限。状态集合在回溯里普遍很小，
@@ -4485,50 +4595,34 @@ func dedupCaptureStates(states []captureState) []captureState {
 	return out
 }
 
-// captureStatesEqual 判定两个捕获状态是否等价。
+// captureStatesEqual 判定两个捕获状态是否等价。捕获表按编号升序排列且编号唯一，
+// 因此可以直接按下标逐条比较，不必再做一次哈希查找。
 func captureStatesEqual(left, right captureState) bool {
 	if left.pos != right.pos || len(left.caps) != len(right.caps) {
 		return false
 	}
-	for index, value := range left.caps {
-		other, ok := right.caps[index]
-		if !ok || !bytes.Equal(value, other) {
+	for i, entry := range left.caps {
+		other := right.caps[i]
+		if entry.index != other.index || !bytes.Equal(entry.value, other.value) {
 			return false
 		}
 	}
 	return true
 }
 
-// captureStateKeyFields 编码单条捕获记录时使用的栈上小数组容量。绝大多数
-// 规则只用到个位数捕获组，超过时才退化为堆分配。
-const captureStateKeyFields = 8
-
 // appendCaptureStateKey 把捕获状态编码成前缀无关的字节序列：结束位置、捕获
-// 数量，随后是按下标排序的「下标 + 长度 + 原始字节」。
+// 数量，随后是按下标升序的「下标 + 长度 + 原始字节」。
 //
 // 长度前缀保证不同状态的编码不会产生歧义，因此不需要转义，也不必像早先基于
-// 引号转义字符串的实现那样为每次去重构造多份临时字符串。
+// 引号转义字符串的实现那样为每次去重构造多份临时字符串。捕获表本身已经按编号
+// 升序，所以这里直接顺序编码即可得到与插入顺序无关的规范键。
 func appendCaptureStateKey(dst []byte, state captureState) []byte {
 	dst = binary.AppendUvarint(dst, uint64(state.pos))
 	dst = binary.AppendUvarint(dst, uint64(len(state.caps)))
-	if len(state.caps) == 0 {
-		return dst
-	}
-	var stack [captureStateKeyFields]int
-	indexes := stack[:0]
-	if len(state.caps) > len(stack) {
-		indexes = make([]int, 0, len(state.caps))
-	}
-	for index := range state.caps {
-		indexes = append(indexes, index)
-	}
-	// map 迭代顺序随机，必须排序后才能得到与顺序无关的规范编码。
-	sort.Ints(indexes)
-	for _, index := range indexes {
-		value := state.caps[index]
-		dst = binary.AppendUvarint(dst, uint64(index))
-		dst = binary.AppendUvarint(dst, uint64(len(value)))
-		dst = append(dst, value...)
+	for _, entry := range state.caps {
+		dst = binary.AppendUvarint(dst, uint64(entry.index))
+		dst = binary.AppendUvarint(dst, uint64(len(entry.value)))
+		dst = append(dst, entry.value...)
 	}
 	return dst
 }
@@ -4537,32 +4631,36 @@ func appendCaptureStateKey(dst []byte, state captureState) []byte {
 //
 // captured 直接引用 subject 的子切片：输入在扫描期间保持不变，且捕获值只被读取
 // 和比较，因此不必为每次捕获复制一份字节。
-func withCapture(caps map[int][]byte, id int, captured []byte) map[int][]byte {
-	out := make(map[int][]byte, len(caps)+1)
-	for index, value := range caps {
-		out[index] = value
+func withCapture(ev *nodeEval, caps captureTable, id int, captured []byte) captureTable {
+	out := ev.captureAlloc(len(caps) + 1)
+	write := 0
+	replaced := false
+	for _, entry := range caps {
+		if !replaced && entry.index >= id {
+			out[write] = captureValue{index: id, value: captured}
+			write++
+			replaced = true
+			if entry.index == id {
+				// 同编号覆盖：旧记录到此为止。
+				continue
+			}
+		}
+		out[write] = entry
+		write++
 	}
-	out[id] = captured
-	return out
+	if !replaced {
+		out[write] = captureValue{index: id, value: captured}
+		write++
+	}
+	return out[:write]
 }
 
-// cloneCaps 复制捕获表结构，供即将就地修改（清除作用域或写入新捕获）的调用方使用。
-//
-// 捕获值本身在整个扫描期间不再被就地改写：新捕获总是整体替换成新切片，
-// 清除作用域只删除键。因此这里只做浅拷贝，避免为每个捕获组重复复制字节。
-// 空表返回 nil，让只读路径无需为「尚无捕获」付出一次 map 分配。
-func cloneCaps(in map[int][]byte) map[int][]byte {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make(map[int][]byte, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
 func dedup(values []int) []int {
-	sort.Ints(values)
+	// 结束偏移大多由确定性推进产生，天然就是升序；先做一次线性检查即可跳过
+	// 排序，避免在命中密集的重复求值里为每个极小切片付出排序调用开销。
+	if len(values) > 1 && !slices.IsSorted(values) {
+		slices.Sort(values)
+	}
 	out := values[:0]
 	for _, v := range values {
 		if len(out) == 0 || out[len(out)-1] != v {

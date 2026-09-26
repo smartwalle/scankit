@@ -724,9 +724,13 @@ type Class struct {
 func (Class) node() {}
 
 // UnicodeClass 表示按 Unicode 属性名匹配的字符类。
+//
+// Resolved 是属性名的解析结果，由解析阶段一次性填好；扫描与求值热路径逐字符
+// 判定时直接使用它，不再重复规范化名称。为 nil 时调用方可按 Name 现场解析。
 type UnicodeClass struct {
-	Name    string
-	Negated bool
+	Name     string
+	Negated  bool
+	Resolved *UnicodeProperty
 }
 
 func (UnicodeClass) node() {}
