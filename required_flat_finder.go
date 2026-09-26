@@ -52,14 +52,6 @@ type requiredFlatFinder struct {
 	tables  simd.ByteSetTables
 }
 
-// flatFoldByte 返回字节的小写折叠形式，与 hwlm 的忽略大小写语义一致。
-func flatFoldByte(value byte) byte {
-	if value >= 'A' && value <= 'Z' {
-		return value + 'a' - 'A'
-	}
-	return value
-}
-
 // flatOtherCase 返回字节在 ASCII 大小写折叠下的另一形态；无对应形态时返回自身。
 func flatOtherCase(value byte) byte {
 	if value >= 'A' && value <= 'Z' {

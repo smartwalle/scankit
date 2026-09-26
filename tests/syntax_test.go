@@ -1502,3 +1502,109 @@ func TestDenseRunHeadMatchesRegexp(t *testing.T) {
 		}
 	}
 }
+
+// TestLiteralPrefixAssertionMatchesRegexp 用确定性随机语料对「入口文字 + 末尾词边界」
+// 形态做差分验证。这类规则的候选起点由入口文字索引派生，确认阶段在入口文字之后
+// 续跑确认表（见 confirmDFAStart）：既跳过入口文字的重复比较，又避免从规则起点
+// 重走整条图。语料刻意混合合法主体与非法主体（空主体、超长重复、非法字符、末尾
+// 断言失败），覆盖「入口文字出现但规则不成立」的失败路径。
+func TestLiteralPrefixAssertionMatchesRegexp(t *testing.T) {
+	patterns := []string{
+		// Rules100 基准里的 Email 形态（入口文字 + 长字符类重复 + 末尾词边界）。
+		`field03=(?:[A-Za-z0-9.!#$%&'*+/?^_` + "`" + `{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\b)`,
+		`token=[a-z]{3,8}\b`,
+		`k=[0-9]{2,4}\b`,
+		`p=[a-z]+\b`,
+		`v=(?:ab|cd)\b`,
+	}
+	// 每条前缀配一组「合法主体」模板，其余字符从这个字母表里随机取，用来制造
+	// 入口文字命中但确认失败的近失配。
+	validBodies := map[string][]string{
+		"field03=": {"user000@sample00.com", "a.b+c@x-y.example", "local@a.b.c.d"},
+		"token=":   {"abc", "abcdefgh"},
+		"k=":       {"12", "1234"},
+		"p=":       {"abc", "zzz"},
+		"v=":       {"ab", "cd"},
+	}
+	prefixes := []string{"field03=", "token=", "k=", "p=", "v="}
+	rng := rand.New(rand.NewPCG(94, 17))
+	pick := func(alphabet string, limit int) string {
+		length := rng.IntN(limit)
+		buf := make([]byte, length)
+		for index := range buf {
+			buf[index] = alphabet[rng.IntN(len(alphabet))]
+		}
+		return string(buf)
+	}
+	fixed := []string{
+		"", "field03=", "field03=user000@sample00.com", "field03=user000@sample00.com.",
+		"field03=@example.com", "field03=a@b.com ", "token=", "token=abc", "token=abc!",
+		"k=12", "k=1", "k=12345", "p=", "p=abc", "v=ab", "v=cd", "v=ae",
+		"field03=" + strings.Repeat("z", 65) + "@b.com",
+		"field03=user000@sample00.com " + "field03=user001@sample01.com ",
+		strings.Repeat("field03=a@b.com ", 8),
+		strings.Repeat("token=abcdef ", 8),
+	}
+	for _, pattern := range patterns {
+		scanner, err := scankit.Compile([]scankit.Expression{{Id: 1, Pattern: pattern}})
+		if err != nil {
+			t.Fatalf("%q: compile: %v", pattern, err)
+		}
+		reference := regexp.MustCompile(pattern)
+		inputs := append([]string(nil), fixed...)
+		// 先补一批「入口文字 + 合法主体」的确定性输入，保证每条模式都覆盖到
+		// 确认成功路径，并让前后的分隔字节覆盖词边界断言的两个方向。
+		for _, prefix := range prefixes {
+			for _, body := range validBodies[prefix] {
+				for range 60 {
+					inputs = append(inputs, prefix+body)
+					inputs = append(inputs, "x "+prefix+body+" y")
+					inputs = append(inputs, prefix+body+"!")
+				}
+			}
+		}
+		for range 1500 {
+			var builder strings.Builder
+			for part := rng.IntN(3) + 1; part > 0; part-- {
+				builder.WriteString(pick(" \t=,:;中文\n", 3))
+				prefix := prefixes[rng.IntN(len(prefixes))]
+				builder.WriteString(prefix)
+				switch rng.IntN(6) {
+				case 0:
+					// 合法主体：覆盖确认成功路径。
+					bodies := validBodies[prefix]
+					builder.WriteString(bodies[rng.IntN(len(bodies))])
+				case 1:
+					// 空主体或超长重复：覆盖重复下界/上界失败。
+					if rng.IntN(2) == 0 {
+						break
+					}
+					builder.WriteString(strings.Repeat("z", 65))
+				default:
+					builder.WriteString(pick("abzAZ09.-_+!~@=", 14))
+				}
+			}
+			inputs = append(inputs, builder.String())
+		}
+		hits := 0
+		for _, input := range inputs {
+			data := []byte(input)
+			want := make([]scankit.Match, 0)
+			for _, index := range reference.FindAllIndex(data, -1) {
+				want = append(want, scankit.Match{Id: 1, From: uint64(index[0]), To: uint64(index[1])})
+			}
+			got, err := scanner.Scan(data)
+			if err != nil {
+				t.Fatalf("%q %q: scan: %v", pattern, input, err)
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("%q 在 %q 上命中不一致:\n got=%v\nwant=%v", pattern, input, got, want)
+			}
+			hits += len(want)
+		}
+		if hits < 200 {
+			t.Fatalf("%q: 语料命中 %d，未充分覆盖命中路径", pattern, hits)
+		}
+		t.Logf("%q 命中=%d", pattern, hits)
+	}
+}

@@ -360,14 +360,62 @@ func (d *confirmDFA) memoryBytes() uint64 {
 	return uint64(len(d.table)) * 4
 }
 
-// preferredEnd 从候选起点执行确定性确认，返回 record 需要的偏好结束偏移。
-// ok 为 false 表示参数越界，调用方应保持原有语义。
-func (d *confirmDFA) preferredEnd(data []byte, start int) (int, bool) {
-	if d == nil || start < 0 || start > len(data) {
-		return -1, false
+// confirmDFAStart 是确认表在「跳过首段必须文字之后」的续跑点。
+//
+// 必须文字规则（如 `field03=(?:...\b)`）的候选起点由候选文字索引派生，确认程序
+// 入口处在入口文字之后；确认表是按整图确定化的，因此从规则起点出发要重走入口
+// 文字。把入口文字在构造期预走一遍，扫描期就能直接从文字之后续跑，同时拿到
+// 解释器捷径（跳过入口文字）与确认表（每字节一次查表）两者的好处：既不像解释器
+// 那样逐指令求值长尾程序，也不像从规则起点出发那样重走入口文字。
+type confirmDFAStart struct {
+	state uint32
+	mask  uint8
+	ok    bool
+}
+
+// stridePrefix 在确认表上预走入口文字，返回续跑点。
+//
+// ok 为 false 表示不能安全续跑，调用方必须保留解释器捷径：
+//   - 文字为空或确认表为空；
+//   - 文字在确认表上走不到终点（与「起点处入口文字必然成立」矛盾，保守回退）；
+//   - 文字内部出现可结束位置（说明入口文字并非每一条匹配路径的必须前缀，
+//     从文字之后续跑会漏掉更短的匹配）。
+func (d *confirmDFA) stridePrefix(literal []byte) (confirmDFAStart, bool) {
+	if d == nil || len(literal) == 0 {
+		return confirmDFAStart{}, false
 	}
 	state := d.startState
 	mask := d.startMask
+	for index, value := range literal {
+		// 位置 start+index（0 < index < len）若能结束匹配，说明存在不经过完整
+		// 入口文字的匹配路径，此时必须由解释器从入口处逐字节求值。
+		if index > 0 && mask != 0 {
+			return confirmDFAStart{}, false
+		}
+		offset := state<<8 | uint32(value)
+		entry := d.table[offset]
+		mask = uint8(entry >> confirmDFATargetBits)
+		state = entry & confirmDFATargetMask
+		if state == confirmDFADead {
+			return confirmDFAStart{}, false
+		}
+	}
+	return confirmDFAStart{state: state, mask: mask, ok: true}, true
+}
+
+// preferredEnd 从候选起点执行确定性确认，返回 record 需要的偏好结束偏移。
+// ok 为 false 表示参数越界，调用方应保持原有语义。
+func (d *confirmDFA) preferredEnd(data []byte, start int) (int, bool) {
+	return d.preferredEndFrom(data, start, confirmDFAStart{state: d.startState, mask: d.startMask, ok: true})
+}
+
+// preferredEndFrom 从已预走进口文字的续跑点执行确定性确认。
+func (d *confirmDFA) preferredEndFrom(data []byte, start int, from confirmDFAStart) (int, bool) {
+	if d == nil || start < 0 || start > len(data) {
+		return -1, false
+	}
+	state := from.state
+	mask := from.mask
 	best := -1
 	pos := start
 	// prevWord 是当前位置之前一个字节的词属性；越界一律按非词字符处理，

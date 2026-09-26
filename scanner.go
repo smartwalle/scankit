@@ -106,6 +106,11 @@ type Scanner struct {
 	// confirmUncoveredRules 是候选路径生效后仍未被索引覆盖的规则。
 	confirmAllRules       []int
 	confirmUncoveredRules []int
+	// confirmDFAStarts 是按规则下标对齐的确认表续跑点：规则既有确认表、又有
+	// 入口文字（confirmSkip > 0）时，构造期把入口文字在确认表上预走一遍，扫描期
+	// 直接从文字之后续跑（见 confirmDFAStart）。无确认表或无法安全续跑的规则为
+	// confirmDFAStart.ok == false。整表为空表示没有任何规则可用该捷径。
+	confirmDFAStarts []confirmDFAStart
 	// startBytes/startBytesAll 是按首字节分组的逐起点确认索引，分别对应
 	// confirmUncoveredRules 与 confirmAllRules。
 	startBytes    *startByteIndex
@@ -402,6 +407,8 @@ type collapseHead struct {
 
 func newScanner(rules []compiledRule) *Scanner {
 	copyRules := append([]compiledRule(nil), rules...)
+	// dfaStarts 惰性分配：只有确实存在「确认表 + 入口文字」的规则时才占用内存。
+	var dfaStarts []confirmDFAStart
 	// 预先计算每条规则的 AST 派生属性，避免扫描时重复遍历规则树。
 	for i := range copyRules {
 		copyRules[i].containsAny = containsAny(copyRules[i].root)
@@ -426,6 +433,20 @@ func newScanner(rules []compiledRule) *Scanner {
 					}
 					copyRules[i].confirmEntry = entry
 					copyRules[i].confirmSkip = skip
+					// 入口文字是单条文字时，把它在确认表上预走一遍：扫描期可以
+					// 直接从文字之后续跑，省掉解释器对入口后长尾程序的逐指令
+					// 求值，也不必像从规则起点出发那样重走入口文字。入口是一组
+					// 等长文字分支（`ab|cd`）时无法用单条文字预走，保持解释器。
+					if skip > 0 && entry != confirmExactEntry && copyRules[i].confirmDFA != nil {
+						if literal := leadingLiteral(copyRules[i].root); len(literal) == skip {
+							if start, ok := copyRules[i].confirmDFA.stridePrefix(literal); ok {
+								if dfaStarts == nil {
+									dfaStarts = make([]confirmDFAStart, len(copyRules))
+								}
+								dfaStarts[i] = start
+							}
+						}
+					}
 				}
 				copyRules[i].collapseHead = newCollapseHead(copyRules[i])
 			}
@@ -507,6 +528,7 @@ func newScanner(rules []compiledRule) *Scanner {
 		}
 	}
 	scanner.backendOnly = !scanner.hasCombo && !scanner.fastLiteral
+	scanner.confirmDFAStarts = dfaStarts
 	scanner.buildConfirmRuleLists()
 	scanner.markRequiredEntrySkips()
 	scanner.startBytes = newStartByteIndex(copyRules, scanner.confirmUncoveredRules)
@@ -1951,14 +1973,14 @@ func guardRunRepeat(rule *compiledRule) (leftmost bool, stride int, ok bool) {
 	if rule.guard == nil || len(rule.guard.sets) == 0 || rule.guard.hasBoundary() {
 		return false, 0, false
 	}
-	repeat, ok := unwrapGroups(rule.root).(parser.Repeat)
-	if !ok || repeat.Min < 1 || !repeat.Greedy {
+	repeatNode, ok := unwrapGroups(rule.root).(parser.Repeat)
+	if !ok || repeatNode.Min < 1 || !repeatNode.Greedy {
 		return false, 0, false
 	}
 	// 重复体可以是字符类，也可以是单字节字面量（`x{2,4}` 的语法树保留为
 	// Literal，不会归一化成 Class），两者都折算成同一个字节集合比较。
 	var set [4]uint64
-	switch child := unwrapGroups(repeat.Child).(type) {
+	switch child := unwrapGroups(repeatNode.Child).(type) {
 	case parser.Class:
 		set = classByteSet(child)
 	case parser.Literal:
@@ -1969,7 +1991,7 @@ func guardRunRepeat(rule *compiledRule) (leftmost bool, stride int, ok bool) {
 	default:
 		return false, 0, false
 	}
-	if set == [4]uint64{} || repeat.Min != len(rule.guard.sets) {
+	if set == [4]uint64{} || repeatNode.Min != len(rule.guard.sets) {
 		return false, 0, false
 	}
 	for index := range rule.guard.sets {
@@ -1981,7 +2003,7 @@ func guardRunRepeat(rule *compiledRule) (leftmost bool, stride int, ok bool) {
 	if !ok || offset != 0 || length != len(rule.guard.sets) {
 		return false, 0, false
 	}
-	if repeat.Max < 0 {
+	if repeatNode.Max < 0 {
 		// 无上界贪婪：收敛到段首。窗口短于 guardRunMinLength 时省略整段展开
 		// 本来就不划算，保持既有阈值。
 		if length < guardRunMinLength {
@@ -1991,10 +2013,10 @@ func guardRunRepeat(rule *compiledRule) (leftmost bool, stride int, ok bool) {
 	}
 	// 有上界贪婪：下界至少 2 个字节时按上界步长收敛。下界为 1 的规则在每个
 	// 成员字节上都成立，收敛不会减少候选，只保留候选文字索引更稳。
-	if repeat.Min < 2 || repeat.Max < int(repeat.Min) {
+	if repeatNode.Min < 2 || repeatNode.Max < repeatNode.Min {
 		return false, 0, false
 	}
-	return false, int(repeat.Max), true
+	return false, repeatNode.Max, true
 }
 
 // denseRunHead 判断规则是否以「单个字节集合的无上界贪婪重复」`S+` 开头，且该
@@ -2036,11 +2058,11 @@ func denseRunHead(rule *compiledRule) [4]uint64 {
 	if !ok || len(sequence.Elements) < 2 {
 		return empty
 	}
-	repeat, ok := unwrapGroups(sequence.Elements[0]).(parser.Repeat)
-	if !ok || repeat.Min != 1 || repeat.Max >= 0 || !repeat.Greedy {
+	repeatNode, ok := unwrapGroups(sequence.Elements[0]).(parser.Repeat)
+	if !ok || repeatNode.Min != 1 || repeatNode.Max >= 0 || !repeatNode.Greedy {
 		return empty
 	}
-	set, ok := singleByteNodeSet(repeat.Child)
+	set, ok := singleByteNodeSet(repeatNode.Child)
 	if !ok || set == empty || set != rule.guard.sets[0] {
 		return empty
 	}
@@ -2385,6 +2407,9 @@ func (st *blockScanState) confirmEnd(ri int, start int) (int, bool) {
 		// 结束偏移恒为 start+confirmSkip，连解释器调用都可以省掉。
 		if rule.confirmEntry == confirmExactEntry {
 			return start + rule.confirmSkip, true
+		}
+		if starts := st.scanner.confirmDFAStarts; starts != nil && starts[ri].ok {
+			return rule.confirmDFA.preferredEndFrom(st.data, start+rule.confirmSkip, starts[ri])
 		}
 		return rule.confirm.run(st.data, rule.confirmEntry, start+rule.confirmSkip, rule.flags, st.ctx.confirmFrames())
 	}
@@ -4454,7 +4479,7 @@ func (ev *nodeEval) captureAlloc(n int) captureTable {
 	if ev == nil {
 		return make(captureTable, n)
 	}
-	return captureTable(ev.caps.alloc(n))
+	return ev.caps.alloc(n)
 }
 
 // statesReserve 返回长度 0、容量不小于 n 的捕获状态切片。

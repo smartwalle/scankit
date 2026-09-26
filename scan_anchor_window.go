@@ -55,6 +55,7 @@ func requiredAnchor(node parser.Node, flags CompileFlag) (startAnchor, bool) {
 			if flags&CompileMultiline == 0 {
 				return startAnchor{kind: anchorEnd}, true
 			}
+		default:
 		}
 		return startAnchor{}, false
 	case parser.Group:
