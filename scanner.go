@@ -82,6 +82,11 @@ type Scanner struct {
 	// requiredCovered 标记规则是否由候选文字索引覆盖；覆盖的规则只需在
 	// 候选起点确认，不再参与整块后端扫描。
 	requiredCovered []bool
+	// runHeadWindows 标记哪些规则的候选窗口启用了段首过滤（见 denseRunHead）。
+	// 这类规则的段内起点不再登记，因此确认阶段一旦被重叠抑制必须把候选推迟到
+	// 水位线位置重新登记，否则水位线之后的段内起点会漏报（见
+	// retryCollapsedCandidate）。
+	runHeadWindows []bool
 	// anchorEntries 是锚定在输入首尾的规则候选来源：这些规则只有一个可行起点，
 	// 直接按锚点推导，无需候选文字命中。anchorCovered 标记这些规则，使它们同样
 	// 免于整块后端扫描；与 requiredCovered 分开是因为该来源没有校验规则入口
@@ -145,6 +150,9 @@ type scanContext struct {
 	requiredSortScratch []uint64
 	requiredStartCounts []uint32
 	requiredStarts      []uint64
+	// retryStarts 复用收敛窗口被重叠抑制后推迟到水位线的补登候选队列，按
+	// (起点, 规则) 升序使用，长度有界于规则数（见 retryCollapsedCandidate）。
+	retryStarts []uint64
 	// chainArena 是确认快路径的单次工作区，跨候选起点复用同一块内存。
 	chainArena byteChainArena
 	// confirmStack 是确认程序的回溯栈，跨候选起点复用。
@@ -181,6 +189,14 @@ type guardRun struct {
 	// prefixCovered 表示约束窗口本身已经覆盖全部前缀字节集合。此时窗口扫描
 	// 已经保证前缀成立，展开时只剩首尾断言折算出的相邻字节约束需要校验。
 	prefixCovered bool
+	// leftmostOnly 表示规则恰好是约束集合的无上界贪婪重复（见 guardRunRepeat），
+	// 同一条连续段内只有段首起点需要登记：段首必命中且贪婪重复消费到段尾，段内
+	// 更靠右的起点都会被同一规则的重叠抑制挡住。
+	leftmostOnly bool
+	// stride 大于 0 表示规则恰好是约束集合的有上界贪婪重复且上界等于该值（见
+	// guardRunRepeat）：连续段内被报告的起点只可能是 段首 + k*stride，登记整段
+	// 只会让必然被重叠抑制的起点也走一遍排序与候选循环。
+	stride int
 }
 
 // guardRunGroup 把共享同一字节集合的约束合并成一次线性扫描。
@@ -300,6 +316,10 @@ type requiredEntry struct {
 	// 命中位置，之后的确认程序与起点无关。此时窗口只需登记最左起点，其余起点
 	// 由确认阶段的推迟逻辑补齐（见 retryCollapsedCandidate）。
 	collapseWindow bool
+	// runHead 非空时表示规则以「该字节集合的无上界贪婪重复」开头（见
+	// denseRunHead）：同一连续段内的起点共享同一个确认结果，窗口展开时只需登记
+	// 段首起点，段内更靠右的起点必然被同一规则的重叠抑制挡住。
+	runHead [4]uint64
 }
 
 // requiredLiteral 是一个候选文字及共享它的全部规则。
@@ -356,6 +376,12 @@ type compiledRule struct {
 	confirmDFA *confirmDFA
 	// confirmEntry 是跳过入口文字后的程序入口，confirmSkip 是跳过的文字长度。
 	// confirmSkip 为 0 时从规则入口正常确认。
+	//
+	// confirmEntry 为 confirmExactEntry 时表示跳过入口文字后确认程序立刻命中：
+	// 候选索引已证明起点处的入口文字成立，且入口之后没有其它消费与断言，匹配
+	// 结束偏移恒为 start+confirmSkip，不必再进解释器（`needle`、`ab|cd` 这类
+	// 纯文字规则）。用哨兵值而不是新增字段：compiledRule 每增大 8 字节，逐规则
+	// 循环的缓存足迹就变化一次，实测在 Rules100 零命中基准上等同 +4%。
 	confirmEntry int32
 	confirmSkip  int
 	// collapseHead 非空表示确认程序入口是一条与候选窗口一一对应的集合重复。
@@ -393,11 +419,13 @@ func newScanner(rules []compiledRule) *Scanner {
 			copyRules[i].guard = newPrefixGuard(copyRules[i])
 			copyRules[i].confirm = compileConfirmProgram(copyRules[i].root, copyRules[i].flags)
 			if copyRules[i].confirm != nil {
-				if literal := leadingLiteral(copyRules[i].root); requiredImpliesLiteral(copyRules[i].required, literal) {
-					if entry, ok := copyRules[i].confirm.afterLeadingLiteral(literal); ok {
-						copyRules[i].confirmEntry = entry
-						copyRules[i].confirmSkip = len(literal)
+				if entry, skip, ok := leadingLiteralSkip(&copyRules[i]); ok {
+					if instrs := copyRules[i].confirm.instrs; entry >= 0 && int(entry) < len(instrs) && instrs[entry].op == confirmOpMatch {
+						// 入口之后立刻命中：确认结果与解释器无关。
+						entry = confirmExactEntry
 					}
+					copyRules[i].confirmEntry = entry
+					copyRules[i].confirmSkip = skip
 				}
 				copyRules[i].collapseHead = newCollapseHead(copyRules[i])
 			}
@@ -462,7 +490,11 @@ func newScanner(rules []compiledRule) *Scanner {
 	for i := range copyRules {
 		scanner.hasCollapse = scanner.hasCollapse || copyRules[i].collapseHead != nil
 	}
-	scanner.guardRunCovered = guardRunCandidates(copyRules)
+	// 约束枚举依赖宽窗口掩码：原生内核下它比候选文字索引更快，标量参考实现下
+	// 反而比 memchr 慢数倍（见 simd.HasNativeWideMask）。集合自重复规则据此在
+	// 两条候选来源之间二选一，两条路径都产出等价候选集合，只影响开销。
+	scanner.guardRunCovered = guardRunCandidates(copyRules, simd.HasNativeWideMask(dispatch.DefaultBackend()))
+	scanner.runHeadWindows = make([]bool, len(copyRules))
 	scanner.buildRequiredIndex(copyRules, scanner.guardRunCovered)
 	scanner.fastLiteral = !scanner.hasCombo && len(copyRules) > 1 &&
 		len(candidateIDs) == len(copyRules) && len(literalIDs) == len(copyRules)
@@ -561,6 +593,7 @@ func (scanner *Scanner) buildRequiredIndex(rules []compiledRule, guardDriven []b
 			continue
 		}
 		caseless := ruleCaseless(rule)
+		runHead := denseRunHead(&rule)
 		for _, variant := range rule.required {
 			// 忽略大小写与精确匹配的文字不能共用同一个候选：两者的候选匹配
 			// 语义不同，混用会让精确规则多确认（可接受）或让忽略大小写的规则
@@ -584,6 +617,15 @@ func (scanner *Scanner) buildRequiredIndex(rules []compiledRule, guardDriven []b
 			// newCollapseHead 完全一致（单候选、guard 由回退集合蕴含），这里只
 			// 复用结论，不重复推导。
 			entry.collapseWindow = rule.collapseHead != nil
+			// 段首过滤只在无上界窗口上成立：有上界时窗口下界会被上界裁剪到
+			// 连续段内部，段首不在窗口里，被丢弃的段内起点没有任何候选可以
+			// 退回补齐。回退集合必须覆盖重复集合，否则窗口左侧可能停在段内，
+			// 段首同样不在窗口里。折叠窗口已给出更强结论（窗口内全部起点共享
+			// 结果），不再叠加其余条件。
+			if !entry.collapseWindow && entry.max < 0 && runHead != ([4]uint64{}) && backSetContains(variant.Back, runHead) {
+				entry.runHead = runHead
+				scanner.runHeadWindows[ruleIndex] = true
+			}
 			if guardImpliedByBack(entry.guard, variant.Back, variant.MinOffset) {
 				entry.guard = nil
 			}
@@ -622,6 +664,37 @@ func requiredWindowUsable(variants []prefilter.Variant) bool {
 // maxRequiredWindow 与编译期候选推导保持一致的偏移窗口上限。
 const maxRequiredWindow = 64
 
+// makeFlatFinder 在长组与忽略大小写组满足两字节前缀表门槛时构建统一匹配器。
+//
+// 第二个返回值是统一匹配器覆盖不到、必须由调用方另行处理的文字：两字节前缀表
+// 的最短文字为 2，忽略大小写组里长度为 1 的文字（例如 (?i)a）进不了任何前缀
+// 条目，若随长组一起交给统一匹配器就会被静默丢弃。构建失败（合并集合为空、或
+// 超过 newRequiredFlatFinder 的规模门槛）时返回 nil，并交回原样的两组文字，让
+// 调用方按老路径分组处理。
+func makeFlatFinder(long, caseless []hwlm.Literal) (func([]byte, []requiredHit) []requiredHit, []hwlm.Literal) {
+	if len(long) == 0 && len(caseless) == 0 {
+		return nil, nil
+	}
+	covered := make([]hwlm.Literal, 0, len(long)+len(caseless))
+	covered = append(covered, long...)
+	var leftover []hwlm.Literal
+	for _, literal := range caseless {
+		if len(literal.Value) < 2 {
+			leftover = append(leftover, literal)
+			continue
+		}
+		covered = append(covered, literal)
+	}
+	if len(covered) == 0 {
+		return nil, leftover
+	}
+	finder := newRequiredFlatFinder(covered)
+	if finder == nil {
+		return nil, nil
+	}
+	return finder.find, leftover
+}
+
 // newRequiredFinder 按候选文字规模选择匹配器，并把每次扫描的命中缓冲
 // 放入对象池，避免为每条命中重新分配临时切片。调用方 requiredScanStarts
 // 会重新按起点排序并在派生的起点上去重，因此这里统一使用无序输出，
@@ -638,8 +711,28 @@ func newRequiredFinder(literals []hwlm.Literal) func([]byte, []requiredHit) []re
 		return newLiteralMatcherFinder(literals)
 	}
 	finders := make([]func([]byte, []requiredHit) []requiredHit, 0, 4)
-	if len(long) > 0 {
-		finders = append(finders, newLiteralMatcherFinder(long))
+	// 长组与忽略大小写组先用统一的两字节前缀表尝试：集合足够窄时它用一次宽窗口
+	// 扫描覆盖两组，逐候选只做两三次小表查值，比 Teddy 的首字节分桶逐条确认
+	// （每次触发复制 40 字节 Literal 并调用 hwlm.ContainsAt）便宜得多；集合过宽
+	// 或同一前缀下文字过多时返回 nil，退回原有的分组通用匹配器。
+	flat, flatLeftover := makeFlatFinder(long, caseless)
+	if flat != nil {
+		finders = append(finders, flat)
+		if len(flatLeftover) > 0 {
+			// 统一匹配器只覆盖长度不小于 2 的文字，忽略大小写的单字节文字
+			// 仍要交给维护折叠自动机的通用后端。
+			finders = append(finders, newLiteralMatcherFinder(flatLeftover))
+		}
+	} else {
+		if len(long) > 0 {
+			finders = append(finders, newLiteralMatcherFinder(long))
+		}
+		if len(caseless) > 0 {
+			// 忽略大小写的候选必须交给按 ASCII 折叠建表的通用后端：扁平索引与
+			// 专用精确匹配器都按精确字节建表，只有 Teddy/FDR 这类维护折叠自动机
+			// 的后端才能正确处理，不能与前三类混排。
+			finders = append(finders, newLiteralMatcherFinder(caseless))
+		}
 	}
 	if len(medium) > 0 {
 		// 2~3 字节的定长文字走专用两级查表，避免通用自动机的逐候选转移与
@@ -652,12 +745,6 @@ func newRequiredFinder(literals []hwlm.Literal) func([]byte, []requiredHit) []re
 	}
 	if len(single) > 0 {
 		finders = append(finders, newSingleByteFinder(single))
-	}
-	if len(caseless) > 0 {
-		// 忽略大小写的候选必须交给按 ASCII 折叠建表的通用后端：专用匹配器是
-		// 按精确字节建表的，直接放进去会静默漏掉大小写变体。Teddy 与 FDR 都会
-		// 同时维护折叠前后的自动机，hwlm.Select 也不会为这类文字选择扁平索引。
-		finders = append(finders, newLiteralMatcherFinder(caseless))
 	}
 	switch len(finders) {
 	case 0:
@@ -1457,6 +1544,8 @@ func (scanner *Scanner) scanInto(data []byte, matches []Match) ([]Match, error) 
 		} else {
 			ctx.requiredStarts = nil
 		}
+		// 补登队列长度有界于规则数，保留容量即可，无需上限判断。
+		ctx.retryStarts = ctx.retryStarts[:0]
 		// 线性排序缓冲按下标复用，超限时释放，避免长期占住大块内存。
 		resetRequiredSortBuffer(&ctx.requiredSortScratch)
 		resetRequiredSortBuffer(&ctx.requiredStartCounts)
@@ -1716,6 +1805,11 @@ func (scanner *Scanner) buildConfirmRuleLists() {
 		scanner.confirmAllRules = append(scanner.confirmAllRules, ri)
 		if scanner.guardRunCovers(ri) {
 			if run, ok := guardRunFor(ri, &scanner.rules[ri]); ok {
+				// 组合规则的触发位置按「每条规则的全部命中」累计，收敛候选会
+				// 改变触发集合，因此只在没有组合依赖时启用（见 guardRunRepeat）。
+				if scanner.hasCombo {
+					run.leftmostOnly, run.stride = false, 0
+				}
 				runs = append(runs, run)
 			}
 			continue
@@ -1733,10 +1827,29 @@ func (scanner *Scanner) buildConfirmRuleLists() {
 // 选中条件是该约束窗口比候选文字索引更省：无法进入必须文字索引的规则一律
 // 改用约束枚举；可以进入但候选文字只有一两个字节时，其在混合字母数字语料上
 // 的命中密度远高于同长度的集合窗口，同样改用约束枚举。
-func guardRunCandidates(rules []compiledRule) []bool {
+func guardRunCandidates(rules []compiledRule, nativeWideMask bool) []bool {
 	var promoted []bool
 	for ruleIndex := range rules {
-		if _, ok := guardRunFor(ruleIndex, &rules[ruleIndex]); !ok {
+		run, ok := guardRunFor(ruleIndex, &rules[ruleIndex])
+		if !ok {
+			continue
+		}
+		// 集合自重复（见 guardRunRepeat）的候选枚举与逐起点确认等价，且比候选
+		// 文字索引更省：文字索引按「候选文字出现的每个位置」登记，自重复则按
+		// 连续段与重复上界收敛，还能让候选文字本身退化成一次集合掩码扫描。
+		// 该判据与最短窗口、集合规模都无关，因此不再经过 guardRunOutshinesLiteral。
+		if run.leftmostOnly || run.stride > 0 {
+			// 有上界自重复在标量宽掩码后端上不划算：它要用一次全语料集合扫描换掉
+			// 候选文字索引，而标量扫描比候选文字的 memchr 慢，净效果是负的
+			// （实测 generic 后端 554.5 → 572.2 µs）。无上界自重复本来就没有候选
+			// 文字索引可放弃，不受该判据影响。
+			if run.stride > 0 && !nativeWideMask {
+				continue
+			}
+			if promoted == nil {
+				promoted = make([]bool, len(rules))
+			}
+			promoted[ruleIndex] = true
 			continue
 		}
 		if !guardRunOutshinesLiteral(rules[ruleIndex]) {
@@ -1784,7 +1897,13 @@ func guardRunFor(ruleIndex int, rule *compiledRule) (guardRun, bool) {
 		return guardRun{}, false
 	}
 	set, offset, length, ok := rule.guard.longestEqualWindow()
-	if !ok || length < guardRunMinLength {
+	if !ok {
+		return guardRun{}, false
+	}
+	// 集合自重复（见 guardRunRepeat）不受最短窗口长度限制：它的候选枚举已经与
+	// 逐起点确认等价，窗口只有 2 个字节也值得用一次掩码扫描换掉候选文字索引。
+	leftmost, stride, selfRepeat := guardRunRepeat(rule)
+	if length < guardRunMinLength && !selfRepeat {
 		return guardRun{}, false
 	}
 	return guardRun{
@@ -1794,7 +1913,189 @@ func guardRunFor(ruleIndex int, rule *compiledRule) (guardRun, bool) {
 		length:        length,
 		guard:         rule.guard,
 		prefixCovered: offset == 0 && length == len(rule.guard.sets),
+		leftmostOnly:  leftmost,
+		stride:        stride,
 	}, true
+}
+
+// guardRunRepeat 判断规则是否恰好是「约束集合的重复」，并给出候选收敛模式。
+//
+// 判据全部来自语法树与编译期固化的约束，不含运行期假设：
+//   - 整条规则就是一个 Repeat{Class 或单字节 Literal, Min≥1, Greedy}，没有锚点、
+//     组合、扩展参数、忽略大小写与 Unicode 语义；
+//   - 约束集合与窗口逐字节一致，窗口从偏移 0 开始并覆盖约束的全部位置
+//     （即 prefixCovered），所以段首起点必然满足前缀、必然命中；
+//   - 没有 \b 折算出的相邻字节约束，否则段首起点仍可能被相邻字节拒绝；
+//   - 调用方还需排除组合依赖（触发位置按全部命中累计）。
+//
+// 成立时按重复上界给出两种候选收敛方式：
+//   - 上界为 -1（无上界贪婪，leftmost）：段首起点的贪婪匹配消费到段尾，同一条
+//     连续段内更靠右的起点都落在同一规则的 blockedUntil 之内，逐起点确认原本
+//     也只是「枚举 + 排序 + 跳过」，因此只需登记段首起点。实测把
+//     `[[:alpha:]]{5,}` 在 64 KiB 固定语料上的候选起点从 14,024 压到 3,341。
+//   - 上界为 M（有上界贪婪，stride=M）：段首起点命中后消费 min(M, 剩余段长) 个
+//     字节并把 blockedUntil 推到该位置，所以段内被报告的起点恰好是
+//     「段首 + k*M」且不超过 段尾-下限；按 M 为步长登记与整段逐起点登记得到
+//     的命中集合逐位相同。实测把 `x{2,4}` 的候选从 2,338 压到 668，并顺带
+//     让候选文字索引整个消失（一次全语料单字节 memchr 换成一次集合掩码扫描）。
+func guardRunRepeat(rule *compiledRule) (leftmost bool, stride int, ok bool) {
+	if rule.nonGreedy || rule.comb != nil || rule.ext != nil || rule.root == nil {
+		return false, 0, false
+	}
+	// 忽略大小写必须同时排除编译参数与 scoped flags（`(?i)x{2,4}`）：折叠语义下
+	// 重复集合会变宽，约束集合与重复集合的逐字节相等判据不再成立。
+	if rule.flags&(CompileCaseless|CompileUTF8|CompileUCP|CompileQuiet) != 0 ||
+		parser.HasScopedFlags(rule.root) || ruleCaseless(*rule) {
+		return false, 0, false
+	}
+	if rule.guard == nil || len(rule.guard.sets) == 0 || rule.guard.hasBoundary() {
+		return false, 0, false
+	}
+	repeat, ok := unwrapGroups(rule.root).(parser.Repeat)
+	if !ok || repeat.Min < 1 || !repeat.Greedy {
+		return false, 0, false
+	}
+	// 重复体可以是字符类，也可以是单字节字面量（`x{2,4}` 的语法树保留为
+	// Literal，不会归一化成 Class），两者都折算成同一个字节集合比较。
+	var set [4]uint64
+	switch child := unwrapGroups(repeat.Child).(type) {
+	case parser.Class:
+		set = classByteSet(child)
+	case parser.Literal:
+		if len(child.Value) != 1 {
+			return false, 0, false
+		}
+		set[child.Value[0]>>6] |= uint64(1) << (child.Value[0] & 63)
+	default:
+		return false, 0, false
+	}
+	if set == [4]uint64{} || repeat.Min != len(rule.guard.sets) {
+		return false, 0, false
+	}
+	for index := range rule.guard.sets {
+		if rule.guard.sets[index] != set {
+			return false, 0, false
+		}
+	}
+	_, offset, length, ok := rule.guard.longestEqualWindow()
+	if !ok || offset != 0 || length != len(rule.guard.sets) {
+		return false, 0, false
+	}
+	if repeat.Max < 0 {
+		// 无上界贪婪：收敛到段首。窗口短于 guardRunMinLength 时省略整段展开
+		// 本来就不划算，保持既有阈值。
+		if length < guardRunMinLength {
+			return false, 0, false
+		}
+		return true, 0, true
+	}
+	// 有上界贪婪：下界至少 2 个字节时按上界步长收敛。下界为 1 的规则在每个
+	// 成员字节上都成立，收敛不会减少候选，只保留候选文字索引更稳。
+	if repeat.Min < 2 || repeat.Max < int(repeat.Min) {
+		return false, 0, false
+	}
+	return false, int(repeat.Max), true
+}
+
+// denseRunHead 判断规则是否以「单个字节集合的无上界贪婪重复」`S+` 开头，且该
+// 集合恰好等于规则首字节约束。返回空集合表示判据不成立。
+//
+// 解析器对 `[a-z]+@[a-z]+\.example` 这类前缀只推导出一段首字节约束：无上界重复
+// 之后的字节位置不再确定，因此 guard.sets 恰为这一段。判据成立时，同一条连续段
+// 上的任意起点都会让该重复贪婪消费到同一个段尾，后继程序从同一位置求值，命中
+// 终点与整个求值结果都与起点无关。
+//
+// 「段内共享结果」只说明段内更靠右的起点冗余，并不说明它们必然被重叠抑制挡住：
+// 前一次命中的结束位置可能落在段内（`[a-z]+\.x` 在 `x.xb.a.x` 上的第二次命中
+// 起点就落在段内），此时水位线之后的段内起点仍必须确认。因此段首过滤只登记段首
+// 起点，水位线处由 retryCollapsedCandidate 在确认阶段补齐。
+//
+// 为保证共享结果成立，除重复本身还要求：
+//   - 下界恰为 1（`+`）且无上界、贪婪：下界更大时段尾附近不足下界的起点会单独
+//     失败，共享结果不再成立；
+//   - 重复之后紧跟的消费字节不在该集合内：贪婪消费到段尾后回溯必然失败（回退
+//     位置仍属于集合），后继求值位置因此固定为段尾；
+//   - 重复之后紧跟的必须是一个消费单字节的字面量或字符类，断言、分组、可选重复
+//     都会让后继求值依赖起点；
+//   - 无尾随 `\b` 折算出的相邻字节约束、无可变宽度的后继重复、无回溯引用与条件
+//     分支、无组合与扩展参数、无忽略大小写与 Unicode 语义。
+func denseRunHead(rule *compiledRule) [4]uint64 {
+	var empty [4]uint64
+	if rule.guard == nil || len(rule.guard.sets) != 1 || rule.guard.hasBoundary() {
+		return empty
+	}
+	if rule.nonGreedy || rule.comb != nil || rule.ext != nil || rule.root == nil ||
+		rule.hasBackref || rule.hasConditional {
+		return empty
+	}
+	if rule.flags&(CompileCaseless|CompileUTF8|CompileUCP|CompileQuiet) != 0 ||
+		parser.HasScopedFlags(rule.root) || ruleCaseless(*rule) {
+		return empty
+	}
+	sequence, ok := unwrapGroups(rule.root).(parser.Sequence)
+	if !ok || len(sequence.Elements) < 2 {
+		return empty
+	}
+	repeat, ok := unwrapGroups(sequence.Elements[0]).(parser.Repeat)
+	if !ok || repeat.Min != 1 || repeat.Max >= 0 || !repeat.Greedy {
+		return empty
+	}
+	set, ok := singleByteNodeSet(repeat.Child)
+	if !ok || set == empty || set != rule.guard.sets[0] {
+		return empty
+	}
+	next, ok := firstByteNodeSet(sequence.Elements[1])
+	if !ok || next == empty || !byteSetDisjoint(next, set) {
+		return empty
+	}
+	return set
+}
+
+// firstByteNodeSet 返回节点必然消费的第一个字节的取值集合；节点可能不消费字节或
+// 首字节位置不确定时返回 false。后继字面量被归一化合并成多字节（`\.x` 合并为
+// `.x`）时只取首字节：回溯必然在属于重复集合的位置上匹配它，首字节不在集合内
+// 就足以排除回溯。
+func firstByteNodeSet(node parser.Node) ([4]uint64, bool) {
+	switch value := unwrapGroups(node).(type) {
+	case parser.Class:
+		return classByteSet(value), true
+	case parser.Literal:
+		if len(value.Value) == 0 {
+			return [4]uint64{}, false
+		}
+		return singleByteSet(value.Value[0]), true
+	}
+	return [4]uint64{}, false
+}
+
+// singleByteNodeSet 返回节点恰好消费一个字节时的字节集合；节点不是单字节消费时
+// 返回 false。重复体必须恰好一个字节：多字节字面量重复的连续段判定是另一套形态。
+func singleByteNodeSet(node parser.Node) ([4]uint64, bool) {
+	if value, ok := unwrapGroups(node).(parser.Literal); ok && len(value.Value) != 1 {
+		return [4]uint64{}, false
+	}
+	return firstByteNodeSet(node)
+}
+
+// byteSetDisjoint 判断两个字节集合是否没有交集。
+func byteSetDisjoint(left, right [4]uint64) bool {
+	for index := range left {
+		if left[index]&right[index] != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// unwrapGroups 剥掉语法树外层不影响语义的分组节点。
+func unwrapGroups(node parser.Node) parser.Node {
+	for {
+		group, ok := node.(parser.Group)
+		if !ok {
+			return node
+		}
+		node = group.Child
+	}
 }
 
 // groupGuardRuns 按字节集合合并约束，使同集合的规则共享一次线性扫描。
@@ -1854,6 +2155,21 @@ func guardImpliedByBack(guard *prefixGuard, back []byte, minOffset int) bool {
 			member = 1
 		}
 		if member != back[value] {
+			return false
+		}
+	}
+	return true
+}
+
+// backSetContains 判断回退字节集合是否覆盖给定的字节集合。回退集合非空时窗口
+// 左侧最多收缩到命中位置左侧第一个不属于回退集合的字节之后，因此只有覆盖重复
+// 集合才能保证窗口下界不落在连续段内部。
+func backSetContains(back []byte, set [4]uint64) bool {
+	if back == nil {
+		return true
+	}
+	for value := range 256 {
+		if set[value>>6]&(uint64(1)<<(uint(value)&63)) != 0 && back[value] != 1 {
 			return false
 		}
 	}
@@ -2065,6 +2381,11 @@ func (st *blockScanState) confirmEnd(ri int, start int) (int, bool) {
 	// 入口文字之后的指令开始求值。这条捷径比确定性表更省：解释器整段跳过前缀，
 	// 而表必须从候选起点逐字节重新走一遍，所以该捷径可用时优先保留解释器。
 	if rule.confirmSkip > 0 && st.requiredStartDriven && st.scanner.literalIndexCovered(ri) {
+		// 入口之后立刻命中（纯文字规则）：候选索引已经证明起点处的入口文字成立，
+		// 结束偏移恒为 start+confirmSkip，连解释器调用都可以省掉。
+		if rule.confirmEntry == confirmExactEntry {
+			return start + rule.confirmSkip, true
+		}
 		return rule.confirm.run(st.data, rule.confirmEntry, start+rule.confirmSkip, rule.flags, st.ctx.confirmFrames())
 	}
 	// 断言敏感确认表把单次确认压缩成每字节一次表查找，命中密集时远快于
@@ -2271,12 +2592,21 @@ func (scanner *Scanner) requiredScanStarts(ctx *scanContext, data []byte) ([]uin
 			// 窗口较宽时同一次文字命中要摊开成多个起点，其中绝大多数连规则
 			// 前缀都过不了；先做一次约束查表，避免为它们建立候选并启动确认程序。
 			guard := entry.guard
+			runHead := entry.runHead
 			for start := from; start <= to; start++ {
 				if len(starts) >= limit {
 					return nil, false
 				}
 				if !guard.allows(data, start) {
 					continue
+				}
+				// 规则以无上界贪婪重复开头时，同一连续段内更靠右的起点与段首
+				// 共享确认结果（见 denseRunHead），只会被段首命中的重叠抑制挡住。
+				if runHead != ([4]uint64{}) && start > 0 {
+					prev := data[start-1]
+					if runHead[prev>>6]&(uint64(1)<<(prev&63)) != 0 {
+						continue
+					}
 				}
 				starts = append(starts, uint64(uint32(start))<<32|ruleKey)
 			}
@@ -2378,6 +2708,38 @@ func (emitter *guardRunEmitter) emitRun(run *guardRun, from, to int) {
 	last := to - run.length - run.offset
 	count := last - first + 1
 	if count <= 0 {
+		return
+	}
+	if run.leftmostOnly {
+		// 段首起点必命中且贪婪重复消费到段尾（见 guardRunRepeat），段内其它
+		// 起点都落在同一条规则的 blockedUntil 内，登记它们只会付出排序与
+		// 候选循环的固定开销。
+		if len(emitter.starts) >= emitter.limit {
+			emitter.overflow = true
+			return
+		}
+		emitter.starts = append(emitter.starts, requiredStartKey(first, run.ruleIndex))
+		return
+	}
+	if run.stride > 0 {
+		// 有上界贪婪重复：段内被报告的起点只可能是「段首 + k*上界」（见
+		// guardRunRepeat），按步长展开与整段展开得到同一批命中。
+		count = (last-first)/run.stride + 1
+		if len(emitter.starts)+count > emitter.limit {
+			emitter.overflow = true
+			return
+		}
+		starts := emitter.starts
+		if cap(starts)-len(starts) < count {
+			starts = slices.Grow(starts, count)
+		}
+		base := len(starts)
+		starts = starts[:base+count]
+		ruleKey := uint64(uint32(run.ruleIndex))
+		for index := range count {
+			starts[base+index] = uint64(uint32(first+index*run.stride))<<32 | ruleKey
+		}
+		emitter.starts = starts
 		return
 	}
 	if run.needsGuardFilter() {
@@ -2580,7 +2942,21 @@ func (group *guardRunGroup) appendStartsScalar(data []byte, starts []uint64, lim
 		for _, run := range group.runs {
 			first := max(runStart-run.offset, 0)
 			last := index - run.length - run.offset
-			for start := first; start <= last; start++ {
+			if first > last {
+				continue
+			}
+			if run.leftmostOnly {
+				if len(starts) >= limit {
+					return nil, false
+				}
+				starts = append(starts, requiredStartKey(first, run.ruleIndex))
+				continue
+			}
+			step := 1
+			if run.stride > 0 {
+				step = run.stride
+			}
+			for start := first; start <= last; start += step {
 				if len(starts) >= limit {
 					return nil, false
 				}

@@ -39,6 +39,28 @@ type Backend interface {
 	AnyLess(Vector, Vector) bool
 }
 
+// WideMaskProbe 由具备原生 64 字节宽窗口掩码内核的后端实现。未实现该接口的
+// 后端一律按标量参考实现处理（见 HasNativeWideMask）。
+type WideMaskProbe interface {
+	// NativeWideMask 返回 WindowMask64 是否由原生内核完成。取值只反映"是否存在
+	// 原生内核"，不反映运行时自检结果：自检失败时后端内部会自行退回标量实现，
+	// 判定因此只可能偏保守。
+	NativeWideMask() bool
+}
+
+// HasNativeWideMask 判断后端是否具备原生宽窗口掩码内核。
+//
+// GenericBackend 的 WindowMask64 逐字节查表，64 字节窗口需要 64 次集合判定；
+// 实测在 64 KiB 语料上比单字节 memchr 慢约 2.5 倍，而原生内核快约 3 倍。约束枚举
+// （guardRun）只有在原生内核可用时才值得取代候选文字索引，调用方据此选择候选来源。
+func HasNativeWideMask(backend Backend) bool {
+	if backend == nil {
+		return false
+	}
+	probe, ok := backend.(WideMaskProbe)
+	return ok && probe.NativeWideMask()
+}
+
 // GenericBackend 是纯 Go 标量参考实现，可在任意平台编译。
 type GenericBackend struct{}
 

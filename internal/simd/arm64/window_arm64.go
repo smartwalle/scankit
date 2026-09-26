@@ -4,6 +4,9 @@ package arm64
 
 import "github.com/smartwalle/scankit/internal/simd"
 
+// NativeWideMask 在 NEON 生效时报告原生宽窗口内核可用。
+func (b Backend) NativeWideMask() bool { return b.resolved >= TierNEON }
+
 // WindowMask 使用 NEON 半字节查表在 32 字节窗口内生成候选起点掩码。
 //
 // 每个 lane 只需一次原生调用即可覆盖整个窗口，并在同一次调用内把两个 128 位半区的

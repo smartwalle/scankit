@@ -117,6 +117,82 @@ var SyntaxCases = []SyntaxCase{
 	{"quantifier_lazy_range", `a{2,3}?x`, 0, "baaax", []scankit.Match{{Id: 1, From: 1, To: 5}}},
 	{"quantifier_possessive_plus", `a++z`, 0, "aaaz", []scankit.Match{{Id: 1, From: 0, To: 4}}},
 
+	// 前缀字节约束枚举（guardRun）在「整条规则就是约束集合的无上界贪婪重复」时
+	// 只登记连续段首起点；以下用例锁定该收敛的语义边界。
+	// 一条连续段只产出一个最左命中：贪婪重复消费到段尾，段内其它起点都被重叠抑制。
+	{"guard_run_unbounded_repeat_single_run", `[[:alpha:]]{5,}`, 0, "abcdefghij",
+		[]scankit.Match{{Id: 1, From: 0, To: 10}}},
+	// 多条连续段各自产出一个命中，非连续段不产出。
+	{"guard_run_unbounded_repeat_multi_run", `[[:alpha:]]{5,}`, 0, "abcdefg12hijklmn",
+		[]scankit.Match{{Id: 1, From: 0, To: 7}, {Id: 1, From: 9, To: 16}}},
+	// 收敛判据必须排除「窗口不在规则起点」：这里合法起点是 1 而不是数字段起点之前的 0，
+	// 只登记窗口对应的最左起点会漏报。
+	{"guard_run_offset_prefix_keeps_later_start", `[0ab][[:digit:]]{8,}`, 0, "c0123456789",
+		[]scankit.Match{{Id: 1, From: 1, To: 11}}},
+	// 尾约束不影响段首起点：贪婪重复仍然消费到段尾，各起点的尾约束位置相同。
+	{"guard_run_unbounded_repeat_trailing_class", `[[:alpha:]]{5,}[0-9]`, 0, "abcdefgh1",
+		[]scankit.Match{{Id: 1, From: 0, To: 9}}},
+	// 收敛只适用于无上界重复：有上界时同一条连续段会被切成多个命中，不能只登记段首。
+	{"guard_run_bounded_repeat_keeps_all_starts", `[[:alpha:]]{2,4}`, 0, "aaaaaa",
+		[]scankit.Match{{Id: 1, From: 0, To: 4}, {Id: 1, From: 4, To: 6}}},
+
+	// 入口是「集合重复 + 接受」时确认求值直接由连续段求出（见 §51）：
+	// 贪婪取最大消费长度、非贪婪取最小消费长度、长度不足下限则不命中。
+	{"set_repeat_accept_greedy_bounded", `x{2,4}`, 0, "axxxxb",
+		[]scankit.Match{{Id: 1, From: 1, To: 5}}},
+	{"set_repeat_accept_truncated_at_end", `x{2,4}`, 0, "xx",
+		[]scankit.Match{{Id: 1, From: 0, To: 2}}},
+	{"set_repeat_accept_below_minimum", `x{2,4}`, 0, "axb",
+		nil},
+	{"set_repeat_accept_lazy_bounded", `x{2,4}?`, 0, "xxxx",
+		[]scankit.Match{{Id: 1, From: 0, To: 2}, {Id: 1, From: 2, To: 4}}},
+	{"set_repeat_accept_unbounded", `[[:alpha:]]{5,}`, 0, "ab12cdefgh",
+		[]scankit.Match{{Id: 1, From: 4, To: 10}}},
+	{"set_repeat_accept_caseless", `(?i)x{2,4}`, 0, "xXxx",
+		[]scankit.Match{{Id: 1, From: 0, To: 4}}},
+
+	// 有上界自重复按重复上界收敛候选起点（见 §52）：段内被报告的起点恰好是
+	// 「段首 + k*上界」且不超过 段尾-下限，与整段逐起点确认的结果逐位相同。
+	{"set_repeat_bounded_stride_long_run", `x{2,4}`, 0, "a" + strings.Repeat("x", 10) + "b",
+		[]scankit.Match{{Id: 1, From: 1, To: 5}, {Id: 1, From: 5, To: 9}, {Id: 1, From: 9, To: 11}}},
+	{"set_repeat_bounded_stride_class_long_run", `\d{2,4}`, 0, "a" + strings.Repeat("7", 9) + "b",
+		[]scankit.Match{{Id: 1, From: 1, To: 5}, {Id: 1, From: 5, To: 9}}},
+	{"set_repeat_bounded_stride_shorter_than_max", `x{3,5}`, 0, "axxxb",
+		[]scankit.Match{{Id: 1, From: 1, To: 4}}},
+
+	// 首字节约束是「集合的无上界贪婪重复」时窗口只登记连续段首起点（见 §53）：
+	// 段内更靠右的起点与前一次命中的结束位置重合时必须补齐，否则会漏报。
+	{"dense_run_head_email", `[a-z]+@[a-z]+\.example`, 0, "user@host.example",
+		[]scankit.Match{{Id: 1, From: 0, To: 17}}},
+	{"dense_run_head_match_ends_inside_run", `[a-z]+\.x`, 0, "x.xb.x",
+		[]scankit.Match{{Id: 1, From: 0, To: 3}, {Id: 1, From: 3, To: 6}}},
+	{"dense_run_head_second_run_head_rejected", `[a-z]+\.x`, 0, "x.xb.a.x",
+		[]scankit.Match{{Id: 1, From: 0, To: 3}, {Id: 1, From: 5, To: 8}}},
+	{"dense_run_head_adjacent_run", `[a-z]+@[a-z]+\.example`, 0, "a@b.examplecd@f.example",
+		[]scankit.Match{{Id: 1, From: 0, To: 11}, {Id: 1, From: 11, To: 23}}},
+	{"dense_run_head_suffix_class", `[a-z]+[0-9]`, 0, "ab12",
+		[]scankit.Match{{Id: 1, From: 0, To: 3}}},
+	// 重复之后的消费字节仍属于重复集合时不能收敛：回溯可能在同一连续段内部
+	// 命中，段内起点不再共享同一个结束偏移。
+	{"dense_run_head_backtrack_inside_run", `[a-z]+x`, 0, "aax",
+		[]scankit.Match{{Id: 1, From: 0, To: 3}}},
+	{"dense_run_head_backtrack_prefers_run_end", `[a-z]+x`, 0, "axb",
+		[]scankit.Match{{Id: 1, From: 0, To: 2}}},
+
+	// 入口是一组等长文字分支时确认程序会跳过入口比较；交替命中仍按左最左、
+	// 每个起点取最长分支报告（见 §50）。
+	{"alternation_literal_variants", `ab|cd`, 0, "xabzcdy",
+		[]scankit.Match{{Id: 1, From: 1, To: 3}, {Id: 1, From: 4, To: 6}}},
+	{"alternation_literal_variants_with_suffix", `(?:ab|cd)ef`, 0, "zabefy",
+		[]scankit.Match{{Id: 1, From: 1, To: 5}}},
+	{"alternation_literal_variants_three", `ab|cd|ef`, 0, "zefab",
+		[]scankit.Match{{Id: 1, From: 1, To: 3}, {Id: 1, From: 3, To: 5}}},
+	{"alternation_literal_variants_caseless", `(?i)ab|cd`, 0, "xABycd",
+		[]scankit.Match{{Id: 1, From: 1, To: 3}, {Id: 1, From: 4, To: 6}}},
+	// 分支长度不一致时必须退回顾有确认路径：`abc|abcd` 在起点 0 取最长分支。
+	{"alternation_unequal_variant_lengths", `abc|abcd`, 0, "zabcdy",
+		[]scankit.Match{{Id: 1, From: 1, To: 5}}},
+
 	// 分组
 	{"group_capture", `(ab)+x`, 0, "ababx", []scankit.Match{{Id: 1, From: 0, To: 5}}},
 	{"group_non_capture", `(?:ab)+x`, 0, "ababx", []scankit.Match{{Id: 1, From: 0, To: 5}}},
@@ -189,6 +265,50 @@ func TestSyntaxCoverage(t *testing.T) {
 		}
 		if !matchEqual(got, c.Want) {
 			t.Errorf("[FAIL] %s: got %v want %v", c.Name, got, c.Want)
+		}
+	}
+}
+
+// TestBoundedSelfRepeatStrideMatchesReference 验证「有上界自重复」的候选收敛
+// （见 §52：段内只登记「段首 + k*上界」）在长连续段、跨 64 字节宽窗口的连续段、
+// 尾部截断与最小长度边界上与参考实现逐位一致，并且在标量宽窗口后端
+// （不同候选来源）与原生后端上给出同一结果。
+func TestBoundedSelfRepeatStrideMatchesReference(t *testing.T) {
+	// 只取下限小于上限的形态：定长重复（`x{2,2}`）在 scankit 中被解析成精确
+	// 文字并按「出现即命中」报告重叠命中，与参考实现的非重叠语义本就不同。
+	patterns := []string{
+		`x{2,4}`, `x{3,5}`, `x{2,8}`,
+		`\d{2,4}`, `\d{3,6}`, `[a-z]{2,5}`, `[[:alpha:]]{4,6}`, `[0-9a-f]{2,7}`,
+	}
+	inputs := []string{
+		"",
+		"x",
+		"xx",
+		"xxx",
+		strings.Repeat("x", 200),
+		"a" + strings.Repeat("x", 137) + "b",
+		strings.Repeat("x", 63) + "ax" + strings.Repeat("x", 63),
+		strings.Repeat("7", 129),
+		"ab" + strings.Repeat("Z7", 70),
+		strings.Repeat("ab", 100),
+		strings.Repeat("abc123", 40),
+		strings.Repeat("\n", 40),
+	}
+	backends := backendMatrixEntries()
+	for _, pattern := range patterns {
+		re := regexp.MustCompile(pattern)
+		for index, input := range inputs {
+			want := re.FindAllStringIndex(input, -1)
+			var reference []scankit.Match
+			for _, span := range want {
+				reference = append(reference, scankit.Match{Id: 1, From: uint64(span[0]), To: uint64(span[1])})
+			}
+			for _, backend := range backends {
+				got := scanWithBackend(t, backend.backend, []scankit.Expression{{Id: 1, Pattern: pattern}}, []byte(input))
+				if !matchEqual(got, reference) {
+					t.Fatalf("%q input=%d backend=%s: got %v want %v", pattern, index, backend.name, got, reference)
+				}
+			}
 		}
 	}
 }
@@ -1313,4 +1433,72 @@ func TestEmailLiteralCollapseMatchesRegexp(t *testing.T) {
 		t.Fatal("随机语料没有产出任何命中，未能覆盖命中路径")
 	}
 	t.Logf("随机语料累计命中=%d", hits)
+}
+
+// TestDenseRunHeadMatchesRegexp 用随机语料对「首字节约束是无上界贪婪重复」的
+// 段首收敛路径（见 §53）做差分验证：候选窗口只登记连续段首起点，段内被重叠抑制
+// 水位线切断的起点必须在确认阶段补登记（retryCollapsedCandidate）。语料刻意让
+// 前一次命中结束在连续段内部，覆盖水位线落在段中的形态。
+func TestDenseRunHeadMatchesRegexp(t *testing.T) {
+	patterns := []string{
+		`[a-z]+\.x`,
+		`[a-z]+@[a-z]+\.example`,
+		`[a-z]+@`,
+		`[a-z]+[0-9]`,
+		`[a-z]+x`,
+		`[a-z]+xy`,
+		`[a-z]+?x`,
+		`(?i)[a-z]+x`,
+		`[a-z]+x\b`,
+		`[[:alpha:]]+\.x`,
+		`[^a]+\.x`,
+	}
+	alphabets := []string{"abx@.", "abx@.AB", "abcxyz@.", "ab@.", "abcXYZ019@. \t", "aaaa"}
+	rng := rand.New(rand.NewPCG(53, 59))
+	pick := func(alphabet string, limit int) string {
+		length := rng.IntN(limit)
+		buf := make([]byte, length)
+		for index := range buf {
+			buf[index] = alphabet[rng.IntN(len(alphabet))]
+		}
+		return string(buf)
+	}
+	fixed := []string{
+		"", "a", "x", "x.x", "x.xb.x", "aa.x", "a.xb.x", "user@host.example",
+		"x@y@z.example", "a@b.examplecd@f.example",
+		"bbb@xx@abx@bxaaab@@@b@b@.@.a@aa.@.@@@@aba@@..aaab.@@@.@@xab@b@.@@x.xba.xxbb@xba@a@b@b",
+		"user@host.example",
+		strings.Repeat("a", 70) + ".x" + strings.Repeat("b", 70) + ".x",
+		strings.Repeat("x@y@z.example ", 20),
+	}
+	for _, pattern := range patterns {
+		scanner, err := scankit.Compile([]scankit.Expression{{Id: 1, Pattern: pattern}})
+		if err != nil {
+			t.Fatalf("%q: compile: %v", pattern, err)
+		}
+		reference := regexp.MustCompile(pattern)
+		inputs := append([]string(nil), fixed...)
+		for range 600 {
+			inputs = append(inputs, pick(alphabets[rng.IntN(len(alphabets))], 48))
+		}
+		hits := 0
+		for _, input := range inputs {
+			data := []byte(input)
+			want := make([]scankit.Match, 0)
+			for _, index := range reference.FindAllIndex(data, -1) {
+				want = append(want, scankit.Match{Id: 1, From: uint64(index[0]), To: uint64(index[1])})
+			}
+			got, err := scanner.Scan(data)
+			if err != nil {
+				t.Fatalf("%q %q: scan: %v", pattern, input, err)
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("%q 在 %q 上命中不一致:\n got=%v\nwant=%v", pattern, input, got, want)
+			}
+			hits += len(want)
+		}
+		if hits == 0 {
+			t.Fatalf("%q: 语料没有产出任何命中，未能覆盖命中路径", pattern)
+		}
+	}
 }

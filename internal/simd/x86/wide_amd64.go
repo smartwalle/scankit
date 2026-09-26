@@ -69,6 +69,10 @@ func verifyWideKernel(kernel func([]byte, *[32]byte) uint64) bool {
 	return true
 }
 
+// NativeWideMask 在 SSE4 及以上层级报告原生宽窗口内核可用：AVX512 走 512 位内核，
+// AVX2 与 SSE4 用两个已验证的 32 字节内核拼出等价结果，都在原生指令内完成。
+func (b Backend) NativeWideMask() bool { return b.resolved >= TierSSE4 }
+
 // WindowMask64 使用半字节查表在 64 字节宽窗口内生成候选起点掩码。
 //
 // AVX512BW/VBMI 能力下由 512 位寄存器一次判定整个窗口，并经一次性自检确认内核与

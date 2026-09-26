@@ -146,18 +146,44 @@ func (st *blockScanState) confirmIndexed(index *startByteIndex) {
 // confirmCandidatesAndFallback 交错执行候选起点确认与首字节过滤后的逐起点确认。
 // starts 已按 (起点, 规则下标) 升序，索引内规则也按规则下标升序，两者合并后
 // 输出顺序与纯逐起点确认一致。
+//
+// 收敛窗口（折叠窗口、段首窗口）只登记了部分起点，被重叠抑制时会派生出推迟到
+// blockedUntil 的补登候选。补登候选放在独立的小队列里按 (起点, 规则) 升序归并，
+// 而不是插回 starts：starts 长度可达数万，每次插入都要搬移整段尾部，实测让
+// 64 KiB 固定语料多付出 45% 的耗时。
 func (st *blockScanState) confirmCandidatesAndFallback(starts []uint64, index *startByteIndex) {
+	// retries[head:] 保存推迟到水位线的补登候选，按 (起点, 规则) 升序排列；
+	// 每条规则至多有一个待处理项，长度有界于规则数。用读取下标而不是切片前移，
+	// 避免消费后容量归零导致每次补登都重新分配。
+	retries := st.ctx.retryStarts[:0]
+	head := 0
+	defer func() { st.ctx.retryStarts = retries }()
+	queue := func(next uint64) {
+		position := head + sort.Search(len(retries)-head, func(index int) bool { return retries[head+index] >= next })
+		if position < len(retries) && retries[position] == next {
+			return
+		}
+		retries = append(retries, 0)
+		copy(retries[position+1:], retries[position:])
+		retries[position] = next
+	}
 	if index == nil {
 		// 候选已按 (起点, 规则) 升序。被重叠抑制或已终止的规则在这里直接
 		// 跳过，避免为必然返回的候选进入通用确认例程。
 		simple := st.scanner.simpleReports
-		for cursor := 0; cursor < len(starts); cursor++ {
-			key := starts[cursor]
+		cursor := 0
+		for cursor < len(starts) || head < len(retries) {
+			key := uint64(0)
+			if head < len(retries) && (cursor >= len(starts) || retries[head] <= starts[cursor]) {
+				key, head = retries[head], head+1
+			} else {
+				key, cursor = starts[cursor], cursor+1
+			}
 			start := int(key >> 32)
 			rule := int(uint32(key))
 			if start < st.blockedUntil[rule] || st.fired[rule] {
 				if next, ok := st.retryCollapsedCandidate(start, rule); ok {
-					starts = insertRequiredStart(starts, cursor+1, next)
+					queue(next)
 				}
 				continue
 			}
@@ -194,26 +220,36 @@ func (st *blockScanState) confirmCandidatesAndFallback(starts []uint64, index *s
 				}
 			}
 			candidate := -1
+			fromRetry := false
 			if cursor < len(starts) {
 				if candidateStart, candidateRule := requiredStartParts(starts[cursor]); candidateStart == start {
 					candidate = candidateRule
+				}
+			}
+			if head < len(retries) {
+				if retryStart, retryRule := requiredStartParts(retries[head]); retryStart == start && (candidate < 0 || retryRule < candidate) {
+					candidate = retryRule
+					fromRetry = true
 				}
 			}
 			if !hasRule && candidate < 0 {
 				break
 			}
 			if candidate >= 0 && (!hasRule || candidate < rule) {
+				if fromRetry {
+					head++
+				} else {
+					cursor++
+				}
 				if start < st.blockedUntil[candidate] || st.fired[candidate] {
 					if next, ok := st.retryCollapsedCandidate(start, candidate); ok {
-						starts = insertRequiredStart(starts, cursor+1, next)
+						queue(next)
 					}
-					cursor++
 					continue
 				}
 				if !st.verify(candidate, start) {
 					return
 				}
-				cursor++
 				continue
 			}
 			if !st.verify(rule, start) {
@@ -227,19 +263,27 @@ func (st *blockScanState) confirmCandidatesAndFallback(starts []uint64, index *s
 	}
 }
 
-// retryCollapsedCandidate 处理折叠窗口候选被重叠抑制的情况。
+// retryCollapsedCandidate 处理窗口候选被重叠抑制的情况，覆盖两类只登记了部分
+// 起点的候选窗口：
 //
-// 折叠窗口内的起点确认结果完全相同（见 collapseHead），逐起点确认在窗口内验证的
-// 是第一个未被抑制的起点，其余起点只会被 blockedUntil 挡住。窗口只登记了最左
-// 起点，因此这里把候选推迟到 blockedUntil 位置重新登记：该位置要么仍在窗口内、
-// 给出与逐起点确认一致的起点，要么已经越过窗口（此时窗口整体被抑制，重新确认会
-// 自然失败，或命中一个本就在该位置成立的合法匹配）。登记位置保持 (起点, 规则)
-// 升序，所以结果集合与稳定投递顺序都与逐起点确认一致。
+//   - 折叠窗口（见 collapseHead）：窗口内起点的确认结果完全相同，逐起点确认在
+//     窗口内验证的是第一个未被抑制的起点，其余起点只会被 blockedUntil 挡住。
+//   - 段首窗口（见 denseRunHead）：窗口内非段首起点与段首共享确认结果，逐起点
+//     确认报告的段内起点只可能是段首，或恰好等于前一次命中的结束位置（重叠
+//     抑制的水位线），后者正是这里补登记的位置。
 //
-// 返回 false 表示该候选不需要推迟：规则没有折叠窗口、规则已终止、推迟位置不晚于
+// 两类窗口都只登记了部分起点，因此这里把候选推迟到 blockedUntil 位置重新登记：
+// 该位置要么仍在窗口内、给出与逐起点确认一致的起点，要么已经越过窗口（此时窗口
+// 整体被抑制，重新确认会自然失败，或命中一个本就在该位置成立的合法匹配）。登记
+// 位置保持 (起点, 规则) 升序，所以结果集合与稳定投递顺序都与逐起点确认一致。
+//
+// 返回 false 表示该候选不需要推迟：规则没有上述窗口、规则已终止、推迟位置不晚于
 // 当前起点，或推迟位置已经在数据末尾之外。
 func (st *blockScanState) retryCollapsedCandidate(start int, rule int) (uint64, bool) {
-	if st.fired[rule] || st.scanner.rules[rule].collapseHead == nil {
+	if st.fired[rule] {
+		return 0, false
+	}
+	if st.scanner.rules[rule].collapseHead == nil && !st.scanner.runHeadWindows[rule] {
 		return 0, false
 	}
 	next := st.blockedUntil[rule]
@@ -247,20 +291,4 @@ func (st *blockScanState) retryCollapsedCandidate(start int, rule int) (uint64, 
 		return 0, false
 	}
 	return requiredStartKey(next, rule), true
-}
-
-// insertRequiredStart 把推迟后的候选按 (起点, 规则) 升序插入候选序列。
-// at 之后的元素都已按升序排列，因此插入位置可以用二分查找定位；与既有候选完全
-// 相同的键不再重复登记，避免同一起点被确认两次。
-func insertRequiredStart(starts []uint64, at int, key uint64) []uint64 {
-	position := at + sort.Search(len(starts)-at, func(index int) bool {
-		return starts[at+index] >= key
-	})
-	if position < len(starts) && starts[position] == key {
-		return starts
-	}
-	starts = append(starts, 0)
-	copy(starts[position+1:], starts[position:])
-	starts[position] = key
-	return starts
 }

@@ -975,12 +975,9 @@ func ContainsAt(data []byte, off int, literal Literal) bool {
 	}
 	window := data[off : off+length]
 	if !literal.CaseInsensitive {
-		for i, c := range value {
-			if window[i] != c {
-				return false
-			}
-		}
-		return true
+		// 逐字节循环在长文字上退化成每字节一次比较，而 bytes.Equal 会走
+		// 定长加载/向量比较：候选命中密集时这一步是逐候选确认的主要成本。
+		return bytes.Equal(window, value)
 	}
 	for i, c := range value {
 		if foldByte(c) != foldByte(window[i]) {
