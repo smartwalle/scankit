@@ -17,17 +17,23 @@ type MaskFunc func(match Match, matched []byte)
 // Replace 会原地重排 matches，并返回不与 data 共享底层数组的新切片。
 func Replace(data []byte, matches []Match, fn ReplaceFunc) []byte {
 	if len(matches) == 0 {
-		return data
+		return append([]byte(nil), data...)
+	}
+	if fn == nil {
+		return append([]byte(nil), data...)
 	}
 	matches = resolveOverlappingMatches(matches)
 
 	// 预分配输入长度，以覆盖替换内容不增长时的常见情况。
 	var buf = bytes.NewBuffer(make([]byte, 0, len(data)))
 	var cursor = 0
-	for _, m := range matches {
-		buf.Write(data[cursor:m.From])
-		fn(buf, m, data[m.From:m.To])
-		cursor = int(m.To)
+	for _, match := range matches {
+		if match.From > match.To || match.To > uint64(len(data)) || match.From < uint64(cursor) {
+			continue
+		}
+		buf.Write(data[cursor:match.From])
+		fn(buf, match, data[match.From:match.To])
+		cursor = int(match.To)
 	}
 	buf.Write(data[cursor:])
 	return buf.Bytes()
@@ -35,26 +41,41 @@ func Replace(data []byte, matches []Match, fn ReplaceFunc) []byte {
 
 // Mask 使用 fn 原地修改 data 中的匹配片段。重叠片段按与 Replace 相同的规则处理。
 //
-// value 与 data 共享底层数组，长度固定。
-// Mask 会原地重排 matches，并返回 data；调用方需要保留原始数据时必须传入副本。
-func Mask(data []byte, matches []Match, fn MaskFunc) []byte {
+// matched 与 data 共享底层数组，长度固定。
+// Mask 会原地重排 matches，并把修改直接写回 data；调用方需要保留原始数据时必须传入副本。
+func Mask(data []byte, matches []Match, fn MaskFunc) {
 	if len(matches) == 0 {
-		return data
+		return
+	}
+	if fn == nil {
+		return
 	}
 	matches = resolveOverlappingMatches(matches)
 	for _, match := range matches {
+		if match.From > match.To || match.To > uint64(len(data)) {
+			continue
+		}
 		fn(match, data[match.From:match.To])
 	}
-	return data
 }
 
 // resolveOverlappingMatches 原地排序 matches，并保留优先级最高的不重叠片段。
 func resolveOverlappingMatches(matches []Match) []Match {
+	valid := matches[:0]
+	for _, m := range matches {
+		if m.From <= m.To {
+			valid = append(valid, m)
+		}
+	}
+	matches = valid
 	sort.Slice(matches, func(i, j int) bool {
 		if matches[i].From != matches[j].From {
 			return matches[i].From < matches[j].From
 		}
-		return matches[i].To > matches[j].To
+		if matches[i].To != matches[j].To {
+			return matches[i].To > matches[j].To
+		}
+		return matches[i].Id < matches[j].Id
 	})
 
 	resolvedMatches := matches[:0]

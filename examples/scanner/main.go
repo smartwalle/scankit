@@ -1,3 +1,4 @@
+// Package main 演示使用 scankit 编译规则并扫描日志中的手机号和邮箱。
 package main
 
 import (
