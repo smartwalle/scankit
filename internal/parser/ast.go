@@ -140,6 +140,20 @@ func Children(n Node, fn func(Node)) {
 // Equal 判断两个 AST 的节点和值是否一致。
 func Equal(a, b Node) bool { return reflect.DeepEqual(a, b) }
 
+// ClassEqual 直接按字段比较两个 Class，避免 reflect.DeepEqual 在 -race
+// 下逐字段反射带来的开销：nfagraph 的等价节点合并会在热路径上频繁调用。
+func ClassEqual(a, b Class) bool {
+	if a.Negated != b.Negated || a.Kind != b.Kind || len(a.Ranges) != len(b.Ranges) {
+		return false
+	}
+	for i := range a.Ranges {
+		if a.Ranges[i] != b.Ranges[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // IsEmpty 判断节点是否可能在零字节消耗下匹配成功；nil 节点不视为空。
 func IsEmpty(n Node) bool {
 	switch v := n.(type) {

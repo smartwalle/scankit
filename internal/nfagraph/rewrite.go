@@ -2,7 +2,6 @@ package nfagraph
 
 import (
 	"fmt"
-	"reflect"
 
 	"github.com/smartwalle/scankit/internal/graph"
 	"github.com/smartwalle/scankit/internal/parser"
@@ -103,7 +102,7 @@ func NormalizeClasses(g *Graph) int {
 			continue
 		}
 		n.Class = normalized
-		if !reflect.DeepEqual(before, n.Class.Ranges) {
+		if !equalRanges(before, n.Class.Ranges) {
 			changed++
 		}
 	}
@@ -198,8 +197,9 @@ func SquashLinearLiterals(g *Graph) int {
 	merged := 0
 	for changed := true; changed; {
 		changed = false
-		for _, id := range g.Flow.Vertices() {
-			node := g.Nodes[id]
+		// 直接遍历 g.Nodes，避免每轮重新调用 Flow.Vertices() 分配 + 插入排序。
+		// 节点被删除后对应的 map 条目随即消失，下一轮扫描自然跳过。
+		for id, node := range g.Nodes {
 			if node == nil || node.Kind != KindLiteral || node.ReportID != 0 {
 				continue
 			}
@@ -234,8 +234,10 @@ func BypassEpsilonJoins(g *Graph) int {
 	removed := 0
 	for changed := true; changed; {
 		changed = false
-		for _, id := range g.Flow.Vertices() {
-			node := g.Nodes[id]
+		// 直接遍历 g.Nodes：原写法每轮重新调用 Flow.Vertices() 重建有序快照，
+		// 在 -race 下分配与排序的开销会被显著放大。删除节点后其 map 条目
+		// 直接消失，下一轮扫描自动忽略，行为与原实现一致。
+		for id, node := range g.Nodes {
 			if node == nil || node.Kind != KindJoin || id == g.Start || node.ReportID != 0 {
 				continue
 			}
@@ -315,8 +317,8 @@ func SquashLinearJoins(g *Graph) int {
 	removed := 0
 	for changed := true; changed; {
 		changed = false
-		for _, id := range g.Flow.Vertices() {
-			node := g.Nodes[id]
+		// 直接遍历 g.Nodes，避免每轮重新调用 Flow.Vertices() 分配 + 插入排序。
+		for id, node := range g.Nodes {
 			if node == nil || node.Kind != KindJoin || id == g.Start {
 				continue
 			}
@@ -351,7 +353,7 @@ func MergeEquivalentNodes(g *Graph) int {
 			}
 			for right := left + 1; right < len(ids); right++ {
 				bID, b := ids[right], g.Nodes[ids[right]]
-				if !mergeableNode(g, bID, b) || !equalMergeableNode(a, b) || !reflect.DeepEqual(g.Flow.Successors(aID), g.Flow.Successors(bID)) {
+				if !mergeableNode(g, bID, b) || !equalMergeableNode(a, b) || !equalSuccessors(g.Flow.Successors(aID), g.Flow.Successors(bID)) {
 					continue
 				}
 				for _, pred := range g.Flow.Predecessors(bID) {
@@ -385,7 +387,7 @@ func mergeableNode(g *Graph, id graph.Vertex, node *Node) bool {
 }
 
 func equalMergeableNode(a, b *Node) bool {
-	if a == nil || b == nil || a.Kind != b.Kind || a.Assertion != b.Assertion || a.RepeatMin != b.RepeatMin || a.RepeatMax != b.RepeatMax || a.Greedy != b.Greedy || !reflect.DeepEqual(a.Class, b.Class) {
+	if a == nil || b == nil || a.Kind != b.Kind || a.Assertion != b.Assertion || a.RepeatMin != b.RepeatMin || a.RepeatMax != b.RepeatMax || a.Greedy != b.Greedy || !parser.ClassEqual(a.Class, b.Class) {
 		return false
 	}
 	if string(a.Literal) != string(b.Literal) {
@@ -395,6 +397,33 @@ func equalMergeableNode(a, b *Node) bool {
 		return a.Unicode == nil && b.Unicode == nil
 	}
 	return *a.Unicode == *b.Unicode
+}
+
+// equalSuccessors 直接按值比较两个顶点后继切片，避免 reflect.DeepEqual
+// 在 -race 下的反射调用开销。MergeEquivalentNodes 会频繁调用。
+func equalSuccessors(a, b []graph.Vertex) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// equalRanges 直接按值比较两个 Range 切片，是 NormalizeClasses 的热路径。
+func equalRanges(a, b []parser.Range) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ExpandLiterals 将多字节文字节点展开为等价的单字节节点链。
